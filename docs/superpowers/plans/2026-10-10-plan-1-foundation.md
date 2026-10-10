@@ -872,7 +872,7 @@ git commit -m "feat(core): 周界与周序号计算（锚点 2026-09-14，ISO-86
 - Produces: `record Baseline(String goal, String item, String amount, String plan, String status)`
 - Produces: `record Phase(String phase, String window, String focus, String acceptance)`
 - Produces: `record ProfileItem(String key, String value)`
-- Produces: `enum PlanSection { PROFILE, GOALS, COURSES, BASELINES, LIFE_RULES, PHASES }`
+- Produces: `enum PlanSection { PROFILE("我的现状"), GOALS("目标清单"), COURSES("课程（本学期）"), BASELINES("每周底线"), PHASES("阶段排期") }`，含 `String label()`（供异常消息直接引用人的说法，而不是枚举名）
 - Produces: `final class SectionMissingException extends RuntimeException`，含 `PlanSection section()`
 - Produces: `final class PlanDocument`
   - `static PlanDocument parse(String markdown)`
@@ -932,6 +932,14 @@ class PlanDocumentTest {
 
             ---
 
+            ## 四、每周底线
+
+            | 目标 | 项 | 量 | 怎么安排 | 状态 |
+            |---|---|---|---|---|
+            | 学校课程 | 作业按时交 | 每周随课 | 当周内完成 | 待回报 |
+
+            ---
+
             ## 六、阶段排期
 
             | 阶段 | 时间窗 | 主攻 | 验收标准 |
@@ -953,6 +961,10 @@ class PlanDocumentTest {
 
         assertEquals(1, doc.courses().size());
         assertEquals("数据库", doc.courses().get(0).name());
+
+        assertEquals(1, doc.baselines().size());
+        assertEquals("作业按时交", doc.baselines().get(0).item());
+        assertEquals("学校课程", doc.baselines().get(0).goal());
 
         assertEquals(2, doc.phases().size());
         assertEquals("A", doc.phases().get(0).phase());
@@ -1465,7 +1477,7 @@ git commit -m "feat(core): 存储服务（备份轮转 10 份 + 外部修改检�
   - `MigrationResult apply(MigrationPlan plan, Path targetFile) throws IOException` —— 唯一写文件的方法
 - Produces: `record MigrationResult(Path target, Path backup, Path archive)`
 - Produces: `final class TargetExistsException extends IOException`
-- Consumes: `MarkdownParser`、`PlanDocument`、`BackupRotation`、`TextFileCodec`
+- Consumes: `MarkdownParser`、`BackupRotation`、`TextFileCodec`。**不使用 `PlanDocument`**：目标文件里 §八/§九/§十 都是原样块，而 `PlanDocument` 只建模结构块，承载不了全部内容；因此迁移用**字符串装配**，不绕模型。
 
 - [ ] **Step 1: 造迁移用样例 `legacy-408-progress.md`**
 
@@ -1589,11 +1601,11 @@ class MigrationSafetyTest {
 
             ---
 
-            ## 二、目标清单
+            ## 二、优先级与每周底线
 
-            | 目标 | 状态 | 优先级 | 时间窗 | 说明 |
-            |---|---|---|---|---|
-            | 考研（408） | 暂缓 | — | 大三再定 | 可能取消 |
+            | 项 | 底线 | 怎么安排 | 状态 |
+            |---|---|---|---|
+            | 单词 | 7 天里 ≥5 天 | 晨起或睡前 | 待回报 |
 
             ---
 
