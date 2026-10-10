@@ -63,6 +63,9 @@
 - **`mvn javafx:run` 不会把子 JVM 的 stdout/stderr 带进 Maven 的输出流**（Apache Commons Exec，无 stream pump；已由两方独立核实：插件 `JavaFXRunMojo` 无 `redirectOutput`/`pumpStreamHandler`/`inheritIO`，且 `JavaFXBaseMojo.executeCommandLine` 把子进程输出直接写文件）。因此**无法用 `mvn javafx:run` 的日志证明 JVM 层面的行为**（例如 native-access flag 的效果）；要看应用自身的标准输出/错误，必须**直接用 JVM 启动**——用插件构建的同一条命令行（同样的 `--module-path`、classpath、主类）。
 - **`javafx:run` 的前缀目标不能与 `-am` 同用**（见 Task 1 Step 6 的实测结论）。
 - **本机显示器约 1.88–2.0 倍 DPI 缩放。** `GetWindowRect` 返回**逻辑**坐标，而截图位图是**物理**像素——两者不是同一坐标空间，按逻辑坐标裁剪会偏移约 2 倍。另外 `PrintWindow(PW_RENDERFULLCONTENT)` **拿不到** JavaFX 场景内容（只拿到原生标题栏）。UI 相关取证必须在同一个坐标空间内完成。
+- **`CharsetDecoder` 在 `CodingErrorAction.REPORT` 下，出错时 `ByteBuffer.position()` 已经指向非法序列的**起点**。** 不要写 `position() - result.length()` 之类的减法：`CharsetDecoder.decode` 在 REPORT 分支于「推进过坏字节」之前就 `return cr`，那步推进只发生在 IGNORE/REPLACE。实测：GBK 字节位于文件开头时正确偏移是 `in.position()` = 0，减法得到 **-1**。（结论来自 JDK 25 源码 `UTF_8.Decoder.malformedForLength` → `updatePositions(src, sp, …)`，以及 22 例对照独立 RFC-3629 扫描器的实测。）
+- **给实现者的 JDK / API 细节必须核实存在性，不能凭印象。** 本项目已两次因此返工：控制器曾要求调用 `MalformedInputException.getInputOffset()`（**JDK 中不存在**，该异常只有 `getInputLength()`），也曾给出上面那条错误的偏移公式。
+- **测试必须断言具体数值，弱条件抓不住这类错误。** 上面那个偏移 bug 是靠断言消息含 `偏移 0` 才被发现的；只断言「消息包含文件名」会放它过去。
 
 **测试纪律**
 - 测试用**脱敏样例**，**绝不把真实档案提交进仓库**。
