@@ -68,10 +68,10 @@ class TableParseTest {
     // ---- 以下是 Step 5 要点里要求的补充断言与负向检查 ----
 
     /**
-     * 未脏的表格必须逐字节返回原文，<b>哪怕「按统一列宽重新生成」会得到另一串字节</b>。
+     * 未脏的表格必须逐字节返回原文，<b>哪怕「规范化重新生成」会得到另一串字节</b>。
      *
      * <p>本用例刻意把手写表格造成不整齐的样子：表头单元格带多余空格、分隔行是 6 个短横。
-     * 重新生成会得到 {@code | 项  | 内容 |} + {@code | --- | --- |}，与原文不同。
+     * 重新生成会得到 {@code | 项 | 内容 |} + {@code | --- | --- |}，与原文不同。
      * 因此这条断言是「未脏表格不重新生成」这个决定性性质唯一的守门人——没有它，
      * P1 在含表格的文件上会静默失效，而普通往返测试仍可能碰巧通过。
      */
@@ -96,9 +96,16 @@ class TableParseTest {
         assertEquals(md, doc.blocks().get(0).render(), "表格块连同尾部空行一起持有原文");
     }
 
-    /** 表格块必须是「结构块」：脏了才重新生成，且按显示宽度对齐（CJK 算 2）。 */
+    /**
+     * 表格块必须是「结构块」：脏了才重新生成，且每个单元格<b>两侧恰好一个空格、不补列宽</b>。
+     *
+     * <p>为什么在这里钉住「不补位」：补位空格会被 {@link TableBlock#splitCells}（只去两侧各一个空格）
+     * 读成单元格内容，于是本类写出的文件自己读回来值就变了——Task 6 实测暴露的矛盾
+     * （状态 {@code 暂缓} 读回成 {@code 暂缓    }）。生成与解析必须成套，
+     * {@link #dirtyOutput_reParsesToTheExactValuesThatWereSet} 用「写出去再读回来」把这条性质直接钉死。
+     */
     @Test
-    void dirtyTable_regeneratesWithDisplayWidthPadding() {
+    void dirtyTable_regeneratesWithExactlyOneSpacePerCellSide_noPadding() {
         String md = "| 项 | 内容 |\n|---|---|\n| 年级 | 大二上 |\n";
         MarkdownDocument doc = MarkdownParser.parse(md);
         TableBlock t = (TableBlock) doc.blocks().stream()
@@ -108,12 +115,40 @@ class TableParseTest {
         t.setCell(0, 1, "大二下");
 
         assertTrue(t.dirty(), "改单元格必须自动置脏，否则改动不会生效");
-        // 列宽：第 0 列 max(项=2, 年级=4)=4；第 1 列 max(内容=4, 大二下=6)=6。
-        // 中文按显示宽度 2 计，所以「项」后面要补到 4 列宽（2 个空格）。分隔行统一用 ---。
-        assertEquals("| 项   | 内容   |\n"
+        assertEquals("| 项 | 内容 |\n"
                         + "| --- | --- |\n"
                         + "| 年级 | 大二下 |\n",
-                doc.render(), "脏表格按显示宽度重新生成；对齐空格变化是 spec §4.3 接受的代价");
+                doc.render(), "脏表格按「两侧各一个空格」重新生成，不按列宽补位；"
+                        + "失去视觉对齐是 spec §4.3 接受的代价");
+    }
+
+    /**
+     * <b>App 写出的文件，App 读回来必须是同一串值。</b>这是「生成不补位」这条规则存在的理由，
+     * 也是此前缺失的那条性质。
+     *
+     * <p>刻意用「前后本身就带空格」的值（{@code " 中 "}）、空值、纯空格值与只带尾空格的值：
+     * 补齐列宽的写法会让补位空格混进值里；而「解析时去掉两侧全部空白」的写法又会把 {@code " 中 "}
+     * 悄悄改成 {@code "中"}——那同样是改用户写的字。只有「生成 = 两侧各一个空格」这一种写法
+     * 能同时通过下面全部断言。
+     */
+    @Test
+    void dirtyOutput_reParsesToTheExactValuesThatWereSet() {
+        String md = "| 甲 | 乙 |\n|---|---|\n| 1 | 2 |\n";
+        MarkdownDocument doc = MarkdownParser.parse(md);
+        TableBlock t = (TableBlock) doc.blocks().stream()
+                .filter(TableBlock.class::isInstance).findFirst().orElseThrow();
+
+        t.setCell(0, 0, " 中 ");       // 前后都真的有空格
+        t.setCell(0, 1, "");           // 空值
+        t.addRow(List.of(" ", "尾 "));  // 纯空格 / 只带尾空格
+
+        MarkdownDocument reloaded = MarkdownParser.parse(doc.render());
+        TableBlock back = (TableBlock) reloaded.blocks().stream()
+                .filter(TableBlock.class::isInstance).findFirst().orElseThrow();
+
+        assertEquals(List.of(List.of(" 中 ", ""), List.of(" ", "尾 ")), back.rows(),
+                "写出去再读回来必须是同一串值（含前后空格），否则就是偷偷改了用户写的字");
+        assertEquals(doc.render(), reloaded.render(), "读回来的表格未脏，必须再逐字节输出同一串字节");
     }
 
     /** 第 2 行不是分隔行 -> 整 run 不是表格（不做「往下找一个分隔行」的子串搜索）。 */
@@ -165,7 +200,7 @@ class TableParseTest {
     /** 行序调整（spec §4.4「保留行序」）：moveRow 后行序按新顺序生成。 */
     @Test
     void rowMutations_markDirtyAndKeepOrder() {
-        // 所有单元格显示宽度都是 4，这样重新生成不产生补位空格，断言能只盯行序
+        // 单元格值里没有前后空格，所以「两侧各一个空格」的重新生成就是原样写法，断言能只盯行序
         String md = "| 阶段 | 主攻 |\n|---|---|\n| 甲乙 | 数学 |\n| 丙丁 | 英语 |\n";
         MarkdownDocument doc = MarkdownParser.parse(md);
         TableBlock t = (TableBlock) doc.blocks().stream()

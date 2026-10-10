@@ -52,11 +52,12 @@ import java.util.Objects;
  *       因此某一格状态写错只会在读到 §二 时抛 {@code IllegalArgumentException}（带原文），
  *       而不是让整篇文件打不开。无论在哪一处失败，都不会写入任何内容。</li>
  *   <li><b>规格固定的字段（表头、状态）比对时忽略两侧空白，自由文本一格都不动</b>：
- *       {@code TableBlock} 重新生成时按列宽补空格，而 {@code splitCells} 只去前后各一个空格
- *       （Task 4 钉死的规则），于是本 App 自己写出的文件里，单元格会带对齐空格。
- *       若按原文严格比对表头与状态，App 会读不了自己刚保存的文件——那是自伤。
- *       自由文本仍然逐字返回（空白就是数据），已知代价见
- *       {@code PlanDocumentTest#alignmentSpacesMayBeAbsorbedIntoFreeTextValues_butFileBytesNeverChange}。</li>
+ *       表头与状态不是用户内容而是 spec 规定的取值，而用户可能把手写表格排得带多余空格
+ *       （{@code | 目标  |  状态 |}、{@code | 暂缓  |}）。忽略两侧空白后，这种手写表格照样能打开，
+ *       但「必须恰好是规格里那几列 / 那四个状态」这条并没有放松。
+ *       <b>自洽性不再依赖这条容忍</b>：{@code TableBlock} 重新生成时每个单元格两侧恰好一个空格、
+ *       不补列宽（spec §4.3），因此 App 自己写出的文件读回来就是同一串值
+ *       （{@code dirtyOutput_reParsesToTheExactValuesThatWereSet}）。</li>
  * </ul>
  *
  * <p><b>本类必须 public</b>：{@code study-desktop} 的界面与后续任务在别的包里消费它。
@@ -203,8 +204,8 @@ public final class PlanDocument {
      * §二 目标清单的全部行，按文件顺序（行序是语义，不重排）。
      *
      * <p>状态取的是去掉两侧空白后的文本，理由与
-     * {@link #headerMatches(PlanSection, List)} 相同：状态必须恰好是四态之一，两侧的对齐空格是
-     * {@code TableBlock} 重新生成时补上的排版，不是用户写的字。其余字段一格都不动（空白就是数据）。
+     * {@link #headerMatches(PlanSection, List)} 相同：状态必须恰好是四态之一，而手写表格常在
+     * 单元格里留多余空格（{@code | 暂缓  |}）。其余字段一格都不动（空白就是数据）。
      *
      * @throws IllegalArgumentException 某一行的状态不是四态之一（消息里带原文，绝不静默降级）
      */
@@ -414,9 +415,12 @@ public final class PlanDocument {
      * 表头比对：忽略单元格两侧的空白。
      *
      * <p><b>为什么这里可以忽略空白，而自由文本一格都不许动</b>：表头是<b>规格</b>（spec §4.4 钉死的列名），
-     * 不是用户内容。而 {@code TableBlock} 重新生成时按列宽补空格、{@code splitCells} 只去前后各
-     * 一个空格，于是本 App 自己写出的文件里，表头单元格会带上对齐空格。按原文严格比对，就会出现
-     * 「App 打不开自己刚保存的文件」这种自伤。忽略两侧空白之后，表头仍然必须是规格里那几列。
+     * 不是用户内容，而手写的表格常把单元格排得带多余空格（{@code | 目标  |  状态 |}）。
+     * 忽略两侧空白之后，表头仍然必须是规格里那几列，一个都不许少、不许换位置。
+     *
+     * <p>注意：这条容忍<b>不再</b>承担「App 读得回自己写的文件」的责任。曾经它必须存在，是因为重新生成
+     * 会按列宽补位、补位空格会在读回时变成单元格内容；现在生成侧改成「每个单元格两侧恰好一个空格、
+     * 不补位」（spec §4.3），自洽性由生成与解析成套来保证。留着容忍只是为了别把用户手写的排版判成错误。
      */
     private static boolean headerMatches(PlanSection section, List<String> cells) {
         List<String> expected = SECTION_HEADERS.get(section);

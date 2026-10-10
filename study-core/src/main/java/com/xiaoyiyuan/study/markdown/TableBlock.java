@@ -8,15 +8,23 @@ import java.util.Objects;
  * 结构化表格块（界面按类型化表单编辑，spec §4.2 的「结构块」）。
  *
  * <p><b>为什么未脏时必须返回原文，而不是「生成一遍，反正一样」</b>：这个类既能解析表格，
- * 也能重新生成表格，但两者的字节<b>不会</b>相同——重新生成会把列按统一显示宽度对齐、
+ * 也能重新生成表格，但两者的字节<b>不会</b>相同——重新生成会把每个单元格规范化为「两侧各一个空格」、
  * 把分隔行统一成 {@code ---}。手写表格平时是怎么排的就怎么排（缩进、分隔行用几个短横、
  * 单元格里多出来的空格），一旦用生成结果回写，用户的排版就没了，而且 P1 会静默失效：
  * 「没改过的地方一个字节都不许动」才是这个项目要守的东西。所以：
  *
  * <ul>
  *   <li>{@link #render()} 未脏 → 返回构造时保存的 {@link #originalText}（逐字节，含行尾符）；</li>
- *   <li>{@link #render()} 已脏 → 才重新生成（对齐空格变化是 spec §4.3 明确接受的代价）。</li>
+ *   <li>{@link #render()} 已脏 → 才重新生成（失去视觉对齐是 spec §4.3 明确接受的代价）。</li>
  * </ul>
+ *
+ * <p><b>重新生成不按列宽补位——每个单元格两侧恰好一个空格，这是硬要求</b>（spec §4.3，Task 6 实测暴露）：
+ * {@link #splitCells} 只去掉单元格两侧<b>各一个</b>空格，所以只有「生成 = 单空格」才能保证
+ * <b>本类写出的文件被本类读回来得到相同的值</b>。若生成时补位，补位空格会在读回时变成单元格内容
+ * ——实测状态下 {@code 暂缓} 会读成 {@code 暂缓    }，严重时本类连自己刚写的文件都读不了。
+ * 单空格写法还有两个好处：对「前后确实带空格的单元格值」（如 {@code " 中 "}）同样稳定往返，
+ * 而「去掉两侧全部空白」的解析规则会把这种值悄悄改掉；并且与用户现有档案的写法一致（{@code |a|} 风格）。
+ * 代价是脏表格不再视觉对齐，这是 spec §4.3 已接受的。
  *
  * <p>脏标记只由本类自己的编辑方法（{@link #setCell} 等）自动置上；这和 {@link RawBlock}
  * 的 {@code setCurrentText} 刻意不同——那边的 {@code currentText} 是字节缓冲，脏必须由调用方
@@ -199,14 +207,13 @@ public final class TableBlock implements Block {
 
     private String regenerate() {
         int columns = header.size();
-        int[] widths = columnWidths(columns);
         StringBuilder sb = new StringBuilder();
-        appendRow(sb, header, widths);
+        appendRow(sb, header);
         sb.append(lineEnding);
         appendSeparator(sb, columns);
         sb.append(lineEnding);
         for (int r = 0; r < rows.size(); r++) {
-            appendRow(sb, rows.get(r), widths);
+            appendRow(sb, rows.get(r));
             if (r < rows.size() - 1 || finalLineHasLineEnding) {
                 sb.append(lineEnding);
             }
@@ -214,77 +221,25 @@ public final class TableBlock implements Block {
         return sb.append(suffix).toString();
     }
 
-    /** 一行写成 {@code | 单元格 | 单元格 |}，每列按显示宽度左侧补空格对齐。 */
-    private static void appendRow(StringBuilder sb, List<String> cells, int[] widths) {
-        sb.append('|');
-        for (int c = 0; c < cells.size(); c++) {
-            String cell = cells.get(c);
-            sb.append(' ').append(cell);
-            int pad = widths[c] - displayWidth(cell);
-            for (int k = 0; k < pad; k++) {
-                sb.append(' ');
-            }
-            sb.append(" |");
+    /**
+     * 一行写成 {@code | 单元格 | 单元格 |}：<b>每个单元格两侧恰好一个空格，不补列宽</b>。
+     *
+     * <p>不补位是硬要求而不是省事：{@code splitCells} 只去掉两侧各一个空格，补位空格会在读回时
+     * 被当成单元格内容（见类注释）。因此生成与解析必须成套——改这里之前先看 {@link #splitCells}。
+     */
+    private static void appendRow(StringBuilder sb, List<String> cells) {
+        for (String cell : cells) {
+            sb.append("| ").append(cell).append(' ');
         }
+        sb.append('|');
     }
 
-    /** 分隔行统一用 {@code ---}（不按列宽补短横，spec §4.3 已接受重新排版的代价）。 */
+    /** 分隔行每格统一用 {@code ---}（不按列宽补短横，spec §4.3 已接受重新排版的代价）。 */
     private static void appendSeparator(StringBuilder sb, int columns) {
         sb.append('|');
         for (int c = 0; c < columns; c++) {
             sb.append(" --- |");
         }
-    }
-
-    private int[] columnWidths(int columns) {
-        int[] widths = new int[columns];
-        for (int c = 0; c < columns; c++) {
-            widths[c] = displayWidth(header.get(c));
-        }
-        for (List<String> row : rows) {
-            for (int c = 0; c < columns; c++) {
-                int w = displayWidth(row.get(c));
-                if (w > widths[c]) {
-                    widths[c] = w;
-                }
-            }
-        }
-        return widths;
-    }
-
-    /**
-     * 显示宽度：CJK / 全角字符算 2，其余算 1。
-     *
-     * <p>为什么不能用 {@code String.length()}：等宽字体里一个汉字的宽度是两个半角字符，
-     * 用字符数对齐会让含中文的表格歪掉。按码点算，避免把增补平面字符（如 CJK 扩展 B）拆开。
-     */
-    public static int displayWidth(String text) {
-        int width = 0;
-        for (int i = 0; i < text.length(); ) {
-            int cp = text.codePointAt(i);
-            width += isWideCodePoint(cp) ? 2 : 1;
-            i += Character.charCount(cp);
-        }
-        return width;
-    }
-
-    /** East Asian Wide / Fullwidth 的主要区段（含常用 emoji）。 */
-    private static boolean isWideCodePoint(int cp) {
-        return (cp >= 0x1100 && cp <= 0x115F)      // 谚文字母
-                || (cp >= 0x2E80 && cp <= 0x303E)  // 康熙部首、CJK 符号（不含 U+303F）
-                || (cp >= 0x3041 && cp <= 0x33FF)  // 假名、注音、韩文兼容字母、CJK 兼容
-                || (cp >= 0x3400 && cp <= 0x4DBF)  // CJK 扩展 A
-                || (cp >= 0x4E00 && cp <= 0x9FFF)  // CJK 基本区
-                || (cp >= 0xA000 && cp <= 0xA4CF)  // 彝文
-                || (cp >= 0xAC00 && cp <= 0xD7A3)  // 韩文音节
-                || (cp >= 0xF900 && cp <= 0xFAFF)  // CJK 兼容表意文字
-                || (cp >= 0xFE10 && cp <= 0xFE19)  // 竖排标点
-                || (cp >= 0xFE30 && cp <= 0xFE6F)  // CJK 兼容形式、小写变体
-                || (cp >= 0xFF00 && cp <= 0xFF60)  // 全角 ASCII 变体
-                || (cp >= 0xFFE0 && cp <= 0xFFE6)  // 全角符号
-                || (cp >= 0x1F300 && cp <= 0x1F64F) // emoji（图形、表情）
-                || (cp >= 0x1F900 && cp <= 0x1F9FF) // emoji（补充符号）
-                || (cp >= 0x20000 && cp <= 0x3FFFD); // CJK 扩展 B 及以后
     }
 
     // ---- 切分与杂项 ----

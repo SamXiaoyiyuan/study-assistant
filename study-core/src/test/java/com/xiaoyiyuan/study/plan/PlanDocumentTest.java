@@ -428,14 +428,14 @@ class PlanDocumentTest {
     }
 
     /**
-     * 写完再解析一次：模型读得回来（可见内容不变），字节也一模一样——写出的文件自己读得回来。
+     * 写完再解析一次必须得到<b>同一个模型</b>、同样的字节——App 写出的文件，App 自己读得回来。
      *
-     * <p>值的两侧可能多出对齐空格（已知局限，见
-     * {@link #alignmentSpacesMayBeAbsorbedIntoFreeTextValues_butFileBytesNeverChange}），
-     * 因此这里比对「可见内容」与字节，而不是逐字段原文相等。
+     * <p>这正是 C1 违反过的那条性质：曾经「脏表重新生成按列宽补位」，于是读回来时补位空格变成了
+     * 单元格内容（状态 {@code 暂缓} 读成 {@code 暂缓    }，最坏情况整篇文件读不了）。现在生成侧
+     * 每个单元格两侧恰好一个空格、不补位，所以这里可以断言<b>记录逐字段相等</b>，而不是「可见内容相等」。
      */
     @Test
-    void editedDocument_canBeReParsed_toTheSameVisibleModelAndBytes() {
+    void editedDocument_canBeReParsed_toTheSameModelAndBytes() {
         PlanDocument doc = PlanDocument.parse(RICH);
         doc.setGoal(0, new Goal("本学期学校课程", GoalStatus.DONE, "1", "2026.9–2027.1", "唯一必须完成的事"));
         doc.setCourse(0, new Course("数据库", "第 5 章作业", "2026-10-20", "进行中"));
@@ -446,54 +446,67 @@ class PlanDocumentTest {
         String out = doc.render();
         PlanDocument reloaded = PlanDocument.parse(out);
 
-        assertEquals(2, reloaded.goals().size());
-        assertEquals(GoalStatus.DONE, reloaded.goals().get(0).status(), "状态列必须读得出来");
-        assertEquals(GoalStatus.DEFERRED, reloaded.goals().get(1).status());
-        assertEquals("本学期学校课程", reloaded.goals().get(0).name().strip());
-        assertEquals("数据库", reloaded.courses().get(0).name().strip());
-        assertEquals("第 5 章作业", reloaded.courses().get(0).weeklyTask().strip());
-        assertEquals("2026-10-20", reloaded.courses().get(0).due().strip());
+        assertEquals(doc.profile(), reloaded.profile(), "§一 逐字段相等（键与值都不许多空格、少空格）");
+        assertEquals(doc.goals(), reloaded.goals(), "§二 逐字段相等");
+        assertEquals(doc.courses(), reloaded.courses(), "§三 逐字段相等");
         assertTrue(doc.baselines().isEmpty(), "§四 的最后一行被删掉了");
         assertTrue(reloaded.baselines().isEmpty(), "只剩表头与分隔行的 §四 必须仍被认领");
-        assertEquals(2, reloaded.phases().size());
-        assertEquals("D", reloaded.phases().get(1).phase().strip(), "新阶段必须写进去，行序保留");
-        assertEquals("本学期课程", reloaded.profile().get(1).key().strip());
-        assertEquals("数据库、Java、线性代数", reloaded.profile().get(1).value().strip());
+        assertEquals(doc.phases(), reloaded.phases(), "§六 逐字段相等（含行序）");
         assertEquals(out, reloaded.render(), "再解析一次必须逐字节相同（写入是幂等的）");
     }
 
     /**
-     * 已知局限（Task 4 转交的对齐空格问题）：脏表重新生成时按列宽补空格，而
-     * {@code TableBlock.splitCells} 只去前后各一个空格（Task 4 钉死的规则：多出来的空格是内容），
-     * 于是「保存 → 重新打开」后，自由文本单元格的值会带上对齐空格。
+     * C1 的修复证据（原先这条用例记的是「对齐空格会被吸收」的局限）：<b>App 写出的文件，App 读回来
+     * 必须是同一串值，一个空格都不许多、也不许少</b>。
      *
-     * <p>本用例把这件事的边界钉死，免得它变成不可预期的漂移：
-     * <ul>
-     *   <li>规格固定的字段（表头、状态）不受影响——它们比对时忽略两侧空白，因此文件永远读得回来；</li>
-     *   <li>自由文本只可能多出空格，可见内容一字不改；</li>
-     *   <li>文件<b>字节</b>不会因此改变：对齐空格吸收进值之后，重新生成写出的仍是同一串字节
-     *       （「值里的空格 + 补位空格」总数守恒）。</li>
-     * </ul>
+     * <p>覆盖三类最容易在生成/解析之间掉队的值：前后都真的带空格的 {@code " 中 "}、空串、纯空格；
+     * 只要生成侧还补列宽（补位空格会被 {@code splitCells} 读成内容），或解析侧改成「去掉两侧全部空白」，
+     * 这条就会红。另外断言文件字节在「打开 → 再保存」之后完全不变。
      */
     @Test
-    void alignmentSpacesMayBeAbsorbedIntoFreeTextValues_butFileBytesNeverChange() {
+    void appOwnOutput_reReadsToIdenticalValues_withNoInventedSpaces() {
         PlanDocument doc = PlanDocument.parse(MD);
-        doc.setGoal(0, new Goal("本学期学校课程", GoalStatus.DONE, "1", "2026.9–2027.1", "唯一必须完成的事"));
+        doc.setCourse(0, new Course(" 数据库 ", " 第 4 章作业 ", "", " 待回报 "));
+        doc.setGoal(0, new Goal(" 本学期学校课程 ", GoalStatus.DONE, "1", " 2026.9–2027.1 ", "唯一必须完成的事"));
         String saved = doc.render();
 
         PlanDocument reloaded = PlanDocument.parse(saved);
-        assertEquals(2, reloaded.goals().size(), "状态列带对齐空格时也必须读得出来");
+        assertEquals(doc.courses(), reloaded.courses(),
+                "前后带空格的课程字段必须原样读回（既不许吸收补位空格，也不许被 trim 掉）");
+        assertEquals(doc.goals(), reloaded.goals(), "目标同理");
         assertEquals(GoalStatus.DONE, reloaded.goals().get(0).status());
-        assertEquals(GoalStatus.DEFERRED, reloaded.goals().get(1).status());
-        for (int i = 0; i < doc.goals().size(); i++) {
-            assertEquals(doc.goals().get(i).name().strip(), reloaded.goals().get(i).name().strip(),
-                    "自由文本的可见内容一字不许改，差异只允许是对齐空格");
-        }
+        assertEquals(GoalStatus.DEFERRED, reloaded.goals().get(1).status(),
+                "状态列必须读得出来（曾经补位会让它变成「暂缓    」而解析失败）");
+        assertTrue(saved.contains("|  数据库  |"), "写出的就是「两侧各一个空格」的规范化写法：" + saved);
         assertEquals(saved, reloaded.render(), "重新打开再保存，字节一个都不动");
 
-        // 再改一次同一张表：字节仍然完全一样（对齐空格已经吸收进值里，不会再变）
+        // 再改一次同一张表：字节仍然完全一样（生成侧不补位，所以没有「越写越长」这回事）
         reloaded.setGoal(1, new Goal(reloaded.goals().get(1).name(), GoalStatus.DEFERRED, "—", "大三再定", "可能取消"));
-        assertEquals(saved, reloaded.render(), "对齐空格不许让文件越写越长或改样");
+        assertEquals(saved, reloaded.render(), "再次保存必须逐字节相同");
+    }
+
+    /**
+     * 表头与状态的「忽略两侧空白」容忍仍然有用：用户手写的表格常把单元格排得带多余空格
+     * （{@code | 目标  |  状态 |}、{@code | 暂缓  |}）。这种文件必须能打开、也能读到值。
+     *
+     * <p>注意这条容忍<b>不再</b>承担「App 读得回自己写的文件」的责任——那件事现在由生成侧
+     * 「每个单元格两侧恰好一个空格、不补位」保证（见
+     * {@link #appOwnOutput_reReadsToIdenticalValues_withNoInventedSpaces}）。这里守的是手写排版不被误判。
+     */
+    @Test
+    void handPaddedTable_isAccepted_andWhitespaceAroundHeadersAndStatusIsIgnored() {
+        String md = MD.replace("| 目标 | 状态 | 优先级 | 时间窗 | 说明 |",
+                        "| 目标  |  状态 | 优先级 | 时间窗 | 说明 |")
+                .replace("| 考研（408） | 暂缓 | — | 大三再定 | 可能取消 |",
+                        "| 考研（408） |  暂缓  | — | 大三再定 | 可能取消 |");
+
+        PlanDocument doc = PlanDocument.parse(md);      // 手写的多余空格不许把这一节判成定位失败
+        assertEquals(2, doc.goals().size());
+        assertEquals(GoalStatus.ACTIVE, doc.goals().get(0).status());
+        assertEquals(GoalStatus.DEFERRED, doc.goals().get(1).status(),
+                "手写状态两侧多出的空格属于排版约定（splitCells 已去掉各一个），不参与四态比对");
+        assertEquals("考研（408）", doc.goals().get(1).name(), "自由文本一格都不许动");
+        assertEquals(md, doc.render(), "没改过就必须逐字节往返，含用户手写的多余空格");
     }
 
     /** 行序按文件顺序给出（spec §4.4「表格保留行序」）。 */
@@ -519,8 +532,8 @@ class PlanDocumentTest {
         assertEquals("年级 / 学期", doc.profile().get(0).key(), "其它行不许动");
 
         PlanDocument reloaded = PlanDocument.parse(doc.render());
-        assertEquals("本学期课程", reloaded.profile().get(1).key().strip());
-        assertEquals("数据库、Java、线性代数", reloaded.profile().get(1).value().strip());
+        assertEquals("本学期课程", reloaded.profile().get(1).key(), "读回来必须逐字段相等，不许多空格");
+        assertEquals("数据库、Java、线性代数", reloaded.profile().get(1).value());
     }
 
     // =====================================================================
@@ -545,7 +558,7 @@ class PlanDocumentTest {
 
         PlanDocument reloaded = PlanDocument.parse(out);
         assertEquals(1, reloaded.phases().size());
-        assertEquals("A", reloaded.phases().get(0).phase().strip());
+        assertEquals("A", reloaded.phases().get(0).phase(), "空表长回来之后必须逐字段读回原值，一个空格都不许多");
         assertEquals(out, reloaded.render());
     }
 
