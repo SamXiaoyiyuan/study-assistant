@@ -443,6 +443,7 @@ git commit -m "feat(core): 文本编码保真读写（CRLF/BOM 不静默转换�
 **Interfaces:**
 - Produces: `interface Block { boolean dirty(); void markDirty(); void clearDirty(); String render(); }`
 - Produces: `final class RawBlock implements Block`，构造 `RawBlock(String originalText)`；方法 `String currentText()` / `void setCurrentText(String)`
+  - **`setCurrentText` 不自动置脏。** 必须显式 `markDirty()` 改动才生效——未置脏的块一律输出原文，这是 P1/P2 的锚点。Task 4 的 brief 曾写出与这条冲突的测试用例，已修正；后续任何测试/界面代码若假设「setCurrentText 自动置脏」，都属同一类错误。
 - Produces: `final class MarkdownDocument`；方法 `List<Block> blocks()`、`String render()`
 - Produces: `static MarkdownDocument MarkdownParser.parse(String text)`
 - Consumes: 无
@@ -727,6 +728,7 @@ class PartialEditTest {
                 .filter(RawBlock.class::isInstance).map(RawBlock.class::cast)
                 .filter(b -> b.render().contains("手写的一段散文")).findFirst().orElseThrow();
         raw.setCurrentText(raw.render().replace("不要动我", "已经改了"));
+        raw.markDirty();   // 必须显式置脏：RawBlock 的契约是「未置脏一律输出原文」（P1 的锚点）
         String out = doc.render();
         assertTrue(out.contains("已经改了"));
         assertTrue(out.contains("另一端散文，含 $1^\\infty$ 公式。"), "未改动的块不受影响");
@@ -759,7 +761,7 @@ Expected: `RoundTripTest`、`TableParseTest`、`PartialEditTest`、`EncodingTest
 - [ ] **Step 7: 再对真实文件跑一次 P1**
 
 Run: `MVN -pl study-core test -Dtest=RealFileRoundTripTest "-Dstudy.realFile=%USERPROFILE%\study\408-进度.md"`
-Expected: PASS。真实档案里有 4 张表格，这一步确认表格识别没有破坏 P1。
+Expected: PASS。真实档案里有 **6 张表格**（实测：`blocks=57 raw=51 tableBlocks=6`），这一步确认表格识别没有破坏 P1。
 
 - [ ] **Step 8: Commit**
 
