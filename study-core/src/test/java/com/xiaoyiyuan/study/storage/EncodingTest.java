@@ -35,9 +35,28 @@ class EncodingTest {
 
         TextFile tf = TextFileCodec.read(f);
         assertTrue(tf.hasBom(), "应识别出 UTF-8 BOM");
+        // 严格解码下 U+FEFF 仍是合法 UTF-8，必须留在串首（否则 BOM 保真就此断掉）
+        assertEquals("\uFEFF# a\n", tf.content(), "严格解码不得吞掉 BOM 对应的 U+FEFF");
 
         TextFileCodec.write(f, tf.content());
         assertArrayEquals(original, Files.readAllBytes(f), "P1：BOM 也必须保真");
+    }
+
+    @Test
+    void invalidUtf8_isRejected_notSilentlyReplaced(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("gbk.md");
+        // GBK 的「中文」是 D6 D0 CE C4，不是合法 UTF-8 序列
+        byte[] original = new byte[] {(byte) 0xD6, (byte) 0xD0, (byte) 0xCE, (byte) 0xC4, '\n'};
+        Files.write(f, original);
+
+        NotUtf8Exception ex = assertThrows(NotUtf8Exception.class, () -> TextFileCodec.read(f));
+        assertTrue(ex.getMessage().contains("gbk.md"), "异常必须带文件名，便于用户定位");
+        // 偏移必须是真的：GBK 字节就在文件开头，所以是 0。
+        // 曾经的实现取 `in.position() - result.length()`，在 REPORT 模式下 position 本就停在序列起点，
+        // 相减会得到 -1，这条断言就是那个 bug 的回归守卫。
+        assertTrue(ex.getMessage().contains("偏移 0"),
+                "首个非法字节偏移必须是 0（非法字节就在文件开头），实际消息：" + ex.getMessage());
+        assertArrayEquals(original, Files.readAllBytes(f), "拒绝时必须一个字节都不改");
     }
 
     @Test
@@ -46,7 +65,8 @@ class EncodingTest {
         TextFileCodec.write(f, "# 新文件\n第二行\n");
 
         byte[] bytes = Files.readAllBytes(f);
-        assertEquals('#', bytes[0], "新文件第一个字节必须是 #，不能是 BOM");
+        assertArrayEquals("# 新文件\n第二行\n".getBytes(StandardCharsets.UTF_8), bytes,
+                "新文件必须逐字节等于上述 UTF-8 内容：无 BOM、LF 结尾，且不追加结尾换行");
         assertFalse(TextFileCodec.read(f).hasCrlf(), "新文件必须是 LF");
     }
 
