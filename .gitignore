@@ -1,0 +1,17 @@
+# 构建产物
+target/
+*.class
+
+# IntelliJ IDEA（本项目基于 Maven，IDE 配置可由 pom.xml 重新生成，不入库）
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# 备份与本地数据
+.backup/
+*.bak
+
+# 系统文件
+Thumbs.db
+.DS_Store
