@@ -193,6 +193,9 @@ Spec 未覆盖、但最可能咬到真实使用者的 5 类输入或条件。**�
         <version>0.0.8</version>
         <configuration>
           <mainClass>com.xiaoyiyuan.study.ui.Launcher</mainClass>
+          <options>
+            <option>--enable-native-access=javafx.graphics</option>
+          </options>
         </configuration>
       </plugin>
     </plugins>
@@ -254,13 +257,18 @@ Expected: BUILD SUCCESS，无 "Could not resolve dependencies"。
 
 - [ ] **Step 6: 运行，确认窗口出现并渲染中文**
 
-Run: `MVN -pl study-desktop -am javafx:run`
+Run: `MVN -q -DskipTests install` 然后 `MVN -pl study-desktop javafx:run`
 
-**必须带 `-am`（also-make）。** 不带时 Maven 只把 `study-desktop` 放进 reactor，`study-core` 解析不到——在干净仓库上 `-pl study-desktop javafx:run` **会直接失败**（`package` 不会把 `study-core` 装进本地仓库；只有 `install` 才会）。`-am` 把 `study-core` 一并纳入 reactor。已实测 Reactor Build Order 为 `study-assistant → study-core → study-desktop`。
+**顺序不能省，也不能改用 `-am`。两条都已实测：**
+- 干净仓库上直接 `MVN -pl study-desktop javafx:run` **会失败**：`-pl` 使 reactor 只含 `study-desktop`，`study-core` 解析不到；`package` 不把 `study-core` 装进本地仓库，**只有 `install` 会**。
+- 改成 `-am` **同样会失败**：`javafx:run` 是前缀形式的插件目标，Maven 会在 reactor 的**每个**模块上解析 `javafx` 前缀，而 `study-core` 没有声明该插件，实测报 `No plugin found for prefix 'javafx' in the current project` + `BUILD FAILURE`。
+- 因此正确做法是：**先 `install` 把 `study-core` 装进本地仓库，再单独对 `study-desktop` 跑 `javafx:run`。**（`-am` 只适用于 `package` 这类构建目标，不适用于前缀插件目标。）
 
 Expected:
 - 弹出标题为「环境冒烟」的窗口，客户区 420×200，显示中文「环境冒烟通过 · 中文渲染正常」，**无方块、无乱码**。
 - run 日志中**没有** JDK 25 原生访问 WARNING（由 `--enable-native-access=javafx.graphics` 消除）。
+- **日志必须用 UTF-8 落盘**（PowerShell 里显式写 `-Encoding utf8`，否则默认 UTF-16LE+BOM+CRLF，既违反本项目的 LF 约定，文本工具也读不了）。
+- **日志必须包含应用自身的输出。** 只截到 `[INFO] --- javafx:0.0.8:run (default-cli) @ study-desktop ---` 这一行 banner **不算证据**——那时 JVM 还没启动，日志里根本没有应用输出，任何"警告已消失"的结论都是空的。
 
 **怎么取证（别用错方法）**：
 - **不要**截全屏然后声称窗口在里面。本机显示器为 **200% 缩放**（物理 3200×2000 / 逻辑 1600×1000），而 JavaFX 按**物理像素**定位窗口；裁剪区域若按逻辑坐标算，就会偏移 2 倍——要么截到别的窗口，要么截到空白。这正是 Task 1 第一次取证失败的真实原因。
@@ -1900,7 +1908,7 @@ git commit -m "feat(core): 配置与路径（study 目录 / 暂缓目标显示�
 
 - [ ] `MVN -pl study-core test` 全绿，包含 `RoundTripTest`、`PartialEditTest`、`TableParseTest`、`EncodingTest`、`WeekBoundaryTest`、`PlanDocumentTest`、`GoalStateTest`、`WeekRecordAppendTest`、`BackupRotationTest`、`ExternalModificationTest`、`MigrationFidelityTest`、`MigrationSafetyTest`、`AppConfigTest`
 - [ ] `MVN -pl study-core test -Dtest=RealFileRoundTripTest "-Dstudy.realFile=%USERPROFILE%\study\408-进度.md"` 通过：**13377 字节进、13377 字节出**
-- [ ] `MVN -pl study-desktop -am javafx:run` 弹出中文窗口，无方块（注意 `-am` 不可省，见 Task 1 Step 6）
+- [ ] `MVN -q -DskipTests install` 后 `MVN -pl study-desktop javafx:run` 弹出中文窗口，无方块（顺序不可省，且**不能用 `-am`**，见 Task 1 Step 6）
 - [ ] 迁移演练产出的预览文件已人工通读，6 周历史与 LaTeX 完好
 - [ ] `%USERPROFILE%\study\` 下的真实文件**一个字节都没被改动**（迁移演练只用了临时目录）
 - [ ] `git status` 干净，无预览文件残留、无真实档案入库
