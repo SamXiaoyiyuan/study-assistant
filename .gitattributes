@@ -1,0 +1,21 @@
+# 强制所有文本文件在仓库内与工作区都用 LF 换行。
+#
+# 原因：本项目的核心性质 P1 是「未修改内容字节级无损往返」，
+# 而 408-进度.md 实测为纯 LF（0 个 CRLF）。若 git 在检出时转成 CRLF，
+# 测试样例文件在任意机器上检出后都会与期望字节不符，RoundTripTest 必然失败。
+# 因此换行符必须锁定为 LF，不交由平台默认值决定。
+
+* text=auto eol=lf
+
+*.java   text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.xml    text eol=lf
+*.properties text eol=lf
+
+# 二进制文件不做换行处理
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.jar    binary
+*.pdf    binary
