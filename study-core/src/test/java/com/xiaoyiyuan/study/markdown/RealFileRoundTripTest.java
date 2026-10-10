@@ -35,11 +35,15 @@ class RealFileRoundTripTest {
         MarkdownDocument doc = MarkdownParser.parse(text);
         byte[] rendered = doc.render().getBytes(StandardCharsets.UTF_8);
 
-        // 断言消息里带上首个不一致字节的偏移：只说「长度不同」定位不到原因
+        // 断言消息与输出里的关键事实刻意用 ASCII 写（bytesIn / bytesOut / firstDiffByte）：
+        // 本机的 Maven/JVM 输出编码不是 UTF-8，中文在控制台会变成乱码，
+        // 「13377 字节进、13377 字节出」如果写成中文就有可能在取证时读不出来。
         int firstDiff = firstDifference(original, rendered);
         assertArrayEquals(original, rendered,
-                "真实档案 P1 失败：原 " + original.length + " 字节，渲染后 " + rendered.length
-                        + " 字节，首个不一致偏移 " + firstDiff);
+                "P1 FAILED for real archive: bytesIn=" + original.length
+                        + " bytesOut=" + rendered.length + " firstDiffByte=" + firstDiff);
+        System.out.println("[P1] realFile round-trip OK: bytesIn=" + original.length
+                + " bytesOut=" + rendered.length + " identical=true");
     }
 
     /** 返回首个不一致的字节偏移；完全一致时返回 -1。 */
