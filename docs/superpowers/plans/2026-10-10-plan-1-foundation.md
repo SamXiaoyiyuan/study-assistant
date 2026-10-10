@@ -57,9 +57,9 @@
 
 **已实测的环境陷阱（Task 1 用代价换来的，后续任务必读）**
 
-- **本机是 Windows PowerShell 5.1**，其 `Out-File -Encoding utf8` 与 `Set-Content -Encoding utf8` **都会写出 BOM**。要产出本项目要求的「UTF-8 无 BOM + LF」，唯一可靠路径是：
+- **本 harness 的 PowerShell 写文件会写出 BOM（实测结论，不绑定版本号）**：`Set-Content -Encoding utf8NoBOM` 的参数**被直接拒绝**（该 `FileSystemCmdletProviderEncoding` 枚举只有 `UTF8` 等旧值），而 `Out-File -Encoding utf8` 与 `Set-Content -Encoding utf8` **都会写出 BOM**。要产出本项目要求的「UTF-8 无 BOM + LF」，唯一可靠路径是：
   `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))`，并确保 `$text` 里是 `\n` 而非 `\r\n`。默认的 `>` 重定向与 `Out-File` 写的是 **UTF-16LE + BOM + CRLF**，既违反本约束，文本工具也读不了。
-- **`mvn javafx:run` 不会转发子 JVM 的 stdout/stderr**（Apache Commons Exec，无 stream pump）。因此：① 带不带 `--enable-native-access=javafx.graphics`，`mvn javafx:run` 的输出**逐字节相同**，无法用它证明该 flag 的效果；② 要看应用自身的标准输出/错误，必须**直接用 JVM 启动**（用插件构建的同一条命令行：同样的 `--module-path`、classpath、主类）。
+- **`mvn javafx:run` 不会把子 JVM 的 stdout/stderr 带进 Maven 的输出流**（Apache Commons Exec，无 stream pump；已由两方独立核实：插件 `JavaFXRunMojo` 无 `redirectOutput`/`pumpStreamHandler`/`inheritIO`，且 `JavaFXBaseMojo.executeCommandLine` 把子进程输出直接写文件）。因此**无法用 `mvn javafx:run` 的日志证明 JVM 层面的行为**（例如 native-access flag 的效果）；要看应用自身的标准输出/错误，必须**直接用 JVM 启动**——用插件构建的同一条命令行（同样的 `--module-path`、classpath、主类）。
 - **`javafx:run` 的前缀目标不能与 `-am` 同用**（见 Task 1 Step 6 的实测结论）。
 - **本机显示器约 1.88–2.0 倍 DPI 缩放。** `GetWindowRect` 返回**逻辑**坐标，而截图位图是**物理**像素——两者不是同一坐标空间，按逻辑坐标裁剪会偏移约 2 倍。另外 `PrintWindow(PW_RENDERFULLCONTENT)` **拿不到** JavaFX 场景内容（只拿到原生标题栏）。UI 相关取证必须在同一个坐标空间内完成。
 
