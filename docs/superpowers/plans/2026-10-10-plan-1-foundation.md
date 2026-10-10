@@ -876,6 +876,8 @@ Expected: 编译失败，`cannot find symbol: class WeekCalendar`。
 
 **编译陷阱**：`Math.floorDiv(long, int)` **没有适用重载**——`Math.floorDiv` 只有 `(int,int)` 与 `(long,long)`，Java 不为方法实参做拓宽转换。`DAYS_PER_WEEK` 是 `int` 时必须显式写成 `Math.floorDiv(days, (long) DAYS_PER_WEEK)`。
 
+**`int` 周号的真实边界（不要写「永远安全」这类注释）**：周号返回 `int`，这只是**务实**而非无溢出。实测 `DAYS.between(ANCHOR_MONDAY, LocalDate.MAX)` = **365,241,759,761 天**，远超 ±2.1e9；`weekNumber(LocalDate.of(50_000_000,1,1))` 的正确值是 2,608,769,252，`(int)` 强转会**静默**返回 -1,686,198,044，不抛异常（阈值约 ±590 万年）。注释只能写「对本项目 2026–2027 的实际输入安全」，**不得**声称超出 `LocalDate` 范围。Task 5 的实现者曾写下后者，已由审查指出。
+
 `weekRangeLabel` 中间用**短破折号 `–`（U+2013）**两边各一个空格，与档案现有写法一致。
 
 - [ ] **Step 4: 运行测试，确认通过**
@@ -1074,6 +1076,7 @@ Expected: 编译失败，`cannot find symbol: class PlanDocument`。
 - **标题之外的散文、列表、引用块、HTML 注释一律不动**——它们不进 `PlanDocument` 的模型，由 `MarkdownDocument` 原样保留。`PlanDocument.render()` 委托给内部持有的 `MarkdownDocument.render()`。
 - **单源约定**（spec §5.3）：`courses()` 的行由 §一 的「本学期课程」行生成。本任务先实现「§三 表格存在就解析它」；单源生成逻辑放到计划 3 的界面层，因为那需要用户交互才能决定何时同步。
 - 表格外的章节名（大标题、其他节）不参与模型。
+- **【Task 4 转交的缺口，本任务必须处理】** `TableBlock.setCell` 接受任意字符串，包括含**裸 `|`** 或 **`\r\n`** 的值；一旦置脏重新生成，就会产出多余列或坏行——这是模型**唯一**能产出畸形结构的路径。因此 `PlanDocument` 的每个写入口（`setGoal` / `setCourse` / `setBaseline` / `setPhase` / `setProfileItem` 等）在写入前**必须拒绝或转义**值中的裸 `|` 与换行，并配测试断言。**理由**：本项目的全部价值建立在「App 不会写坏用户的文件」之上，而这是唯一一条能把合法输入变成畸形 Markdown 的路径。
 
 - [ ] **Step 5: 写失败的测试 `GoalStateTest`**
 
