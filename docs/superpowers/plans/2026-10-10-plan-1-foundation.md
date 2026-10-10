@@ -24,7 +24,8 @@
 **编码与字节保真（最重要）**
 - 读写固定 **UTF-8（无 BOM）+ `\n`**；**不得使用平台默认编码**。
 - **不得做换行符转换**：读取保真优先于规范化。
-- **P1**：不修改就写回，**字节完全相同**（对任何输入都成立，含 CRLF / BOM 文件）。
+- **P1**：不修改就写回，**字节完全相同**（对任何**合法 UTF-8** 输入都成立，含 CRLF / BOM 文件）。
+- **非法 UTF-8 一律拒绝读取**：严格解码（`CharsetDecoder` + `CodingErrorAction.REPORT`），抛领域异常，**绝不返回 U+FFFD 替换过的字符串**（否则写回即毁坏用户文件；GBK 文件在中文 Windows 上常见）。
 - **P2**：只改一个字段，**只有该块内容变化**，其余块字节不变。
 - **P3**：迁移后，原文件所有**原样块文本行**逐行存在于新文件。
 - 新建文件固定 UTF-8 无 BOM + LF。
@@ -302,11 +303,14 @@ git commit -m "build: Maven 双模块骨架 + JavaFX 25.0.4 环境冒烟通过"
 - Test: `study-core/src/test/java/com/xiaoyiyuan/study/storage/EncodingTest.java`
 
 **Interfaces:**
-- Produces: `record TextFile(String content, boolean hasBom, boolean hasCrlf)`
-- Produces: `static TextFile TextFileCodec.read(Path path) throws IOException`
-- Produces: `static void TextFileCodec.write(Path path, String content) throws IOException`
-- Produces: `static String TextFileCodec.normalizeToLf(String content)`
+- Produces: `public record TextFile(String content, boolean hasBom, boolean hasCrlf)`
+- Produces: `public final class TextFileCodec`，含 `public static TextFile read(Path path) throws IOException`、`public static void write(Path path, String content) throws IOException`、`public static String normalizeToLf(String content)`
+- Produces: `public class NotUtf8Exception extends IOException`，消息含文件路径与首个非法字节偏移
 - Consumes: 无
+
+**`public` 不是可选项。** Task 9 的 `Migrator` 在 `com.xiaoyiyuan.study.migrate` 包，与 `storage` **不是同一个包**，却要消费 `TextFileCodec`；包私有会让 Task 9 直接编译不过。声明即 `public`。
+
+**严格解码也是硬要求**（见 Global Constraints 的 P1 条）：`read` 必须用 `CharsetDecoder` 的 `REPORT` 模式，非法字节序列抛 `NotUtf8Exception`，不得静默替换成 U+FFFD。对应测试 `invalidUtf8_isRejected_notSilentlyReplaced`。
 
 - [ ] **Step 1: 写失败的测试 `EncodingTest`**
 
