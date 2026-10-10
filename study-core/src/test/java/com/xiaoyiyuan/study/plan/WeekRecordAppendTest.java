@@ -100,12 +100,11 @@ class WeekRecordAppendTest {
         assertTrue(out.endsWith("\n"), "结尾应有换行");
     }
 
-    // ---- 以下两个是补充用例（brief 的 7 个用例逐字保留），补的是「重排式实现能蒙过去」的地方 ----
+    // ---- 以下 5 个是补充用例（brief 的 7 个用例逐字保留），补的是「重排式实现 / 锚点放宽能蒙过去」的地方 ----
 
     @Test
     void appendWeek_newWeekReadsBackThroughTheSameParser() {
         // appendWeek 写出去的文本必须能被 parseWeeks 原样读回来：新周有完整四行、既有周一条不少。
-        // 若哪天有人把模板或标题格式改了，这里会先亮——而不是等到界面显示时才看出来。
         String out = WeekRecordAppender.appendWeek(MD, 4);
         List<WeekRecord> weeks = WeekRecordAppender.parseWeeks(out);
 
@@ -118,7 +117,6 @@ class WeekRecordAppendTest {
         assertEquals(List.of("- 本周计划：", "- 实际完成：", "- 卡住的点：", "- 下周行动："),
                 week4.bullets(), "四行模板必须逐字、按序落在这一周下面");
 
-        // 既有的两周逐字未变（标题与项目行都从新文本里读出来，最接近「界面看到什么」）
         assertEquals("### 2026-09-14 – 2026-09-20（第 1 周 ｜ 周一–周日）", weeks.get(0).heading());
         assertEquals(List.of("- 本周计划：单词 20 分钟", "- 实际完成：单词 6 天"), weeks.get(0).bullets());
         assertEquals(List.of("- 实际完成：进行中"), weeks.get(1).bullets());
@@ -126,13 +124,9 @@ class WeekRecordAppendTest {
 
     @Test
     void appendWeek_historyAndTrailingSectionsAreByteIdentical_aroundTheNewWeek() {
-        // 这条是冲着「重建整篇再写回」那种实现去的：把新周与 §十 之间的一切（周记录章节结尾的
-        // `---` 与空行、§十 整节、文末 HTML 注释）要求逐字节等于原文里对应的那一段。
-        // 重建式实现会把空行/分隔线按自己的排版重写一遍，于是这里会失败。
+        // 期望文本刻意写死（不从 MD 推导）：MD 改了也不会跟着一起变，标准答案是独立的。
         String out = WeekRecordAppender.appendWeek(MD, 4);
 
-        // 期望文本刻意写死（不从 MD 里推导）：一旦有人把 MD 改了，这条不会跟着一起变，
-        // 于是「新周该长什么样、历史该长什么样」始终有一个独立的标准答案。
         String expected = """
                 # 学习与生活计划 · 测试
 
@@ -155,6 +149,7 @@ class WeekRecordAppendTest {
                 - 实际完成：
                 - 卡住的点：
                 - 下周行动：
+
                 ## 十、待确认
 
                 1. 目标院校
@@ -163,8 +158,25 @@ class WeekRecordAppendTest {
                 """;
 
         assertEquals(expected, out,
-                "新文本必须逐字等于「原文里 §九 结尾的 `---` 之前的全部历史 + 新周块 + 原文那一行 `---`"
-                        + " + 原文 §十 及之后」；任何一处被重排（空行、分隔线、历史周内容）都会让这条失败");
+                "新文本必须逐字等于「原文里 §九 结尾的 `---` 之前的全部历史 + 新周块（末尾带一个空行）"
+                        + " + 原文那一行 `---` + 原文 §十 及之后」；任何一处被重排都会让这条失败");
+    }
+
+    @Test
+    void appendWeek_newWeekIsSeparatedFromFollowingSectionByABlankLine() {
+        // 块边界只由零字符空行产生（全局约束），所以「新周最后一行」与「下一个 `## ` 标题」之间
+        // 必须有一个空行；否则两者落进同一个块，按块读取的人会把它们看成一回事。
+        // 两种插入点都要成立：有下一个 `## `（插到它之前）与没有（插到文档末尾）。
+        String withNextSection = WeekRecordAppender.appendWeek(MD, 4);
+        assertTrue(withNextSection.contains("- 下周行动：\n\n## 十、待确认"),
+                "新周与 §十 之间必须有一个空行");
+        assertTrue(hasBlankLineBeforeEverySectionHeading(withNextSection),
+                "结果里每个 `## ` 标题之前都必须是一个空行");
+
+        String atEnd = WeekRecordAppender.appendWeek("# 计划\n\n## 九、周记录（每周追加，不覆盖）\n\n", 3);
+        assertTrue(atEnd.endsWith("- 下周行动：\n\n"),
+                "插到文档末尾时，新周块自身也以空行收尾");
+        assertTrue(atEnd.endsWith("\n"), "且结果仍以换行结尾");
     }
 
     @Test
@@ -206,6 +218,87 @@ class WeekRecordAppendTest {
         assertTrue(out.contains("  - **9/21 周一 D1 ✅**"), "缩进的子条目必须一字不动");
         assertTrue(out.contains("$1-\\cos x\\sim\\frac{x^2}{2}$，$a_n<2$"), "第二个公式也必须一字不动");
         assertTrue(out.contains("### 2026-09-28 – 2026-10-04（第 3 周 ｜ 周一–周日）"));
+    }
+
+    @Test
+    void appendWeek_weeklySectionIsAnchoredBySectionNineOnly() {
+        // 锚点是钉死的：只有 `## 九、周记录（每周追加，不覆盖）` 才是周记录章节。周记录在 §六 的
+        // 文档（迁移前真实档案的形状）必须被拒绝——不许「顺手也认一下 §六」：那样插入点就不再是
+        // 从一个已知章节里挑出来的，而且 Task 6 的 PlanDocument 也是「序号 + 标题名逐字匹配」，
+        // 只在这里放宽会让两处对「哪一节是周记录」有两种说法。
+        String sectionSix = """
+                # 学习与生活计划 · 测试
+
+                ## 六、周记录（每周追加，不覆盖）
+
+                ### 2026-09-21 – 2026-09-27（第 2 周 ｜ 周一–周日）
+
+                - 实际完成：进行中
+
+                ---
+
+                ## 七、待确认
+
+                <!-- 周界固定为周一–周日 -->
+                """;
+        String before = sectionSix;
+
+        assertThrows(IllegalStateException.class, () -> WeekRecordAppender.appendWeek(sectionSix, 3),
+                "§六 不是周记录章节，必须拒绝而不是插进去");
+        assertEquals(before, sectionSix, "被拒绝的调用不能改动入参");
+        assertFalse(WeekRecordAppender.hasWeek(sectionSix, 3), "拒绝之后文档里仍然没有第 3 周");
+    }
+
+    @Test
+    void hasWeek_onlyMatchesHeadings_mentionsOfAWeekNumberDoNotCount() {
+        // 正文里「第 4 周」这种提法不能被当成标题，否则 hasWeek 会为真、appendWeek 会拒绝一次
+        // 其实合法的追加（最难查的一类错）。档案里真实存在这种句子：
+        // 「卡在极限的概念、性质及存在准则……第 2 周第 1 晚（9/21）补上」。
+        String mentionsOnly = """
+                # 学习与生活计划 · 测试
+
+                ## 九、周记录（每周追加，不覆盖）
+
+                ### 2026-09-21 – 2026-09-27（第 2 周 ｜ 周一–周日）
+
+                - 卡住的点：存在准则例题还没动手做过，第 4 周第 1 晚（10/5）补上
+                - 下周行动：第 4 周再说
+
+                ---
+
+                ## 十、待确认
+                """;
+
+        assertFalse(WeekRecordAppender.hasWeek(mentionsOnly, 4),
+                "只是在正文里提到「第 4 周」不算已有记录");
+
+        String out = WeekRecordAppender.appendWeek(mentionsOnly, 4);
+        assertTrue(out.contains("### 2026-10-05 – 2026-10-11（第 4 周 ｜ 周一–周日）"),
+                "正文提到过也必须照样能追加");
+        assertEquals(List.of("- 卡住的点：存在准则例题还没动手做过，第 4 周第 1 晚（10/5）补上",
+                        "- 下周行动：第 4 周再说"),
+                WeekRecordAppender.parseWeeks(out).get(0).bullets(),
+                "提到周号的正文行必须原样保留，且不被当成新的周记录");
+    }
+
+    /** 每个二级标题（{@code ## }）之前那一行必须是空行——块边界只由空行产生。 */
+    private static boolean hasBlankLineBeforeEverySectionHeading(String markdown) {
+        List<String> lines = linesOf(markdown);
+        int checked = 0;
+        for (int i = 1; i < lines.size(); i++) {
+            if (lines.get(i).strip().startsWith("## ")) {
+                checked++;
+                assertTrue(lines.get(i - 1).isEmpty(),
+                        "第 " + i + " 行是二级标题，但它前面一行不是空行：["
+                                + lines.get(i - 1).strip() + "]");
+            }
+        }
+        return checked > 0;
+    }
+
+    /** 按 {@code '\n'} 切行并去掉行尾符；只用于测试里的结构断言。 */
+    private static List<String> linesOf(String text) {
+        return List.of(text.split("\n", -1));
     }
 
     private static int firstDiff(String a, String b) {

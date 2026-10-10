@@ -148,8 +148,13 @@ public final class WeekRecordAppender {
      * <p>插入点固定两条规则（先写清白，代码里也只有这一处实现）：
      * <ol>
      *   <li>周记录章节标题之后遇到的下一个二级标题（{@code ## }）之前——也就是 §十 之前；</li>
-     *   <li>没有下一个二级标题时，插到文档末尾，并保证结果仍以换行结尾。</li>
+     *   <li>没有下一个二级标题时，插到<b>文档末尾</b>（整篇最后一个字符之后），并保证结果仍以换行结尾。</li>
      * </ol>
+     *
+     * <p><b>两条规则共同保证的性质</b>：新周块<b>末尾总是一个空行</b>。插在二级标题之前时它把新周
+     * 与下一节分开；插到文档末尾时，文档本来那个收尾空行承担同样的作用。少了它，新周最后一行
+     * （{@code "- 下周行动："}）会和后面的 {@code ## } 标题落进同一个块——块边界只由空行产生
+     * （全局约束），所以这不是排版偏好，是块的正确性。
      *
      * <p>本章节标题之前必须能定位到<b>那一个</b>章节标题（{@link #requireWeeklySection}）：
      * 找不到就报错退出。这是为了让「插入点」永远落在周记录章节<b>里面</b>，而不是靠
@@ -176,8 +181,10 @@ public final class WeekRecordAppender {
         String prefix = join(lines, 0, insertAt);
         String suffix = join(lines, insertAt, lines.size());
 
-        // 插在某个二级标题之前时，前缀末尾已经是空行（含「最后一个换行符」），因此这里不加任何
-        // 补白字符——多加一个就破坏了「插入点之前逐字节相同」这条硬要求（有测试守着）。
+        // 插在某个二级标题之前时，前缀末尾已经是空行（含「最后一个换行符」），所以这里只需拼上
+        // 新周块本身——块内部自带收尾空行（见 weekBlock），于是「下一个 `## ` 标题之前那一行必是
+        // 空行」这条性质成立。注意：这个空行在插入块内部，动不到前缀，「插入点之前逐字节相同」
+        // 不受影响。
         String insertion = insertAt < lines.size()
                 ? weekBlock(weekNumber)
                 : endOfFileBlock(prefix, weekNumber);
@@ -211,10 +218,10 @@ public final class WeekRecordAppender {
     /**
      * 插入点在 {@code lines} 里的下标（即「插入后新块从第几行开始」）。
      *
-     * <p>规则只有两条，见 {@link #appendWeek(String, int)} 的说明。第二条的「文档末尾」刻意指
-     * <b>最后一个非空行的下一个换行符之后</b>，而不是「整篇最后一个字符之后」：若文末本来就有
-     * 空行，标题直接跟在整篇末尾会让上一段内容紧贴标题；退到那个换行符之后，效果是
-     * 「不会给上一段内容加空行」的插入。两种判法都不会改动任何既有字节（前缀与后缀都来自原文）。
+     * <p>规则只有两条，见 {@link #appendWeek(String, int)} 的说明。第二条的「文档末尾」是
+     * <b>整篇最后一个字符之后</b>（返回 {@code lines.size()}），而不是「最后一个非空行之后」：
+     * 后者会插到文档已有的收尾空行<b>之前</b>，把新周夹在正文与那些空行中间。按字面插到最末尾，
+     * 文档本来那个收尾空行就自然成了新周与后文之间的分隔——不额外补空行，也不覆盖它。
      */
     private static int insertionPointIndex(List<String> lines, int anchorLine) {
         for (int i = anchorLine + 1; i < lines.size(); i++) {
@@ -222,34 +229,40 @@ public final class WeekRecordAppender {
                 return i;
             }
         }
-        for (int i = lines.size() - 1; i >= 0; i--) {
-            if (!lines.get(i).isBlank()) {
-                return i + 1;
-            }
-        }
         return lines.size();
     }
 
     /**
-     * 插到文末时用的文本：与前文之间补一个空行，并保证结果以换行结尾。
+     * 插到文末时用的文本：新周块 + 保证结果仍以换行结尾。
      *
-     * <p>为什么先算 {@code newlineNeeded} 而不是直接写 {@code "\n\n" + block}：文档末尾可能本来
-     * 就没有换行符（最后一行缺行尾），此时只补一个换行即可，补两个会在正文与标题之间留下一个
-     * 多出来的空行。写这两行是因为「保证以换行结尾」是 brief 与测试都点名的要求。
+     * <p>只可能补<b>一个</b>换行符，且只在文档最后一行缺行尾符时补（例如文末是
+     * {@code "…- 下周行动："} 而没有收尾换行）。这里刻意<b>不</b>再补一个空行：文末本来就没有空行
+     * 时，新周块自己的收尾空行已经把它与前文分开；再补一个就会凭空多出一行，让「插到末尾」的
+     * 结果和「插在某个二级标题之前」的结果长得不一样。
      */
     private static String endOfFileBlock(String prefix, int weekNumber) {
         String newlineIfMissing = prefix.endsWith("\n") ? "" : "\n";
-        return newlineIfMissing + "\n" + weekBlock(weekNumber);
+        return newlineIfMissing + weekBlock(weekNumber);
     }
 
-    /** 新一周的文本块：标题行 + 空行 + 四行模板；日期一律来自 {@link WeekCalendar}。 */
+    /**
+     * 新一周的文本块：标题行 + 空行 + 四行模板 + <b>一个收尾空行</b>；日期一律来自
+     * {@link WeekCalendar}。
+     *
+     * <p><b>为什么末尾必须是一个空行</b>：块边界只由零字符空行产生（全局约束），所以少了这个空行，
+     * 新周的最后一行 {@code "- 下周行动："} 就会和紧跟的 {@code ## 十、待确认} 挤在同一个块里——
+     * 下游按块读的人会把「周记录的最后一项」和「下一节的标题」看成一回事。文件自身的写法也是这样
+     * （查档案：每周的项目行之后都留一个空行）。
+     *
+     * <p>这个空行<b>不会</b>影响「插入点之前逐字节相同」：它在插入块内部，前缀一个字符都没动。
+     */
     private static String weekBlock(int weekNumber) {
         StringBuilder sb = new StringBuilder();
         sb.append(headingOf(weekNumber)).append('\n').append('\n');
         for (String bullet : TEMPLATE_BULLETS) {
             sb.append(bullet).append('\n');
         }
-        return sb.toString();
+        return sb.append('\n').toString();
     }
 
     /**
