@@ -81,14 +81,15 @@ class RoundTripTest {
     }
 
     @Test
-    void parse_booleanFlagIsNotEnough_blankRunEndsTheBlock() {
+    void parse_blankRunEndsTheBlock() throws IOException {
         // 「甲\n\n乙」里 乙 前面有空行，所以 乙 不在 甲 那一块里——空行是分块边界，
-        // 不是「可以跨过去继续攒」的填充物。用错状态的实现（例如只用一个布尔量记「见过非空行」）
-        // 会把它合成一块，字节拼接仍然对，块结构却错了，后续 Task 4/5 会踩到。
+        // 不是「可以跨过去继续攒」的填充物。只用「此前是否见过非空行」这一个布尔量来记状态的实现
+        // 会把它合成一块：字节拼接仍然对，块结构却错了（后续 Task 4/5 会踩到）。
+        // 这条用例就是为本任务实现过程中真实出现过的那个 bug 写的。
         String text = "甲\n\n乙";
         MarkdownDocument doc = MarkdownParser.parse(text);
 
-        assertEquals(2, doc.blocks().size(), "空行run 之后的非空行必须开新块");
+        assertEquals(2, doc.blocks().size(), "空行之后的非空行必须开新块");
         assertEquals("甲\n\n", doc.blocks().get(0).render());
         assertEquals("乙", doc.blocks().get(1).render());
     }
