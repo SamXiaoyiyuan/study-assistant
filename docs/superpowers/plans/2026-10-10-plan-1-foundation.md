@@ -55,6 +55,14 @@
 - maven-compiler-plugin `3.16.0` ｜ maven-surefire-plugin `3.6.0`
 - `maven.compiler.release` = `25`；`project.build.sourceEncoding` = `UTF-8`
 
+**已实测的环境陷阱（Task 1 用代价换来的，后续任务必读）**
+
+- **本机是 Windows PowerShell 5.1**，其 `Out-File -Encoding utf8` 与 `Set-Content -Encoding utf8` **都会写出 BOM**。要产出本项目要求的「UTF-8 无 BOM + LF」，唯一可靠路径是：
+  `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))`，并确保 `$text` 里是 `\n` 而非 `\r\n`。默认的 `>` 重定向与 `Out-File` 写的是 **UTF-16LE + BOM + CRLF**，既违反本约束，文本工具也读不了。
+- **`mvn javafx:run` 不会转发子 JVM 的 stdout/stderr**（Apache Commons Exec，无 stream pump）。因此：① 带不带 `--enable-native-access=javafx.graphics`，`mvn javafx:run` 的输出**逐字节相同**，无法用它证明该 flag 的效果；② 要看应用自身的标准输出/错误，必须**直接用 JVM 启动**（用插件构建的同一条命令行：同样的 `--module-path`、classpath、主类）。
+- **`javafx:run` 的前缀目标不能与 `-am` 同用**（见 Task 1 Step 6 的实测结论）。
+- **本机显示器约 1.88–2.0 倍 DPI 缩放。** `GetWindowRect` 返回**逻辑**坐标，而截图位图是**物理**像素——两者不是同一坐标空间，按逻辑坐标裁剪会偏移约 2 倍。另外 `PrintWindow(PW_RENDERFULLCONTENT)` **拿不到** JavaFX 场景内容（只拿到原生标题栏）。UI 相关取证必须在同一个坐标空间内完成。
+
 **测试纪律**
 - 测试用**脱敏样例**，**绝不把真实档案提交进仓库**。
 - `RoundTripTest` 与 `MigrationFidelityTest` 必须常绿。它们跑不过就不允许改动界面代码——它们守的是用户的数据。
