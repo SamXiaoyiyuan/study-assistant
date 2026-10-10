@@ -252,12 +252,23 @@ Expected: BUILD SUCCESS，无 "Could not resolve dependencies"。
 
 若报 JavaFX `25.0.4` 无法解析，按此顺序退：`25.0.3` → `25.0.2` → `25.0.1`。**不要**升到 26+（26 及以上要求 JDK 26+，本机是 JDK 25）。
 
-- [ ] **Step 6: 运行，人工确认窗口出现**
+- [ ] **Step 6: 运行，确认窗口出现并渲染中文**
 
-Run: `MVN -pl study-desktop javafx:run`
-Expected: 弹出一个标题为「环境冒烟」、宽 420 高 200 的窗口，显示中文「环境冒烟通过 · 中文渲染正常」，**无方块、无乱码**。关闭窗口后命令结束。
+Run: `MVN -pl study-desktop -am javafx:run`
 
-这一步同时验证了两件事：JavaFX 能在 JDK 25 上跑起来（风险 1），以及中文渲染正常（风险 3）。**任何一项不通过就在这里停下来解决，不要往下写业务代码。**
+**必须带 `-am`（also-make）。** 不带时 Maven 只把 `study-desktop` 放进 reactor，`study-core` 解析不到——在干净仓库上 `-pl study-desktop javafx:run` **会直接失败**（`package` 不会把 `study-core` 装进本地仓库；只有 `install` 才会）。`-am` 把 `study-core` 一并纳入 reactor。已实测 Reactor Build Order 为 `study-assistant → study-core → study-desktop`。
+
+Expected:
+- 弹出标题为「环境冒烟」的窗口，客户区 420×200，显示中文「环境冒烟通过 · 中文渲染正常」，**无方块、无乱码**。
+- run 日志中**没有** JDK 25 原生访问 WARNING（由 `--enable-native-access=javafx.graphics` 消除）。
+
+**怎么取证（别用错方法）**：
+- **不要**截全屏然后声称窗口在里面。本机显示器为 **200% 缩放**（物理 3200×2000 / 逻辑 1600×1000），而 JavaFX 按**物理像素**定位窗口；裁剪区域若按逻辑坐标算，就会偏移 2 倍——要么截到别的窗口，要么截到空白。这正是 Task 1 第一次取证失败的真实原因。
+- 可靠做法：先按 `MainWindowTitle` 找到窗口与句柄，再 `GetWindowRect` 取**物理**坐标后 `CopyFromScreen`。
+- `PrintWindow(PW_RENDERFULLCONTENT)` **拿不到** JavaFX 场景内容（只能拿到原生标题栏），不要用它。
+- **人工确认是最终权威**：截图为辅，人眼看窗口为主。
+
+这一步同时验证两件事：JavaFX 能在 JDK 25 上跑起来（风险 1），中文渲染正常（风险 3）。**任何一项不通过就在这里停下来解决，不要往下写业务代码。**
 
 - [ ] **Step 7: Commit**
 
@@ -1889,7 +1900,7 @@ git commit -m "feat(core): 配置与路径（study 目录 / 暂缓目标显示�
 
 - [ ] `MVN -pl study-core test` 全绿，包含 `RoundTripTest`、`PartialEditTest`、`TableParseTest`、`EncodingTest`、`WeekBoundaryTest`、`PlanDocumentTest`、`GoalStateTest`、`WeekRecordAppendTest`、`BackupRotationTest`、`ExternalModificationTest`、`MigrationFidelityTest`、`MigrationSafetyTest`、`AppConfigTest`
 - [ ] `MVN -pl study-core test -Dtest=RealFileRoundTripTest "-Dstudy.realFile=%USERPROFILE%\study\408-进度.md"` 通过：**13377 字节进、13377 字节出**
-- [ ] `MVN -pl study-desktop javafx:run` 弹出中文窗口无方块
+- [ ] `MVN -pl study-desktop -am javafx:run` 弹出中文窗口，无方块（注意 `-am` 不可省，见 Task 1 Step 6）
 - [ ] 迁移演练产出的预览文件已人工通读，6 周历史与 LaTeX 完好
 - [ ] `%USERPROFILE%\study\` 下的真实文件**一个字节都没被改动**（迁移演练只用了临时目录）
 - [ ] `git status` 干净，无预览文件残留、无真实档案入库
