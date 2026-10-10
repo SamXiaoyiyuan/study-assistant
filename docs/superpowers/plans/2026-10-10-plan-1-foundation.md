@@ -67,6 +67,8 @@
 - **`CharsetDecoder` 在 `CodingErrorAction.REPORT` 下，出错时 `ByteBuffer.position()` 已经指向非法序列的**起点**。** 不要写 `position() - result.length()` 之类的减法：`CharsetDecoder.decode` 在 REPORT 分支于「推进过坏字节」之前就 `return cr`，那步推进只发生在 IGNORE/REPLACE。实测：GBK 字节位于文件开头时正确偏移是 `in.position()` = 0，减法得到 **-1**。（结论来自 JDK 25 源码 `UTF_8.Decoder.malformedForLength` → `updatePositions(src, sp, …)`，以及 22 例对照独立 RFC-3629 扫描器的实测。）
 - **给实现者的 JDK / API 细节必须核实存在性，不能凭印象。** 本项目已两次因此返工：控制器曾要求调用 `MalformedInputException.getInputOffset()`（**JDK 中不存在**，该异常只有 `getInputLength()`），也曾给出上面那条错误的偏移公式。
 - **测试必须断言具体数值，弱条件抓不住这类错误。** 上面那个偏移 bug 是靠断言消息含 `偏移 0` 才被发现的；只断言「消息包含文件名」会放它过去。
+- **`String.contains` 是子串判断，`List.contains` 是 `equals` 判断，二者不等价。** 实测代价：`parseWeeks` 若把行尾 `\n` 留在 bullet 里，`bullets().contains("…")`（equals）为假，而同一断言的 `String.contains` 形式仍为真——Task 7 为此排查很久。**返回给调用方的集合元素必须去掉行尾换行符。**
+- **周记录锚点是 §九，不是 §六。** 旧档案 `408-进度.md` 的周记录在 §六，而 App 的写入目标是迁移后的 `学习与生活计划.md`（§六 内容搬入 §九，见 Task 9 映射表）。因此 `appendWeek` **只认 §九**：对未迁移的旧档案抛 `IllegalStateException` 且不改任何字节，这是**预期行为**。**不得**为兼容旧档案而放宽成「§六 或 §九」——那会引入「哪一节才是周记录」的歧义，正是 Task 6 双重重匹配要防的东西。
 
 **测试纪律**
 - 测试用**脱敏样例**，**绝不把真实档案提交进仓库**。
