@@ -870,7 +870,11 @@ Expected: 编译失败，`cannot find symbol: class WeekCalendar`。
 周序号 = floor((该日所在周的周一 − 2026-09-14) / 7 天) + 1
 ```
 
-用 `ChronoUnit.DAYS.between(ANCHOR_MONDAY, monday)` 取天数差后整除 7。用 `Math.floorDiv` 而非 `/`，这样锚点之前的日期也不会算错符号。
+用 `ChronoUnit.DAYS.between(ANCHOR_MONDAY, monday)` 取天数差后整除 7。
+
+**关于 `Math.floorDiv`：保留它，但不要声称它被测试守着。** 实测反证：把 `floorDiv` 换成 `/` 后**全部 61 个测试仍绿**——因为 `mondayOf` 必然返回周一，被除数（锚点到该周一的天数差）**永远是 7 的整数倍**，两者在整个 `LocalDate` 域上恒等，不存在能区分它们的输入。保留 `floorDiv` 的理由是**语义正确性与稳健性**：一旦有人把被除数换成别的天数差（例如「今天」而非「本周一」之差），`/` 就会在负数侧静默向零取整。测试不得声称覆盖了二者的差异。
+
+**编译陷阱**：`Math.floorDiv(long, int)` **没有适用重载**——`Math.floorDiv` 只有 `(int,int)` 与 `(long,long)`，Java 不为方法实参做拓宽转换。`DAYS_PER_WEEK` 是 `int` 时必须显式写成 `Math.floorDiv(days, (long) DAYS_PER_WEEK)`。
 
 `weekRangeLabel` 中间用**短破折号 `–`（U+2013）**两边各一个空格，与档案现有写法一致。
 
