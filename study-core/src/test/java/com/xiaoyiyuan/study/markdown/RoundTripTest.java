@@ -45,6 +45,11 @@ class RoundTripTest {
     void parseThenRender_emptyAndWhitespaceOnlyInput() {
         assertEquals("", MarkdownParser.parse("").render());
         assertEquals("\n\n", MarkdownParser.parse("\n\n").render());
+
+        String onlyNewlines = "\n\n\n";
+        MarkdownDocument doc = MarkdownParser.parse(onlyNewlines);
+        assertEquals(onlyNewlines, doc.render(), "整篇只有空行时必须原样返回");
+        assertEquals(1, doc.blocks().size(), "整篇只有空行：开头空行自成一块，不凭空多出空块");
     }
 
     @Test
@@ -115,6 +120,11 @@ class RoundTripTest {
         String notTerminated = "第一行\n第二行";
         assertEquals(notTerminated, MarkdownParser.parse(notTerminated).render(),
                 "文件末尾没有换行时不许补一个");
+
+        // 孤立 CR（老 Mac 换行）：本任务只认 '\n'，所以整篇成为一个块。这不影响保真——
+        // 「不认识它」等价于「不乱动它」；要不要规范化是用户显式操作的事。
+        String crOnly = "第一行\r第二行\r";
+        assertEquals(crOnly, MarkdownParser.parse(crOnly).render(), "孤立 CR 不得被吞掉或改写");
     }
 
     @Test
@@ -126,6 +136,22 @@ class RoundTripTest {
         assertEquals(original.length(), rendered.length(), "render() 不得增删任何字符");
         assertTrue(rendered.endsWith("\n"), "样例以换行结尾，render() 必须保留它");
         assertEquals(original, joined(MarkdownParser.parse(original)));
+    }
+
+    @Test
+    void parse_fixture_noBlankOnlyBlockAndLastBlockOwnsTrailingNewline() throws IOException {
+        // 结构性质的守卫：空行不许自成块（否则块序列里会有一堆语义为空的块），
+        // 且文档末尾的换行必须归属于最后一个真实块——这说明「空行挂前一块」真的生效了。
+        List<Block> blocks = MarkdownParser.parse(fixture()).blocks();
+
+        List<String> blankOnly = blocks.stream()
+                .map(Block::render)
+                .filter(r -> r.replace("\n", "").replace("\r", "").isEmpty())
+                .toList();
+        assertEquals(List.of(), blankOnly, "空行不得自成块");
+        Block last = blocks.get(blocks.size() - 1);
+        assertTrue(last.render().startsWith("<!--"), "样例最后一块应是末尾的 HTML 注释");
+        assertTrue(last.render().endsWith("-->\n"), "文件末尾的换行必须归最后一块所有");
     }
 
     @Test
