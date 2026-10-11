@@ -405,34 +405,59 @@ class EmotionFileTest {
         assertEquals(rendered, reparsed.render(), "再往返一次必须逐字节相同");
     }
 
-    /** 文件末块不以换行结尾、且还没有任何条目：`addEntry` 会走「追加到文末」那条路。 */
-    private static final String HEADER_ONLY = """
+    /**
+     * 文件末块不以空行结尾、且还没有任何条目：`addEntry` 会走「追加到文末」那条路。
+     *
+     * <p>两种子形状都要压——它们分别落在 {@code addEntry} 里那一个三元表达式的两个分支上：
+     * <ul>
+     *   <li>{@code HEADER_NO_LINE_END}：末块连换行都没有（{@code …---}），要补 {@code "\n\n"}；</li>
+     *   <li>{@code HEADER_ONE_LINE_END}：末块已以单个换行结尾（{@code …---\n}），只需再补一个
+     *       {@code "\n"}。</li>
+     * </ul>
+     * 只压其中一个，另一个分支就是一个绿着出去、其实没人守的洞（评审正是用这一条找到漏网的）。
+     */
+    private static final String HEADER_NO_LINE_END = """
             # 生活与情绪记录
 
             ---\
             """;
 
+    private static final String HEADER_ONE_LINE_END = "# 生活与情绪记录\n\n---\n";
+
     @Test
-    void addEntry_whenLastBlockHasNoTrailingNewline_stillRoundTrips() {
+    void addEntry_whenLastBlockHasNoTrailingBlankLine_stillRoundTrips() {
         // 只要文件里还有条目，addEntry 就插在第一个标题之前，走不到「追加到文末」那条路。
-        // 真正会追加到文末的是**没有任何条目**、且末块不是以换行结尾的文件——例如用户手工
-        // 删掉了所有记录。那时必须给末块补一个换行符，否则新条目会与末块挤在同一块里
-        // （末块没有 `## ` 标题，于是新条目跟着一起被跳过），写出的文件自己读不回来。
-        assertFalse(HEADER_ONLY.endsWith("\n"), "这份样例必须真的没有末尾换行，否则压不住那条路");
-        EmotionLog log = EmotionLog.parse(HEADER_ONLY);
-        assertEquals(0, log.entries().size());
-        assertEquals(HEADER_ONLY, log.render(), "先确认这份输入本身是保真的");
+        // 真正会追加到文末的是**没有任何条目**、且末块不是以空行结尾的文件——例如用户手工
+        // 删掉了所有记录。那时必须让末块以空行结尾，否则新条目的标题会与末块的最后一行挤进
+        // 同一个块（块边界只由零字符空行产生），新条目跟着整块一起被跳过：自己写出的文件自己读不回来。
+        for (String fixture : List.of(HEADER_NO_LINE_END, HEADER_ONE_LINE_END)) {
+            // fixture 的形状必须自己先断言，而不是假设：形状变了这两条就没有意义了
+            assertFalse(fixture.endsWith("\n\n"),
+                    "样例必须以「不以空行结尾」收尾，否则压不到追加到文末那条路："
+                            + fixture.replace("\n", "\\n"));
+            assertTrue(fixture.startsWith("# 生活与情绪记录")
+                            && (fixture.endsWith("---") || fixture.endsWith("---\n")),
+                    "样例末块必须是 `---`：[" + fixture.replace("\n", "\\n") + "]");
 
-        log.addEntry(new EmotionEntry(LocalDate.of(2026, 10, 11), "平静", 2, null, null, null, null, List.of()));
+            EmotionLog log = EmotionLog.parse(fixture);
+            assertEquals(0, log.entries().size(), "样例里本来不该有条目");
+            assertEquals(fixture, log.render(), "先确认这份输入本身是保真的");
 
-        String rendered = log.render();
-        EmotionLog reparsed = EmotionLog.parse(rendered);
-        assertEquals(1, reparsed.entries().size(), "追加之后必须读得回来");
-        assertEquals(LocalDate.of(2026, 10, 11), reparsed.entries().get(0).date());
-        assertEquals("平静", reparsed.entries().get(0).mood());
-        assertEquals(2, reparsed.entries().get(0).intensity());
-        assertEquals(rendered, reparsed.render(), "第二次往返逐字节相同");
-        assertEveryHeadingFollowsABlankLine(rendered);
+            log.addEntry(new EmotionEntry(LocalDate.of(2026, 10, 11), "平静", 2, null, null, null, null, List.of()));
+
+            String rendered = log.render();
+            // 关键：断言的是「新写出的文本能被本类自己读回来」，不只是 render() 里含某个子串——
+            // 一个 append 把标题写进上一个块的实现同样能「含有」那串字符，却读不回任何条目。
+            EmotionLog fresh = EmotionLog.parse(rendered);
+            assertEquals(1, fresh.entries().size(),
+                    "追加之后的文本必须能被重新解析出 1 条：[" + rendered.replace("\n", "\\n") + "]");
+            assertEquals(List.of(LocalDate.of(2026, 10, 11)),
+                    fresh.entries().stream().map(EmotionEntry::date).toList());
+            assertEquals("平静", fresh.entries().get(0).mood());
+            assertEquals(2, fresh.entries().get(0).intensity());
+            assertEquals(rendered, fresh.render(), "第二次往返逐字节相同");
+            assertEveryHeadingFollowsABlankLine(rendered);
+        }
     }
 
     /** 逐个 `## ` 标题检查：它前面必须是一个完整的空行（块边界只由空行产生）。 */
