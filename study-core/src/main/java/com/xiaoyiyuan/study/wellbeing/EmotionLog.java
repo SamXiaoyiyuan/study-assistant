@@ -272,11 +272,14 @@ public final class EmotionLog {
         }
         int at = firstEntryBlockIndex();
         if (at == blocks.size() && at > 0) {
-            // 追加到文末：原末块若不以换行结尾，新条目会与它挤在同一行，先补一个换行符
+            // 追加到文末：末块必须以**空行**结尾，否则新条目的标题会与末块的最后一行挤进同一个块。
+            // 块边界只由零字符空行产生——只补一个换行符（`---\n## …`）仍然是一块，而那一块里
+            // 标题不是行首那一行，新条目就会跟着整块一起被跳过：写出的文件自己读不回来
+            // （实测就是这个结果：追加之后 0 条）。末块本来就以空行结尾时一个字节都不动。
             Block last = blocks.get(at - 1);
             String text = last.render();
-            if (!text.isEmpty() && !text.endsWith("\n")) {
-                blocks.set(at - 1, newTextBlock(text + "\n"));
+            if (!text.endsWith("\n\n")) {
+                blocks.set(at - 1, newTextBlock(text + (text.endsWith("\n") ? "\n" : "\n\n")));
             }
         }
         // slot 的插入次序必须用「插入之前」的下标来数：blocks.add 之后同一个下标已经指向下一个块了
@@ -325,7 +328,16 @@ public final class EmotionLog {
     /**
      * 删除第 {@code index} 条（下标按 {@link #entries()} 的顺序）。
      *
-     * <p>连同归属于这一块的尾部空行一起删掉，否则文件里会留下一段来历不明的空行。
+     * <p>连同这一段自己的字节一起删掉，之后条目的块下标整体前移。
+     *
+     * <p><b>这里刻意不做「保留一个空块占位」的花样。</b>曾经担心「分隔空行会被一起删掉」，实测
+     * （打印块序列）不成立：{@code MarkdownParser} 把空行归给<b>它前面</b>那一块，所以首条标题
+     * 之前的那个空行落在 {@code ---} 块里（{@code ---\n\n}），并不属于被删的这一段。删掉首条之后，
+     * 新的首条 `## ` 标题之前仍然是一个完整空行（{@code ---\n\n## …}），重新解析照样读得回两条。
+     * 保留空块反而会多出一个零字节块、让「块序列 ↔ 槽位」的对应变得不直观。
+     *
+     * <p>与其留一个「防御性」的复杂写法，不如把这条性质用测试钉住——
+     * 见 {@code removeFirstEntry_keepsTheSurvivorsSeparatorBlankLine}。
      *
      * @throws IndexOutOfBoundsException 下标越界
      */
@@ -460,8 +472,10 @@ public final class EmotionLog {
                         value = value.substring(0, m.start());
                     }
                     // 情绪词两侧的空白剥掉：两侧空白是分隔符的一部分，不是情绪词的内容。
-                    // 这是**唯一**一处会吃掉空白的取值；换来的是一切写法（半角/全角空格、
-                    // 有没有空格）都能读成同一个情绪词，而不是被判成「读不出来」。
+                    // 这是**字段值**里唯一会吃掉空白的地方（另一处是下面 headingOf 对标题整行的
+                    // strip——那里剥掉的只是行首缩进与行尾空白，标题从不参与重新生成，所以安全）；
+                    // 换来的是一切写法（半角/全角空格、有没有空格）都能读成同一个情绪词，
+                    // 而不是被判成「读不出来」。
                     mood = value.strip();
                 } else if (isField(body, FIELD_SLEEP)) {
                     sleep = withoutLineEnding(body.substring(fieldPrefixLength(FIELD_SLEEP)));
@@ -497,9 +511,19 @@ public final class EmotionLog {
 
     // =====================================================================
     // 标题行（形状识别与日期解析分开：形状不认识 → 不是条目；形状认识但日期坏 → 报错）
+    //
+    // 这里只说「以 ## 开头」，日期是否合法由 dateOfHeading 判——于是 `## 只有文字` 这类形状
+    // 会走到 parse 阶段并报错（带原文），而不是被当成散文悄悄略过。
     // =====================================================================
 
-    /** 该块里的 {@code ## } 标题行（已 strip）；没有就返回 {@code null}。 */
+    /**
+     * 该块里的 {@code ## } 标题行（已 strip）；没有就返回 {@code null}。
+     *
+     * <p>这里对整行用 {@code strip()}，与 {@link #parseEntry} 里只剥行首的做法<b>不同</b>，
+     * 而且是有意的：标题行从不参与重新生成（脏条目按 {@code EmotionEntry#headingLabel} 重写），
+     * 所以行首缩进与行尾空白被剥掉不会丢任何字节；反过来，容忍行首缩进能让「缩进了一格的标题」
+     * 照常被认出来，而不是整个条目降级。字段值那边就不行——那些字节会被重新生成。
+     */
     private static String headingOf(List<String> lines) {
         for (String line : lines) {
             String stripped = line.strip();
@@ -513,9 +537,20 @@ public final class EmotionLog {
     /**
      * 块里标题行的日期。
      *
-     * <p>形状对得上 {@link #HEADING} 就取其中的日期部分；对不上（例如 {@code ## 随便写点什么}）
-     * 就去掉 {@code ## } 之后整串交给 {@code LocalDate.parse}——那样必然失败并抛错。
-     * 两条路都失败时抛 {@link IllegalArgumentException} 并在消息里带标题原文，绝不静默略过。
+     * <p>实际有三条路，按顺序：
+     * <ol>
+     *   <li>整行匹配 {@link #HEADING}（{@code ## yyyy-MM-dd（周X）}）→ 取捕获组里的日期；</li>
+     *   <li>不匹配 → 把 {@code ## } 之后的<b>整串</b>交给 {@code LocalDate.parse}。
+     *       这一步<b>不只</b>接「日期本身坏掉」的形状：{@code ## 2026-10-10} 这种<b>省略了星期</b>
+     *       的写法会在这里被<b>接受</b>（整串正好是合法 ISO 日期），而 {@code ## 2026-10-10(周六)}
+     *       这种半角括号、或 {@code ## 随便写点什么} 会失败并抛错。</li>
+     * </ol>
+     *
+     * <p><b>省略星期的写法是有意接受的</b>：星期只是给人看的显示细节，日期才是条目的身份；
+     * 一个用户手写漏了 `（周六）` 的文件不因此变得不可读，条目照旧能被定位、编辑、删除。
+     * 半角括号这类形状仍然报错（见下），因为那说明标题确实不是本文件的形态，猜它等于替用户改字。
+     *
+     * <p>失败时抛 {@link IllegalArgumentException}，消息里带标题原文，绝不静默略过。
      */
     private static LocalDate dateOfHeading(Block block) {
         String heading = headingOf(blockLines(block));

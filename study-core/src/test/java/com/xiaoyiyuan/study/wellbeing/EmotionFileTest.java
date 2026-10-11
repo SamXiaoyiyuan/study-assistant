@@ -323,9 +323,128 @@ class EmotionFileTest {
         String rendered = log.render();
         assertFalse(rendered.contains("2026-10-10"), "被删的条目一个字都不许留");
         assertTrue(rendered.startsWith("# 生活与情绪记录"));
-        assertEquals(SAMPLE.substring(SAMPLE.indexOf("## 2026-10-09")),
-                rendered.substring(rendered.indexOf("## 2026-10-09")),
-                "留下的条目逐字不变");
+        // 删的是首条：它前面没有「与上一条之间的分隔空行」要留，所以留下的条目逐字不变，
+        // 包括它自己的收尾换行；那个被清空的块贡献零字节（不额外添一个空行）。
+        assertTrue(rendered.endsWith("## 2026-10-09（周五）\n\n- 情绪：平静 ｜ 强度：2\n"),
+                "留下的条目逐字不变，且文件仍以一个换行结尾");
+        assertEveryHeadingFollowsABlankLine(rendered);
+    }
+
+    /** 三条目样例：用来压「删中间一条」——这是条目之间那块分隔空行最容易丢的形状。 */
+    private static final String THREE_ENTRIES = """
+            # 生活与情绪记录
+
+            ---
+
+            ## 2026-10-10（周六）
+
+            - 情绪：疲惫 ｜ 强度：3
+
+            ## 2026-10-09（周五）
+
+            - 情绪：平静 ｜ 强度：2
+
+            ## 2026-10-08（周四）
+
+            - 情绪：低落 ｜ 强度：1
+            """;
+
+    @Test
+    void removeMiddleEntry_keepsSurvivorsByteIdenticalAndSeparated() {
+        EmotionLog log = EmotionLog.parse(THREE_ENTRIES);
+        assertEquals(3, log.entries().size());
+        log.removeEntry(1); // 删 2026-10-09
+
+        assertEquals(2, log.entries().size());
+        assertEquals(LocalDate.of(2026, 10, 10), log.entries().get(0).date());
+        assertEquals(LocalDate.of(2026, 10, 8), log.entries().get(1).date());
+
+        String rendered = log.render();
+        // (a) 幸存的条目逐字节不变
+        assertTrue(rendered.contains("## 2026-10-10（周六）\n\n- 情绪：疲惫 ｜ 强度：3\n"),
+                "第一条内容逐字不变");
+        assertTrue(rendered.contains("## 2026-10-08（周四）\n\n- 情绪：低落 ｜ 强度：1\n"),
+                "第三条内容逐字不变");
+        // (b) 重新解析得到的就是留下的这两条
+        EmotionLog reparsed = EmotionLog.parse(rendered);
+        assertEquals(2, reparsed.entries().size(), "删完必须还能读回两条");
+        assertEquals(List.of(LocalDate.of(2026, 10, 10), LocalDate.of(2026, 10, 8)),
+                reparsed.entries().stream().map(EmotionEntry::date).toList());
+        // (c) 每个 `## ` 标题之前都有空行
+        assertEveryHeadingFollowsABlankLine(rendered);
+        assertEquals(rendered, reparsed.render(), "再往返一次必须逐字节相同");
+    }
+
+    @Test
+    void removeFirstEntry_keepsTheSurvivorsSeparatorBlankLine() {
+        // 这条断言才是「只清文字、留下那个空块」这个写法的**判别性**证据。
+        // 分隔空行属于「被删的首条」那一块；把这一段连块一起删掉，新的首条 `## ` 标题就会
+        // 直接贴在 `---` 下面（`---\n## …`），块边界消失，重新解析时整条降级 → 0 条。
+        EmotionLog log = EmotionLog.parse(THREE_ENTRIES);
+        log.removeEntry(0); // 删 2026-10-10
+
+        assertEquals(2, log.entries().size());
+        assertEquals(LocalDate.of(2026, 10, 9), log.entries().get(0).date());
+        assertEquals(LocalDate.of(2026, 10, 8), log.entries().get(1).date());
+
+        String rendered = log.render();
+        // (a) 幸存条目逐字节不变
+        assertTrue(rendered.contains("## 2026-10-09（周五）\n\n- 情绪：平静 ｜ 强度：2\n"),
+                "新的首条内容逐字不变");
+        assertTrue(rendered.contains("## 2026-10-08（周四）\n\n- 情绪：低落 ｜ 强度：1\n"),
+                "第二条内容逐字不变");
+        // (c) 每个标题之前都有空行——尤其是新的首条，它前面必须仍是 `---` 之后那个空行
+        assertTrue(rendered.contains("---\n\n## 2026-10-09（周五）"),
+                "`---` 与新的首条标题之间必须保留空行");
+        assertEveryHeadingFollowsABlankLine(rendered);
+        // (b) 重新解析得到的就是留下的这两条
+        EmotionLog reparsed = EmotionLog.parse(rendered);
+        assertEquals(2, reparsed.entries().size(), "删完必须还能读回两条");
+        assertEquals(List.of(LocalDate.of(2026, 10, 9), LocalDate.of(2026, 10, 8)),
+                reparsed.entries().stream().map(EmotionEntry::date).toList());
+        assertEquals(rendered, reparsed.render(), "再往返一次必须逐字节相同");
+    }
+
+    /** 文件末块不以换行结尾、且还没有任何条目：`addEntry` 会走「追加到文末」那条路。 */
+    private static final String HEADER_ONLY = """
+            # 生活与情绪记录
+
+            ---\
+            """;
+
+    @Test
+    void addEntry_whenLastBlockHasNoTrailingNewline_stillRoundTrips() {
+        // 只要文件里还有条目，addEntry 就插在第一个标题之前，走不到「追加到文末」那条路。
+        // 真正会追加到文末的是**没有任何条目**、且末块不是以换行结尾的文件——例如用户手工
+        // 删掉了所有记录。那时必须给末块补一个换行符，否则新条目会与末块挤在同一块里
+        // （末块没有 `## ` 标题，于是新条目跟着一起被跳过），写出的文件自己读不回来。
+        assertFalse(HEADER_ONLY.endsWith("\n"), "这份样例必须真的没有末尾换行，否则压不住那条路");
+        EmotionLog log = EmotionLog.parse(HEADER_ONLY);
+        assertEquals(0, log.entries().size());
+        assertEquals(HEADER_ONLY, log.render(), "先确认这份输入本身是保真的");
+
+        log.addEntry(new EmotionEntry(LocalDate.of(2026, 10, 11), "平静", 2, null, null, null, null, List.of()));
+
+        String rendered = log.render();
+        EmotionLog reparsed = EmotionLog.parse(rendered);
+        assertEquals(1, reparsed.entries().size(), "追加之后必须读得回来");
+        assertEquals(LocalDate.of(2026, 10, 11), reparsed.entries().get(0).date());
+        assertEquals("平静", reparsed.entries().get(0).mood());
+        assertEquals(2, reparsed.entries().get(0).intensity());
+        assertEquals(rendered, reparsed.render(), "第二次往返逐字节相同");
+        assertEveryHeadingFollowsABlankLine(rendered);
+    }
+
+    /** 逐个 `## ` 标题检查：它前面必须是一个完整的空行（块边界只由空行产生）。 */
+    private static void assertEveryHeadingFollowsABlankLine(String text) {
+        String[] lines = text.split("\n", -1);
+        for (int i = 0; i < lines.length; i++) {
+            if (!lines[i].startsWith("## ")) {
+                continue;
+            }
+            assertTrue(i > 0, "标题 `" + lines[i] + "` 不能是整个文件的第一行");
+            assertEquals("", lines[i - 1], "标题 `" + lines[i] + "` 之前必须是一个空行");
+        }
     }
 
     @Test
@@ -425,6 +544,23 @@ class EmotionFileTest {
         assertEquals("低落", log.entries().get(0).mood());
         assertEquals(null, log.entries().get(0).intensity(), "没打分就是 null");
         assertEquals(text, log.render(), "不带强度的一行也要逐字节往返");
+    }
+
+    @Test
+    void weekdayLessHeading_isAcceptedOnPurpose() {
+        // 有意接受：星期只是显示细节，日期才是一条记录的身份。用户手写漏了 `（周四）`
+        // 不该让这条记录变得「读不出来」，它照旧能被定位、编辑、删除。
+        // 注意这与「非法日期」不同：`## 2026-13-45（周X）` 仍然抛错（见 invalidDateHeading…）。
+        String text = """
+                ## 2026-10-08
+
+                - 情绪：低落 ｜ 强度：1
+                """;
+        EmotionLog log = EmotionLog.parse(text);
+        assertEquals(1, log.entries().size());
+        assertEquals(LocalDate.of(2026, 10, 8), log.entries().get(0).date());
+        assertEquals("低落", log.entries().get(0).mood());
+        assertEquals(text, log.render(), "原样往返，不改用户的标题写法");
     }
 
     @Test
