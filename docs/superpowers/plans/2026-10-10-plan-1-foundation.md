@@ -1786,7 +1786,7 @@ Run: `MVN -pl study-core test -Dtest=RealMigrationPreviewTest "-Dstudy.realFile=
 
 | 要确认的 | 期望 |
 |---|---|
-| 6 周周记录 | 全部在 §九，LaTeX（`$1^\infty$`、`\sum_{k=1}^{n}\frac{n}{n^2+k}`）一个字符没变 |
+| **4 周**周记录（实测：第 1–4 周） | 全部在 §九，LaTeX（`$1^\infty$`、`\sum_{k=1}^{n}\frac{n}{n^2+k}`）一个字符没变 |
 | 阶段 A–E | 整表在 §八「考研（暂缓）」 |
 | 目标清单 | 三行：本学期学校课程（进行中/1）、生活与身心（进行中/2）、考研（408）（**暂缓**/—） |
 | 课程表 | 6 门：数据库、Java、线性代数、物理学、电路分析基础、马克思主义基本原理 |
@@ -1939,7 +1939,7 @@ git commit -m "feat(core): 配置与路径（study 目录 / 暂缓目标显示�
 - [ ] `MVN -pl study-core test` 全绿，包含 `RoundTripTest`、`PartialEditTest`、`TableParseTest`、`EncodingTest`、`WeekBoundaryTest`、`PlanDocumentTest`、`GoalStateTest`、`WeekRecordAppendTest`、`BackupRotationTest`、`ExternalModificationTest`、`MigrationFidelityTest`、`MigrationSafetyTest`、`AppConfigTest`
 - [ ] `MVN -pl study-core test -Dtest=RealFileRoundTripTest "-Dstudy.realFile=%USERPROFILE%\study\408-进度.md"` 通过：**13377 字节进、13377 字节出**
 - [ ] `MVN -q -DskipTests install` 后 `MVN -pl study-desktop javafx:run` 弹出中文窗口，无方块（顺序不可省，且**不能用 `-am`**，见 Task 1 Step 6）
-- [ ] 迁移演练产出的预览文件已人工通读，6 周历史与 LaTeX 完好
+- [ ] 迁移演练产出的预览文件已人工通读，**4 周**历史与 LaTeX 完好
 - [ ] `%USERPROFILE%\study\` 下的真实文件**一个字节都没被改动**（迁移演练只用了临时目录）
 - [ ] `git status` 干净，无预览文件残留、无真实档案入库
 
