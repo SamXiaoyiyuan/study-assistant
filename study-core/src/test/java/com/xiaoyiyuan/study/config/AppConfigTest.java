@@ -345,4 +345,165 @@ class AppConfigTest {
         assertTrue(text.contains("crisis.2.number=110"), "危机渠道逐条写出");
         assertTrue(text.contains("base_url=https://api.deepseek.com"), "值按字面写出");
     }
+
+    // —— 修复轮 1（复核 Major-1 / Minor-1 / Minor-2）：把删除保护从「API 层」钉到「文件层」 ——
+
+    /**
+     * 对抗性文件内容表：任何一份能被程序识别的危机渠道文件，保存之后都必须<b>仍然含有 120 与 110</b>。
+     *
+     * <p>复核发现的最小复现：文件里只有 {@code crisis.1.number=120}（用户手改、或半截写入、或别的
+     * 程序截断），{@code load} 忠实返回 1 条 → 用户只改了一个<b>无关字段</b> → {@code save()} →
+     * 磁盘上 110 永久消失。全程不经过 {@code setCrisisResources}，所以「删除保护只在 setter 里」
+     * 的旧实现对这个路径毫无办法，而旧测试全绿。
+     *
+     * <p>每条用例都走同一条路：写文件 → load → 改一个无关字段（学校心理中心）→ save → 重新读盘，
+     * 然后两路断言：① 重新 load 出来的号码表；② 磁盘原文里每个号码都有一条
+     * {@code crisis.N.number=<号码>} 行——只断言 ① 的话，「渲染时丢行」这类 bug 会漏网。
+     *
+     * <p>用例的选取各有分工：①② 各缺一条必需号码；③ 编号越界（{@code Integer.parseInt} 抛
+     * {@code NumberFormatException}，旧实现 {@code continue} 整条丢弃）；④ 负编号（旧实现直接丢）；
+     * ⑤ 编号跳跃（旧实现保留，是回归网）；⑥ 正常自定义列表，钉住「标签原样保留、顺序不变」。
+     * 前五条都不在旧实现的保护范围内，而 {@code 120}/{@code 110} 的存在是硬要求。
+     */
+    @Test
+    void crisisSave_fromAnyFileContent_keeps120And110(@TempDir Path dir) throws IOException {
+        assertEquals(List.of("只有 120 的文件", "只有 110 的文件", "越界编号", "负编号", "编号跳跃",
+                        "正常自定义列表"),
+                ADVERSARIAL_CRISIS_FILES.stream().map(AdversarialCrisisFile::name).toList(),
+                "①–⑥ 一条都不能少：少一条等于这张性质表少钉一个角");
+
+        for (AdversarialCrisisFile item : ADVERSARIAL_CRISIS_FILES) {
+            String context = "[" + item.name() + "] 文件原文：" + item.fileContent().replace("\n", "\\n");
+            Path f = dir.resolve("adversarial-" + item.name().hashCode() + ".properties");
+            writeConfig(f, item.fileContent());
+
+            AppConfig loaded = AppConfig.load(f);
+            loaded.setSchoolCounseling("校医院三楼 心理中心 021-1234-5678"); // 与危机渠道无关的一个字段
+            loaded.save();
+
+            AppConfig again = AppConfig.load(f);
+            List<String> numbers = again.crisisResources().stream().map(CrisisResource::number).toList();
+            String diskText = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+
+            for (String number : List.of("120", "110")) {
+                assertTrue(numbers.contains(number),
+                        context + " → 保存后重新 load 少了 " + number + "；实际号码表：" + numbers);
+                assertTrue(diskText.contains("crisis.") && diskText.contains(".number=" + number + "\n"),
+                        context + " → 保存后的文件里没有 " + number + " 的那一行；文件原文："
+                                + diskText.replace("\n", "\\n"));
+            }
+
+            assertEquals(item.expectedNumbers(), numbers, context + " → 保存后重新 load 的号码表/顺序");
+            for (String labelKey : item.preservedLabelKeys()) {
+                assertTrue(diskText.contains(labelKey),
+                        context + " → 用户可识别的条目被静默丢弃：" + labelKey + "；文件原文："
+                                + diskText.replace("\n", "\\n"));
+            }
+        }
+    }
+
+    /** {@link #crisisSave_fromAnyFileContent_keeps120And110} 的表行：文件原文 + 期望号码表 + 必须留存的标签/号码行。 */
+    private record AdversarialCrisisFile(String name, String fileContent, List<String> expectedNumbers,
+            List<String> preservedLabelKeys) {
+    }
+
+    /** 表本体。{@code expectedNumbers} 里的 120/110 由 load 的保底补齐，其余条目一律原样保留。 */
+    private static final List<AdversarialCrisisFile> ADVERSARIAL_CRISIS_FILES = List.of(
+            new AdversarialCrisisFile("只有 120 的文件",
+                    "studyDir=E:\\我的目录\ncrisis.1.label=急救\ncrisis.1.number=120\n",
+                    List.of("120", "110"),
+                    List.of("crisis.1.label=急救")),
+            new AdversarialCrisisFile("只有 110 的文件",
+                    "studyDir=E:\\我的目录\ncrisis.1.label=报警\ncrisis.1.number=110\n",
+                    List.of("110", "120"),
+                    List.of("crisis.1.label=报警")),
+            new AdversarialCrisisFile("越界编号",
+                    "crisis.2147483648.label=报警\ncrisis.2147483648.number=110\n",
+                    List.of("110", "120"),
+                    List.of("crisis.1.label=报警", "crisis.1.number=110")),
+            new AdversarialCrisisFile("负编号",
+                    "crisis.-1.label=学校附近求助点\ncrisis.-1.number=119\n",
+                    List.of("119", "120", "110"),
+                    List.of("crisis.1.label=学校附近求助点", "crisis.1.number=119")),
+            new AdversarialCrisisFile("编号跳跃",
+                    "crisis.5.number=110\n",
+                    List.of("110", "120"),
+                    List.of("crisis.1.number=110")),
+            new AdversarialCrisisFile("正常自定义列表",
+                    "crisis.1.label=我改的名字\ncrisis.1.number=120\n"
+                            + "crisis.2.label=报警\ncrisis.2.number=110\n"
+                            + "crisis.3.label=学校心理中心\ncrisis.3.number=1234-5678\n",
+                    List.of("120", "110", "1234-5678"),
+                    List.of("crisis.1.label=我改的名字", "crisis.3.label=学校心理中心",
+                            "crisis.3.number=1234-5678")));
+
+    /**
+     * 契约（Minor-2）：{@code setCrisisResources} 收到<b>含 null 元素</b>的列表时，必须抛
+     * {@link IllegalArgumentException} 并点明位置，不得让 {@link List#copyOf} 抛
+     * {@link NullPointerException}——javadoc 承诺的是 IAE，调用方按 IAE 写 catch 时会漏接 NPE，
+     * 而 NPE 的消息里只有一个下标数字，界面拿它没法给用户任何可读的解释。
+     */
+    @Test
+    void crisis_setWithNullElement_throwsIaeWithPosition(@TempDir Path dir) {
+        AppConfig c = AppConfig.load(dir.resolve("config.properties"));
+
+        IllegalArgumentException atZero = assertThrows(IllegalArgumentException.class,
+                () -> c.setCrisisResources(java.util.Arrays.asList(
+                        null, new CrisisResource("急救", "120"), new CrisisResource("报警", "110"))),
+                "含 null 元素必须按契约抛 IAE（旧实现抛的是 NPE）");
+        assertTrue(atZero.getMessage().contains("0"),
+                "消息必须点明位置（下标 0）；实际消息：" + atZero.getMessage());
+
+        IllegalArgumentException atOne = assertThrows(IllegalArgumentException.class,
+                () -> c.setCrisisResources(java.util.Arrays.asList(new CrisisResource("急救", "120"),
+                        null, new CrisisResource("报警", "110"))),
+                "null 出现在中间位置同样要拦");
+        assertTrue(atOne.getMessage().contains("1"),
+                "消息必须点明位置（下标 1）；实际消息：" + atOne.getMessage());
+
+        assertEquals(5, c.crisisResources().size(), "被拒绝的编辑不得改动已有配置");
+    }
+
+    /**
+     * 契约（Minor-2）：请求超时必须有上界——{@code Duration.ofSeconds(Long.MAX_VALUE)} 能被存下来，
+     * 直到真正发请求时 {@code toNanos()} 才抛 {@link ArithmeticException}，那时已经离「用户改设置」
+     * 很远，且异常用的是纳秒溢出这种对用户毫无意义的措辞。这里把上界钉在 24 小时：既是常见用例
+     * （60 秒～几分钟）的上千倍，又是「一定跑不完」的量级。
+     */
+    @Test
+    void requestTimeout_rejectsAbove24Hours_andKeeps24hBoundary(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("config.properties");
+        AppConfig c = AppConfig.load(f);
+
+        c.setRequestTimeout(Duration.ofHours(24)); // 上界本身合法，避免「一律拒绝大值」的假守护
+        c.save();
+        assertEquals(Duration.ofHours(24), AppConfig.load(f).requestTimeout(), "24 小时是闭区间上界");
+
+        IllegalArgumentException tooBig =
+                assertThrows(IllegalArgumentException.class, () -> c.setRequestTimeout(Duration.ofHours(24)
+                        .plusSeconds(1)), "超过 24 小时必须当场拒绝");
+        assertTrue(tooBig.getMessage().contains("24"),
+                "消息要能看懂：得说出上界是多少；实际消息：" + tooBig.getMessage());
+
+        assertThrows(IllegalArgumentException.class,
+                () -> c.setRequestTimeout(Duration.ofSeconds(Long.MAX_VALUE)),
+                "Long.MAX_VALUE 秒：存下去会在 toNanos() 溢出，必须在设置时就拒绝");
+        assertThrows(IllegalArgumentException.class, () -> c.setRequestTimeout(Duration.ofHours(25)));
+        assertThrows(IllegalArgumentException.class, () -> c.setRequestTimeout(Duration.ofDays(365)));
+
+        assertEquals(Duration.ofHours(24), c.requestTimeout(), "被拒绝的编辑不得改动已有配置");
+
+        // 文件里写了超界值时同样回退默认（「配置坏了也得能启动」），而不是把天文数字搬进内存。
+        writeConfig(f, "request_timeout=" + Long.MAX_VALUE + "\n");
+        assertEquals(Duration.ofSeconds(60), AppConfig.load(f).requestTimeout(), "文件里的超界值回退默认");
+        writeConfig(f, "request_timeout=86401\n");
+        assertEquals(Duration.ofSeconds(60), AppConfig.load(f).requestTimeout(), "86401 秒 > 24 小时，回退默认");
+        writeConfig(f, "request_timeout=86400\n");
+        assertEquals(Duration.ofHours(24), AppConfig.load(f).requestTimeout(), "86400 秒 = 24 小时，合法");
+    }
+
+    /** 测试用：把配置文件原文按 UTF-8（无 BOM）写到磁盘。 */
+    private static void writeConfig(Path file, String content) throws IOException {
+        Files.writeString(file, content, java.nio.charset.StandardCharsets.UTF_8);
+    }
 }
