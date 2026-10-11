@@ -220,6 +220,15 @@ class EmotionFileTest {
         assertFalse(rendered.contains("有点烦"), "被替换掉的那一段原文必须整段消失");
         assertEquals(1, countOccurrences(rendered, "## 2026-10-09"));
         assertEquals(2, EmotionLog.parse(rendered).entries().size(), "写出的文件必须能读回来");
+
+        // 这一段从两块缩成一块之后，后面那一条的块下标必须跟着前移。漏掉这一步，
+        // 下一次编辑就会写到邻居的字节上（这里用「再改一次第二条」把它逼出来）。
+        log.replaceEntry(1, new EmotionEntry(LocalDate.of(2026, 10, 9), "低落", 2, null, null, null, null, List.of()));
+        String second = log.render();
+        assertEquals(1, countOccurrences(second, "## 2026-10-09"));
+        assertTrue(second.contains("- 情绪：低落 ｜ 强度：2"));
+        assertFalse(second.contains("- 情绪：平静"), "第二条要被改掉，说明下标确实指向它自己");
+        assertTrue(second.contains("- 情绪：开心 ｜ 强度：4"), "第一条不许被误改");
     }
 
     private static int countOccurrences(String text, String needle) {

@@ -300,16 +300,13 @@ public final class EmotionLog {
      */
     public void replaceEntry(int index, EmotionEntry entry) {
         Objects.requireNonNull(entry, "entry");
-        // 先校验再落笔：被拒绝的写入必须一个字节都不改，也不能留下半改的状态
-        if (index < 0 || index >= slots.size()) {
-            throw new IndexOutOfBoundsException("条目下标越界：" + index + "（共 " + slots.size() + " 条）");
-        }
+        // 先全部校验、再落笔：被拒绝的写入必须一个字节都不改，也不能留下半改的状态
+        EntrySlot slot = slotAt(index);
         for (int i = 0; i < slots.size(); i++) {
             if (i != index && slots.get(i).entry.date().equals(entry.date())) {
                 throw new IllegalStateException(duplicateMessage(entry.date()));
             }
         }
-        EntrySlot slot = slots.get(index);
         slot.entry = entry;
         slot.markDirty();
         Region region = slot.region;
@@ -318,6 +315,11 @@ public final class EmotionLog {
         blocks.subList(region.blockFrom(), region.blockToExclusive()).clear();
         blocks.add(region.blockFrom(), newTextBlock(slot.render()));
         slot.region = new Region(region.blockFrom(), region.blockFrom() + 1);
+        // 这一段从「多块」变成了「一块」，后面的条目必须跟着前移；漏掉这一步，
+        // 它们的块下标就会指向邻居的字节，下一次编辑会改坏别的记录。
+        if (region.size() != 1) {
+            shiftRegions(index + 1, 1 - region.size());
+        }
     }
 
     /**
@@ -328,15 +330,20 @@ public final class EmotionLog {
      * @throws IndexOutOfBoundsException 下标越界
      */
     public void removeEntry(int index) {
-        if (index < 0 || index >= slots.size()) {
-            throw new IndexOutOfBoundsException("条目下标越界：" + index + "（共 " + slots.size() + " 条）");
-        }
-        EntrySlot slot = slots.get(index);
+        EntrySlot slot = slotAt(index);
         Region region = slot.region;
         blocks.subList(region.blockFrom(), region.blockToExclusive()).clear();
         slots.remove(index);
         // 被删条目之后的条目整体前移（含删除首条的情形：新的首条正好落在被删掉的位置上）
         shiftRegions(index, -region.size());
+    }
+
+    /** 取第 {@code index} 条，越界就抛。所有写入口共用它，越界判定只有一处。 */
+    private EntrySlot slotAt(int index) {
+        if (index < 0 || index >= slots.size()) {
+            throw new IndexOutOfBoundsException("条目下标越界：" + index + "（共 " + slots.size() + " 条）");
+        }
+        return slots.get(index);
     }
 
     /** 重复日期的统一说法：界面直接把它显示给用户，所以要说清「为什么不覆盖」。 */
