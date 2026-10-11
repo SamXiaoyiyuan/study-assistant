@@ -42,11 +42,17 @@ import java.util.Objects;
  * 存在的理由。所以这里只按<b>行</b>装配：能原样搬的一行不改地搬（§六 周记录整段搬进 §九，一个字符
  * 都不动），只有真正需要改结构的几张表才重新生成。
  *
- * <h2>为什么 apply 需要「本实例刚产出的」方案</h2>
- * {@link MigrationPlan} 是纯数据、刻意不带源文件路径（它要能脱离文件系统被展示与确认）；而 apply
- * 要备份与归档，必须知道源文件在哪。路径只能由 {@link #plan(Path)} 记在本实例上，因此 apply 只接受
- * <b>本实例刚产出的</b>方案：拿别的实例的、或凭空造的方案来调，一律拒绝，绝不去猜一个
- * 「大概是这个」的源文件来备份——猜错就是备份了别人的文件、把用户的档案原地改掉。
+ * <h2>方案自带源路径：apply 校验的是「路径 + 内容」，不是「谁产出的」</h2>
+ * {@link MigrationPlan} 是纯数据（它要能脱离文件系统被展示与确认），但它<b>自带源文件路径</b>：
+ * apply 要备份与归档，必须知道源文件在哪，而这个答案属于方案本身，不属于碰巧调用了 apply 的那个实例。
+ *
+ * <p>因此 apply 的闸门是<b>证据</b>而不是<b>身份</b>：源文件此刻是否仍逐字节等于方案所依据的那份内容。
+ * 用对象身份做闸门（早期实现）有两个坏处：① brief 公开的用法
+ * {@code new Migrator(dir).apply(plan, target)} 直接抛 {@link IllegalArgumentException}，而它本该只是
+ * 正常迁移一次——这是留给 Task 10 的地雷；② 身份闸门排在目标检查之前，会让「外来方案 + 目标非空」
+ * 抛错类型变成 {@code IllegalArgumentException} 而不是 {@link TargetExistsException}，
+ * 「绝不静默覆盖」这条规格就被一个无关的检查遮住了。内容闸门两条都解掉，且不放松任何安全性质：
+ * 归档写的字节、目标文本、备份的源文件仍然是同一份内容。
  */
 public final class Migrator {
 
@@ -86,13 +92,6 @@ public final class Migrator {
 
     private final Path studyDir;
 
-    // ---- apply 需要、而 MigrationPlan 刻意不带的现场信息 ----
-    // 只在 plan() 里写入；apply() 用 <b>对象身份</b> 把方案与这些现场信息绑死（见 apply 的闸门）。
-
-    private Path plannedSource;
-    private byte[] sourceBytes;
-    private MigrationPlan lastPlan;
-
     /**
      * @param studyDir 用户的 study 目录：备份落在 {@code studyDir\.backup\}，归档落在
      *                 {@code studyDir\.archive\}。构造器<b>不碰盘</b>（plan 只读的语义从这里开始）。
@@ -130,58 +129,63 @@ public final class Migrator {
         List<String> notes = new ArrayList<>();
         String targetText = buildTarget(file, notes);
 
-        MigrationPlan plan = new MigrationPlan(file.content(), targetText, notes);
-        this.plannedSource = legacyFile;
-        this.sourceBytes = bytes;
-        this.lastPlan = plan;
-        return plan;
+        // 源路径进方案：apply 靠它知道去备份/归档谁，也靠它复核「源文件还是不是这一份」。
+        // 本方法这里仍只读——把路径记进返回值不等于碰盘。
+        return new MigrationPlan(legacyFile, file.content(), targetText, notes);
     }
 
     /**
-     * 落盘：先拒绝、再备份、再归档、最后写目标。
+     * 落盘：先拒绝（目标 → 源内容 → 归档冲突，三步全部<b>只读</b>）、再备份、再归档、最后写目标。
      *
      * <p><b>顺序是规格，不是实现细节</b>（spec §4.6 第 1–5 条）：
      * <ol>
      *   <li>目标存在且非空 → 立刻抛 {@link TargetExistsException}。「绝不静默覆盖」的检查必须
      *       排在<b>第一步</b>：放到备份之后，异常照样会抛，但用户的目录里已经多出一份备份，
-     *       而备份本身会轮转、会删掉最旧的一份——一次「什么都没做」的拒绝不该有这个后果。</li>
-     *   <li>源文件在 plan 之后被改动过 → 拒绝。本项目里同一个档案由 App、AI 助手、用户自己的
+     *       而备份本身会轮转、会删掉最旧的一份——一次「什么都没做」的拒绝不该有这个后果。
+     *       它排第一还有一个直接后果：{@code new Migrator(dir).apply(plan, target)} 这种
+     *       「方案不是本实例产的」用法，在目标已存在时抛的仍然是 {@code TargetExistsException}，
+     *       而不是被别人抢先抛出的参数错误（brief 的公开用法不能被无关检查遮住）。</li>
+     *   <li>源文件内容与方案不符 → 拒绝。本项目里同一个档案由 App、AI 助手、用户自己的
      *       编辑器三方共同改，照着过期方案写目标、却把新内容归档掉，是把用户的最新内容
      *       留在了一个没人会去看的地方。</li>
+     *   <li>归档已存在且内容不同 → 拒绝。它和上一条共用同一条理由：<b>拒绝的代价必须是零</b>，
+     *       所以这条也必须是只读的、且排在备份之前。</li>
      *   <li>备份 → 归档 → 写目标。归档是<b>不可变</b>历史快照，内容不同时拒绝覆盖。</li>
      * </ol>
      *
      * @throws TargetExistsException 目标已存在且非空（或存在但不是普通文件）
-     * @throws IllegalArgumentException 传进来的方案不是本实例 {@link #plan(Path)} 刚产出的
-     * @throws IOException 源文件被改动过、读写失败、或归档冲突
+     * @throws IOException 源文件内容与方案不符、归档冲突、或读写失败
      */
     public MigrationResult apply(MigrationPlan plan, Path targetFile) throws IOException {
+        Objects.requireNonNull(plan, "plan");
         Objects.requireNonNull(targetFile, "targetFile");
-        if (plan == null || plan != lastPlan || plannedSource == null || sourceBytes == null) {
-            throw new IllegalArgumentException(
-                    "apply 只接受本实例 plan() 刚产出的迁移方案。MigrationPlan 是纯数据、不带源文件路径，"
-                            + "而备份与归档必须知道源文件在哪；凭空造的或别的实例的方案一律拒绝——"
-                            + "绝不能去猜一个「大概是这个」的源文件来备份。请先调用本实例的 plan()。");
-        }
+        // 源路径来自方案本身。apply 因此不依赖任何实例现场信息，也就没有「哪个实例产的」这回事。
+        Path source = plan.sourceFile();
 
         // ① 先检查目标：已存在且非空就到此为止，此时磁盘上什么都没多出来。
         requireAbsentTarget(targetFile);
 
-        // ② 源文件必须仍是 plan 时那一份（字节级）。
-        byte[] currentBytes = Files.readAllBytes(plannedSource);
+        // ② 源文件必须仍是这份方案所依据的那一份（字节级）。方案是纯数据，判据只能从方案自己来：
+        //    sourceText 按 UTF-8 编码回去必然等于 plan() 当时读到的原始字节（plan() 里已核对过
+        //    这一点，BOM 与 CRLF 都在其中）——所以这条比对就是「现在是同一份内容」的证明。
+        byte[] sourceBytes = plan.sourceText().getBytes(StandardCharsets.UTF_8);
+        byte[] currentBytes = Files.readAllBytes(source);
         if (!Arrays.equals(currentBytes, sourceBytes)) {
-            throw new IOException("源文件在 plan() 之后被改动过，拒绝按过期方案迁移：" + plannedSource
-                    + "（目标文件未写入，也没有产生备份与归档；请重新 plan() 并确认新的目标文本）");
+            throw new IOException("源文件已不是这份方案所依据的那一份（内容被改过），拒绝按过期方案迁移："
+                    + source + "（目标文件未写入，也没有产生备份与归档；请重新 plan() 并确认新的目标文本）");
         }
 
-        // ③ 备份（命名、保留 10 份由 BackupRotation 按规格执行）。
-        Path backup = new BackupRotation(studyDir.resolve(BACKUP_DIR), BACKUP_KEEP).backup(plannedSource);
+        // ③ 归档冲突的只读预检查，排在备份之前：见方法上的说明与上面的顺序表第 3 条。
+        requireArchiveCoherent(source, sourceBytes);
 
-        // ④ 归档：写的是 ② 里核对过的那份字节，而不是「再去读一次文件」——后者给别的程序留了
+        // ④ 备份（命名、保留 10 份由 BackupRotation 按规格执行）。
+        Path backup = new BackupRotation(studyDir.resolve(BACKUP_DIR), BACKUP_KEEP).backup(source);
+
+        // ⑤ 归档：写的是 ② 里核对过的那份字节，而不是「再去读一次文件」——后者给别的程序留了
         //    一个把两边改得不一致的窗口。
-        Path archive = archiveSource(sourceBytes);
+        Path archive = archiveSource(source, sourceBytes);
 
-        // ⑤ 写目标文件。目标文本固定 LF、无 BOM（新建文件一律如此，见全局约束）。
+        // ⑥ 写目标文件。目标文本固定 LF、无 BOM（新建文件一律如此，见全局约束）。
         TextFileCodec.write(targetFile, plan.targetText());
 
         return new MigrationResult(targetFile, backup, archive);
@@ -207,26 +211,43 @@ public final class Migrator {
         }
     }
 
+    /** 归档路径：{@code .archive\<原文件名>}。纯路径运算，不碰盘。 */
+    private Path archiveFileFor(Path source) {
+        return studyDir.resolve(ARCHIVE_DIR).resolve(source.getFileName());
+    }
+
+    /**
+     * <b>只读</b>：归档已存在且内容与源文件不同就拒绝。
+     *
+     * <p>单独抽出来，是为了让它能排在备份<b>之前</b>（见 {@link #apply} 的顺序表第 3 条）：
+     * 拒绝的代价必须是零。本方法不建目录、不写文件，冲突时磁盘上连 {@code .archive\} 都不会出现。
+     */
+    private void requireArchiveCoherent(Path source, byte[] sourceBytes) throws IOException {
+        Path archive = archiveFileFor(source);
+        if (Files.exists(archive) && !Arrays.equals(Files.readAllBytes(archive), sourceBytes)) {
+            throw new IOException("不可变归档已存在，且内容与当前源文件不同，拒绝迁移：" + archive
+                    + "（它保存的是迁移前那一份历史快照。目标文件未写入，也没有产生备份；"
+                    + "源文件一个字节都没动。请先自行确认并处理该归档，再重新迁移）");
+        }
+    }
+
     /**
      * 把源文件的那份字节写成不可变归档，返回归档路径。
      *
      * <p>已存在且内容相同时保持原样（用户删掉目标后重跑一次迁移是合法操作）；内容不同则拒绝：
      * 全局约束把它定义为「不可变归档」，而它正是「迁移前那份档案」的唯一快照——静默改写它，
      * 等于把用户回头核对历史的依据换掉。
+     *
+     * <p>这里再查一次冲突：apply 里那次是「拒绝无副作用」的前置闸门，这次是「写入前最后一瞬」的
+     * 复查——两者之间隔着一次备份，别的程序有可能已经动过归档。两次判据同一个方法，不会漂移。
      */
-    private Path archiveSource(byte[] sourceBytes) throws IOException {
-        Path archiveDir = studyDir.resolve(ARCHIVE_DIR);
-        Path archive = archiveDir.resolve(plannedSource.getFileName());
-        Files.createDirectories(archiveDir);
-        if (Files.exists(archive)) {
-            if (!Arrays.equals(Files.readAllBytes(archive), sourceBytes)) {
-                throw new IOException("不可变归档已存在，且内容与当前源文件不同，拒绝覆盖：" + archive
-                        + "（它保存的是迁移前那一份历史快照。目标文件未写入，源文件未改动；"
-                        + "请先自行确认并处理该归档，再重新迁移）");
-            }
-            return archive;
+    private Path archiveSource(Path source, byte[] sourceBytes) throws IOException {
+        Path archive = archiveFileFor(source);
+        requireArchiveCoherent(source, sourceBytes);
+        Files.createDirectories(studyDir.resolve(ARCHIVE_DIR));
+        if (!Files.exists(archive)) {
+            Files.write(archive, sourceBytes);
         }
-        Files.write(archive, sourceBytes);
         return archive;
     }
 
