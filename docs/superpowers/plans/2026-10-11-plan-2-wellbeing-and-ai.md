@@ -488,7 +488,8 @@ assertFalse(full.contains("\uFFFD"));
 **Interfaces:**
 - Produces: `public enum PromptRole { PLANNER("学习与生活规划师"), COUNSELOR("生活与心理顾问") }`，含 `String fileName()`
 - Produces: `public final class PromptLibrary`
-  - `PromptLibrary(Path promptDir)`
+  - `PromptLibrary(Path promptDir)` —— 外部提示词目录（可不存在）
+  - `static PromptLibrary builtIn()` —— **只用内置资源，不读盘**（测试与回退默认走它）
   - `String load(PromptRole role)` —— 外部文件优先，缺失则内置回退
   - `boolean isUsingBuiltIn(PromptRole role)`
 - Consumes: `TextFileCodec`（读外部提示词；**严格 UTF-8**，非法则视为缺失并回退内置，同时 `isUsingBuiltIn` 为真）
@@ -521,7 +522,7 @@ for (String s : List.of("不评价过去","信息不足","空洞口号","可支�
     assertTrue(PromptLibrary.builtIn().load(PromptRole.PLANNER).contains(s), s);
 
 // builtInCounselor_forbidsDiagnosticLabels_andRequiresHedgedWording
-String c = PromptLibrary.builtIn().load(PromptRole.Counselor);
+String c = PromptLibrary.builtIn().load(PromptRole.COUNSELOR);
 assertTrue(c.contains("观察到") && c.contains("可能相关"));
 assertTrue(c.contains("不替代专业"));
 
@@ -610,7 +611,7 @@ assertEquals("", s.lastSentPreview());
 **Interfaces:**
 - Produces: `public record Conversation(String id, String title, Instant startedAt, List<AiMessage> messages)`
 - Produces: `public final class ConversationStore`
-  - `ConversationStore(Path conversationsDir)` —— 目录不存在时**创建**（计划 1 的教训：写前先建父目录）
+  - `ConversationStore(Path conversationsDir)` —— **只记住路径，不创建目录**（创建发生在 `save`，见下）
   - `void save(Conversation) throws IOException`
   - `Optional<Conversation> load(String id) throws IOException`
   - `List<Conversation> list() throws IOException` —— 按 `startedAt` **最新在前**
@@ -619,6 +620,7 @@ assertEquals("", s.lastSentPreview());
 
 **规则**
 - 存 `<conversationsDir>/<id>.json`，UTF-8 无 BOM + LF
+- **构造器不创建目录**（只记住路径）；**`save` 在写前创建父目录**。这样 `list()` 对「目录尚不存在」的语义才有意义，也符合计划 1 的教训（由**写入方**负责建父目录）。
 - `id` 由调用方给（界面用 UUID）；本类**不**生成 id，也不做路径拼接校验以外的事
 - **`id` 必须校验为安全文件名**（不得含 `/`、`\`、`..`），否则抛 `IllegalArgumentException`——防目录穿越
 - `load` 遇到**损坏 JSON** → 抛 `IOException`（含文件路径），**不得**返回空对象或静默忽略
