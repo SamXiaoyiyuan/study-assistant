@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -132,5 +133,24 @@ class ExternalModificationTest {
         assertEquals("# 新文件\n", Files.readString(f));
         assertEquals(0, new BackupRotation(dir.resolve(".backup"), 10).list(f).size(),
                 "文件原本不存在，没有任何内容需要备份");
+    }
+
+    /**
+     * 目标文件的<b>目录</b>也还不存在时，{@code save} 必须自己把目录建出来。
+     *
+     * <p>这是「第一次保存」在磁盘上的真实形态：用户刚把学习目录指到一个空文件夹，那里既没有
+     * {@code 学习与生活计划.md}，也没有它可能被放在其中的子目录。少了这一层，第一次保存就会在
+     * 最外层炸 {@code NoSuchFileException}——而 {@link TextFileCodec#write} 是全项目唯一的写入点，
+     * 所以这条保证要在这里（而不是各调用方）钉住。
+     */
+    @Test
+    void missingParentDirectories_areCreatedOnSave(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("子目录").resolve("更深一层").resolve("计划.md");
+        assertFalse(Files.exists(f.getParent()), "前置条件：父目录必须不存在");
+        FileStore store = new FileStore(f, new BackupRotation(dir.resolve(".backup"), 10));
+
+        assertEquals(SaveOutcome.SAVED, store.save("# 第一次保存\n", false), "父目录缺失不得让保存失败");
+        assertTrue(Files.isRegularFile(f), "保存必须把文件真的建出来");
+        assertEquals("# 第一次保存\n", Files.readString(f, StandardCharsets.UTF_8));
     }
 }

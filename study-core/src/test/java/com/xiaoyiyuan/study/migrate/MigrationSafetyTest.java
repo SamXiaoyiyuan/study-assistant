@@ -7,6 +7,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -304,6 +306,14 @@ class MigrationSafetyTest {
 
         assertTrue(e.getMessage().contains("不可变归档"),
                 "这条路径必须是归档冲突，实际消息：" + e.getMessage());
+        // 这条路径走到的是 apply 的**只读预检查**（排在备份之前）：此刻源文件已经变了，而归档还是
+        // 原来那份，预检查立刻就能看见冲突。所以这里的消息**应当**说「也没有产生备份」——它在这个
+        // 调用点是真话（见下面 apply_writePhaseRecheck_... 那条：写入期复查是另一个调用点，
+        // 那里备份已经落地，措辞必须不同）。
+        assertTrue(e.getMessage().contains("也没有产生备份"),
+                "预检查排在备份之前，消息必须声明没有产生备份，实际消息：" + e.getMessage());
+        assertFalse(e.getMessage().contains("备份已建立"),
+                "这条路径上备份确实没有建立（预检查早于备份），实际消息：" + e.getMessage());
         // 文件数不够：备份名精度是秒，同一秒内重复备份会 REPLACE_EXISTING 撞名、数量不变。
         // 所以「没新增备份」要用「原来那份备份的字节一个都没变」来证明。
         assertEquals(1, backupCount(dir), "归档冲突的拒绝不得新增备份");
@@ -312,6 +322,101 @@ class MigrationSafetyTest {
         assertFalse(Files.exists(target), "归档冲突时不得写出目标文件");
         assertTrue(Files.readString(dir.resolve(".archive").resolve("408-进度.md")).contains("测试"),
                 "原归档必须原样还在");
+    }
+
+    /**
+     * <b>写入期复查</b>那条路的拒绝消息：归档在「只读预检查通过」与「写入前最后一瞬」之间被别的
+     * 程序改掉（TOCTOU），此时备份<b>已经</b>落地，消息必须如实给出它的路径。
+     *
+     * <p>为什么单开一条测试：{@link #apply_refusesToOverwriteADifferentArchive} 走的是只读预检查，
+     * 断言的是「也没有产生备份」；同一个 {@code requireArchiveCoherent} 的第二个调用点（
+     * {@code archiveSource} 内）在磁盘状态上正相反。早先两个调用点共用一句写死的话，于是在这条路上
+     * 消息会假称没有备份——用户读完那句话本该去 {@code .backup\} 找内容，却会以为内容无从找回。
+     *
+     * <p><b>怎么确定性地制造这个窗口</b>：预检查与复查之间隔着一次备份，而备份是
+     * {@code Files.copy}。用一份足够大的源文件把这次复制拉长到可观测，另起一个线程轮询
+     * {@code .backup\}（{@code BackupRotation.backup} 一进来就建目录），看到目录出现就立刻把归档
+     * 改成别的内容。于是预检查过、复查红——正是真实世界里另一个程序的动作。
+     */
+    @Test
+    void apply_writePhaseRecheck_reportsTheBackupItAlreadyMade(@TempDir Path dir) throws Exception {
+        Path legacy = writeLargeLegacy(dir);
+        Path target = dir.resolve("学习与生活计划.md");
+        Migrator m = new Migrator(dir);
+        MigrationPlan plan = m.plan(legacy);
+
+        // 预置一份与源文件一致的归档：只读预检查因此通过（差异由测试线程在备份之后制造）。
+        Path archiveDir = Files.createDirectories(dir.resolve(".archive"));
+        Path archive = archiveDir.resolve("408-进度.md");
+        Files.write(archive, plan.sourceText().getBytes(StandardCharsets.UTF_8));
+
+        // 备份一进来就建 .backup\（BackupRotation.backup 的第一句），而这个目录只可能在只读
+        // 预检查<b>之后</b>出现——所以「目录出现」是「预检查已经通过」的证据，不是靠时序赌的。
+        //
+        // 线程用 createTempFile + Files.move(REPLACE_EXISTING, ATOMIC_MOVE) 换掉归档：replace 让
+        // 归档永远「存在且内容不同」，不存在「先删掉、预检查看见不存在而放行」的窗口；atomic 让替换
+        // 要么在预检查前、要么在预检查后，不会半个状态。大文件把 Files.copy 拉长到足以让替换落进
+        // 「预检查已过、复查未读」之间。
+        Thread intruder = new Thread(() -> {
+            Path backupDir = dir.resolve(".backup");
+            for (int i = 0; i < 20_000; i++) {
+                if (Files.isDirectory(backupDir)) {
+                    try {
+                        Path replacement = Files.createTempFile(archiveDir, "intruder", ".md");
+                        Files.writeString(replacement, "被别的程序改掉了\n", StandardCharsets.UTF_8);
+                        Files.move(replacement, archive, StandardCopyOption.REPLACE_EXISTING,
+                                StandardCopyOption.ATOMIC_MOVE);
+                    } catch (IOException ignored) {
+                        // 迁移的写入与本线程撞上时无需处理：断言只看消息
+                    }
+                    return;
+                }
+                try {
+                    Thread.sleep(1);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }, "archive-intruder");
+        intruder.start();
+        IOException e = assertThrows(IOException.class, () -> m.apply(plan, target));
+        intruder.join();
+
+        assertTrue(e.getMessage().contains("不可变归档"),
+                "这条路径必须是归档冲突，实际消息：" + e.getMessage());
+        // 判据刻意用「目标文件未写入；备份已建立：」这个只有复查分支才会产出的整串：
+        // 只断言含「备份已建立」的话，预检查分支哪天被误改成也带上这四个字就会蒙混过关。
+        assertTrue(e.getMessage().contains("目标文件未写入；备份已建立："),
+                "复查分支的措辞必须声明备份已建立，实际消息：" + e.getMessage());
+        assertFalse(e.getMessage().contains("也没有产生备份"),
+                "备份确实产生了，消息不得声称没有备份，实际消息：" + e.getMessage());
+        try (var backups = Files.list(dir.resolve(".backup"))) {
+            List<Path> made = backups.toList();
+            assertEquals(1, made.size(), "写入期复查之前必须恰好产生一份备份");
+            assertTrue(e.getMessage().contains(made.get(0).getFileName().toString()),
+                    "消息必须给出那份备份的真实文件名，实际消息：" + e.getMessage());
+        }
+        assertFalse(Files.exists(target), "归档冲突时不得写出目标文件");
+    }
+
+    /**
+     * 一份大到足以让 {@code Files.copy} 花上可观测时间的源文件。
+     *
+     * <p><b>体积靠「行很长」而不是「行很多」</b>：迁移的兜底对每条原样行做一次
+     * {@code rendered.contains(line)}，行数一多就是行数 × 全文长度的量级。几十行超长散文
+     * （非空、非表格、非标题）换来同样的字节数，却让兜底与映射的代价保持在可忽略的量级。
+     * 内容仍是合法的旧档案形状，本测试只关心拒绝路径的消息，不关心映射结果。
+     */
+    private static Path writeLargeLegacy(Path dir) throws IOException {
+        StringBuilder text = new StringBuilder(LEGACY);
+        String filler = "填".repeat(4_000_000);
+        for (int i = 0; i < 4; i++) {
+            text.append("- 填充行 ").append(i).append(' ').append(filler).append('\n');
+        }
+        Path p = dir.resolve("408-进度.md");
+        Files.writeString(p, text.toString(), StandardCharsets.UTF_8);
+        return p;
     }
 
     /** 归档内容一致时（源文件没变，用户只是删了目标）允许重跑：归档保持原样，不重复写。 */

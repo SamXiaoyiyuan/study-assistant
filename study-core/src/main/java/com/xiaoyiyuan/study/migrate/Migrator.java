@@ -176,14 +176,15 @@ public final class Migrator {
         }
 
         // ③ 归档冲突的只读预检查，排在备份之前：见方法上的说明与上面的顺序表第 3 条。
-        requireArchiveCoherent(source, sourceBytes);
+        //    此处还没有备份（null），拒绝消息里那句「也没有产生备份」在这个调用点是真的。
+        requireArchiveCoherent(source, sourceBytes, null);
 
         // ④ 备份（命名、保留 10 份由 BackupRotation 按规格执行）。
         Path backup = new BackupRotation(studyDir.resolve(BACKUP_DIR), BACKUP_KEEP).backup(source);
 
         // ⑤ 归档：写的是 ② 里核对过的那份字节，而不是「再去读一次文件」——后者给别的程序留了
         //    一个把两边改得不一致的窗口。
-        Path archive = archiveSource(source, sourceBytes);
+        Path archive = archiveSource(source, sourceBytes, backup);
 
         // ⑥ 写目标文件。目标文本固定 LF、无 BOM（新建文件一律如此，见全局约束）。
         TextFileCodec.write(targetFile, plan.targetText());
@@ -221,13 +222,30 @@ public final class Migrator {
      *
      * <p>单独抽出来，是为了让它能排在备份<b>之前</b>（见 {@link #apply} 的顺序表第 3 条）：
      * 拒绝的代价必须是零。本方法不建目录、不写文件，冲突时磁盘上连 {@code .archive\} 都不会出现。
+     *
+     * <p><b>消息必须按调用点的现场分岔</b>（这是本方法唯一的坑）：调用点有两个，磁盘状态不同——
+     * <ul>
+     *   <li>{@link #apply} 里那次排在备份<b>之前</b>：此刻确实「也没有产生备份」；</li>
+     *   <li>{@link #archiveSource} 里那次排在备份<b>之后</b>：备份已经写好躺在 {@code .backup\} 里了，
+     *       此时若照抄前一句，消息就<b>假称没有备份</b>——而用户读完那句话正该去 {@code .backup\}
+     *       找自己的内容。所以这条路必须给出备份的真实路径。</li>
+     * </ul>
+     * 同一个方法、同一个判据，只有这句关于磁盘状态的描述随调用点变化；这样两个调用点的消息都为真，
+     * 又不会各自维护一套会漂移的措辞。
+     *
+     * @param backupAlreadyMade 调用点<b>已经</b>建好的那份备份的路径；排在备份之前、
+     *                          磁盘上还没有备份时传 {@code null}
      */
-    private void requireArchiveCoherent(Path source, byte[] sourceBytes) throws IOException {
+    private void requireArchiveCoherent(Path source, byte[] sourceBytes, Path backupAlreadyMade)
+            throws IOException {
         Path archive = archiveFileFor(source);
         if (Files.exists(archive) && !Arrays.equals(Files.readAllBytes(archive), sourceBytes)) {
+            String backupClause = backupAlreadyMade == null
+                    ? "目标文件未写入，也没有产生备份"
+                    : "目标文件未写入；备份已建立：" + backupAlreadyMade;
             throw new IOException("不可变归档已存在，且内容与当前源文件不同，拒绝迁移：" + archive
-                    + "（它保存的是迁移前那一份历史快照。目标文件未写入，也没有产生备份；"
-                    + "源文件一个字节都没动。请先自行确认并处理该归档，再重新迁移）");
+                    + "（它保存的是迁移前那一份历史快照。" + backupClause
+                    + "；源文件一个字节都没动。请先自行确认并处理该归档，再重新迁移）");
         }
     }
 
@@ -240,10 +258,13 @@ public final class Migrator {
      *
      * <p>这里再查一次冲突：apply 里那次是「拒绝无副作用」的前置闸门，这次是「写入前最后一瞬」的
      * 复查——两者之间隔着一次备份，别的程序有可能已经动过归档。两次判据同一个方法，不会漂移。
+     *
+     * <p>{@code backup} 是调用方<b>已经</b>建好的那份备份：拒绝消息要如实告诉用户它在哪
+     * （见 {@link #requireArchiveCoherent} 的说明）。
      */
-    private Path archiveSource(Path source, byte[] sourceBytes) throws IOException {
+    private Path archiveSource(Path source, byte[] sourceBytes, Path backup) throws IOException {
         Path archive = archiveFileFor(source);
-        requireArchiveCoherent(source, sourceBytes);
+        requireArchiveCoherent(source, sourceBytes, backup);
         Files.createDirectories(studyDir.resolve(ARCHIVE_DIR));
         if (!Files.exists(archive)) {
             Files.write(archive, sourceBytes);

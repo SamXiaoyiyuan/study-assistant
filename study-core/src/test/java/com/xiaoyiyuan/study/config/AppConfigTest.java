@@ -67,6 +67,28 @@ class AppConfigTest {
     }
 
     // 以下三条超出 brief 的逐字测试，是「配置坏了也得能启动」与「文件格式可读」这两条要求的防回归网。
+
+    /**
+     * 全新安装：配置所在的目录<b>整个都不存在</b>，`save()` 必须自己把它建出来。
+     *
+     * <p>用「两层都不存在」而不是一层：只建最后一段父目录的实现（例如只对 {@code getParent()}
+     * 调一次不带 {@code createDirectories} 的创建）在只缺一层时会侥幸通过。默认路径
+     * {@code %APPDATA%\xiaoyiyuan-study\} 在全新机器上正是「连 {@code xiaoyiyuan-study} 都没有」
+     * 的形态，所以这里必须两层都缺。
+     */
+    @Test
+    void save_createsMissingParentDirectories(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("xiaoyiyuan-study").resolve("nested").resolve("config.properties");
+        assertFalse(Files.exists(f.getParent()), "前置条件：父目录必须不存在");
+
+        AppConfig c = AppConfig.load(f);
+        c.setStudyDir(Path.of("E:\\别的目录"));
+        c.save();
+
+        assertTrue(Files.isRegularFile(f), "首次保存必须把文件建出来，而不是抛 NoSuchFileException");
+        assertEquals(Path.of("E:\\别的目录"), AppConfig.load(f).studyDir(), "建目录后往返必须成立");
+    }
+
     @Test
     void valueWithWindowsPathBackslash_survivesRoundTrip(@TempDir Path dir) throws IOException {
         // 值里的反斜杠必须按字面往返。用 java.util.Properties 读写时（本机 JDK 25 实测）：

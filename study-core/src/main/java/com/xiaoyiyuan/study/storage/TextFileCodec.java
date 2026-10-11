@@ -47,8 +47,19 @@ public final class TextFileCodec {
      *
      * <p>直接写字符串自身的字节，<b>不做任何替换</b>：不补/不去 BOM、不转换换行符、
      * 不 trim。CRLF 与 BOM 的保真正是靠「什么都不做」实现的。
+     *
+     * <p><b>自己把父目录建出来</b>：本方法是全项目唯一的写入点（{@code FileStore.save} 与
+     * {@code Migrator.apply} 都走这里），父目录不存在时报 {@code NoSuchFileException} 就会
+     * 让「第一次保存」在最外层炸掉——而「目录还没有」恰恰是全新安装的常态。
+     * {@link BackupRotation} 早就在自己的路径上这么做了，这里补上是为了让<b>每一个</b>写入者
+     * 都拿到同一条保证，而不是各写各的。{@code createDirectories} 对已存在的目录是无操作。
      */
     public static void write(Path path, String content) throws IOException {
+        // 父路径为 null 时（相对路径且只有一段）没有目录可建，跳过即可。
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
         Files.write(path, content.getBytes(StandardCharsets.UTF_8));
     }
 

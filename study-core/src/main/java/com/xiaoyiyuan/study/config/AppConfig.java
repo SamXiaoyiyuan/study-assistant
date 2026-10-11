@@ -131,10 +131,22 @@ public final class AppConfig {
      * ② 按 ISO-8859-1 输出，把中文转义成 {@code &#92;u60B2} 之类的序列——
      * 配置文件是给人看、给人手改的，转义之后中文读者的第一反应是「这文件怎么是乱码」。
      *
-     * @throws IOException 写盘失败（磁盘满、目录不在、权限不足……）：这一次没保存成功，
+     * <p><b>自己把所在目录建出来</b>：配置默认落在
+     * {@code %APPDATA%\xiaoyiyuan-study\config.properties}，而那个目录<b>全新安装时并不存在</b>
+     * （本机实测不存在）。少了这一步，用户第一次改设置就撞 {@code NoSuchFileException}——
+     * 「改不动设置」是启动路径上最容易劝退人的失败。{@code createDirectories} 对已存在的目录
+     * 是无操作，所以重复保存不会出问题。
+     *
+     * @throws IOException 写盘失败（磁盘满、权限不足……）：这一次没保存成功，
      *                     调用方必须让用户看到，不能当作已保存
      */
     public void save() throws IOException {
+        // 配置目录可能整个都不存在（全新安装）。父路径为 null 时（相对路径且只有一段）
+        // 没有目录可建，跳过即可。
+        Path parent = file.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
         // writeString 用 UTF-8 编码，且 JDK 明确不写 BOM（BOM 必须由调用方自己放进内容里）。
         Files.writeString(file, render(), StandardCharsets.UTF_8);
     }
