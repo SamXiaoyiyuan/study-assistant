@@ -480,7 +480,7 @@ assertFalse(full.contains("\uFFFD"));
 
 **Files:**
 - Create: `study-core/src/main/java/com/xiaoyiyuan/study/ai/PromptRole.java`
-- Create: `study-core/src/main/java/com/xiaoyiyuan/study/ai/PromptLibrary.java`
+- Create: `study-core/src/main/java/com/xiaoyiyuan/study/prompt/PromptLibrary.java`  ← **实际落在 `prompt` 包**（交付时裁定：它要读外部提示词文件，而 `ai` 包被字节码护栏禁止出现 `java/nio/file/*`；`PromptRole` 是纯值，留在 `ai`）
 - Create: `study-core/src/main/resources/prompts/学习与生活规划师.md`
 - Create: `study-core/src/main/resources/prompts/生活与心理顾问.md`
 - Test: `study-core/src/test/java/com/xiaoyiyuan/study/ai/PromptFallbackTest.java`
@@ -604,9 +604,9 @@ assertEquals("", s.lastSentPreview());
 ### Task 8: 对话历史（Gson）
 
 **Files:**
-- Create: `study-core/src/main/java/com/xiaoyiyuan/study/ai/Conversation.java`
-- Create: `study-core/src/main/java/com/xiaoyiyuan/study/ai/ConversationStore.java`
-- Test: `study-core/src/test/java/com/xiaoyiyuan/study/ai/ConversationStoreTest.java`
+- Create: `study-core/src/main/java/com/xiaoyiyuan/study/conversation/Conversation.java`  ← **实际落在 `conversation` 包**（交付时裁定：Store 要读写 `Path`，而 `ai` 包被字节码护栏禁止出现 `java/nio/file/*`；依赖方向 `conversation → ai` 单向）
+- Create: `study-core/src/main/java/com/xiaoyiyuan/study/conversation/ConversationStore.java`
+- Test: `study-core/src/test/java/com/xiaoyiyuan/study/conversation/ConversationStoreTest.java`
 
 **Interfaces:**
 - Produces: `public record Conversation(String id, String title, Instant startedAt, List<AiMessage> messages)`

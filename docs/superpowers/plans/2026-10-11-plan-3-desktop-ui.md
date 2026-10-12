@@ -33,9 +33,9 @@
 | `CrisisDetector` / `CrisisSignal` | 计划 2 Task 3 | Task 10 |
 | `AiConfig` / `AiRequest` / `AiMessage` / `AiFailure` / `AiFailureKind` / `AiClient.complete` / `AiClient.endpoint` | 计划 2 Task 4 | Task 8 |
 | `AiStreamListener` / `AiClient.stream` | 计划 2 Task 5 | Task 8 |
-| `PromptRole` / `PromptLibrary` | 计划 2 Task 6 | Task 8、Task 9 |
+| `PromptRole`（在 `ai` 包）/ `PromptLibrary`（**在 `prompt` 包**） | 计划 2 Task 6 | Task 8、Task 9 |
 | `PendingRequest` / `ConsentGate` / `ConfirmingAiSession` | 计划 2 Task 7 | Task 8 |
-| `Conversation` / `ConversationStore` | 计划 2 Task 8 | Task 8 |
+| `Conversation` / `ConversationStore`（**都在 `conversation` 包**，不在 `ai` 包） | 计划 2 Task 8 | Task 8 |
 | `AnalysisWindow` / `EmotionAnalysis` | 计划 2 Task 9 | Task 7、Task 8 |
 
 **若某任务开工时其 `[待计划 2]` 依赖仍未提交**：该任务**不得**自行发明实现，**停在这里**并在报告里写清「被计划 2 的 Task N 阻塞」，由控制器决定是插队执行计划 2 的那个任务，还是把本任务顺延。自行造一个近似接口会让计划 2 交付后出现两套同名不同签名的类型。
