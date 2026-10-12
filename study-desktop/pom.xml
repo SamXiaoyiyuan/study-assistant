@@ -16,10 +16,29 @@
       <artifactId>study-core</artifactId>
       <version>${project.version}</version>
     </dependency>
+
+    <!--
+      javafx-controls 传递依赖 javafx-graphics / javafx-base，但 ui/theme 的签名里直接出现
+      javafx.scene.Scene / Font / Text（ThemeManager、JavaFontResolver），所以这里**显式**声明
+      javafx-graphics：编译期与测试期都靠它解析，不依赖传递依赖的偶然性。
+      版本只有父 POM 的 ${javafx.version} 一个来源。
+    -->
     <dependency>
       <groupId>org.openjfx</groupId>
       <artifactId>javafx-controls</artifactId>
       <version>${javafx.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-graphics</artifactId>
+      <version>${javafx.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
@@ -34,6 +53,18 @@
           <options>
             <option>--enable-native-access=javafx.graphics</option>
           </options>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!--
+            ui/theme 的字体测试要起 JavaFX 工具包（必须看真实行为，这是本任务的悬置项之一）。
+            JavaFX 在 classpath 方式下会警告「Unsupported JavaFX configuration: classes were loaded
+            from 'unnamed module'」，但功能正常；native-access 警告用下面这个参数消掉。
+          -->
+          <argLine>-Dfile.encoding=UTF-8 --enable-native-access=javafx.graphics</argLine>
         </configuration>
       </plugin>
     </plugins>

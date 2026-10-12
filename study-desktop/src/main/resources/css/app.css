@@ -1,0 +1,454 @@
+/* ============================================================
+   Study Assistant — 组件样式（app.css）
+   规则：
+     - 只用 -fx-c-* / CHART_COLOR_* 查找色与 -fx-* 非颜色令牌；**不含任何字面色值**
+     - 不含任何 px：尺寸一律 em 或裸倍率（本机 200% 缩放，写死 px 必然破版）
+     - 必须最后加载（guides §2.2）：tokens-*.css → app.css，否则组件样式被基线覆盖
+     - 不用 ProgressBar 表达计划完成度（隐含「落后」语义，见 guides §4.2）
+     - 状态永远「文字 + 形状 + 中性色」三重编码，绝不只靠颜色
+   ============================================================ */
+
+.root {
+    /* 字体族与根字号由 tokens-*.css 定义；这里再声明一次是为了不依赖加载顺序 */
+    -fx-font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Segoe UI";
+    -fx-background-color: -fx-c-bg;
+}
+
+/* ---------- 焦点：常驻透明边框 + 负 insets，焦点出现不改变布局、不引起跳动 ---------- */
+.button, .toggle-button, .text-field, .text-area, .combo-box, .choice-box,
+.check-box, .radio-button, .table-view, .list-view, .scroll-pane, .spinner {
+    -fx-border-color: transparent;
+    -fx-border-width: 2;
+    -fx-border-insets: -2;
+}
+.button:focused, .toggle-button:focused, .text-field:focused, .text-area:focused,
+.combo-box:focused, .choice-box:focused, .check-box:focused, .radio-button:focused,
+.table-view:focused, .list-view:focused, .spinner:focused {
+    -fx-border-color: -fx-c-focus;
+}
+
+/* ---------- 面 / 卡片 ---------- */
+.card {
+    -fx-background-color: -fx-c-surface;
+    -fx-background-radius: -fx-r-card;
+    -fx-border-color: -fx-c-border-subtle;
+    -fx-border-radius: -fx-r-card;
+    -fx-border-width: 1;
+    -fx-padding: -fx-sp-4;
+    -fx-effect: -fx-sh-card;
+}
+
+/* ---------- 文本层级：只用字重 + 字号 + 行距表达 ---------- */
+.page-title {
+    -fx-font-size: 1.40em;
+    -fx-font-weight: 600;
+    -fx-text-fill: -fx-c-text;
+}
+.section-title {
+    -fx-font-size: 1.20em;
+    -fx-font-weight: 600;
+    -fx-text-fill: -fx-c-text;
+}
+.card-title {
+    -fx-font-size: 1.07em;
+    -fx-font-weight: 600;
+    -fx-text-fill: -fx-c-text;
+}
+.body {
+    -fx-font-size: 1.00em;
+    -fx-text-fill: -fx-c-text;
+    -fx-line-spacing: -fx-ls-body;
+}
+.secondary {
+    -fx-font-size: 0.93em;
+    -fx-text-fill: -fx-c-text-secondary;
+    -fx-line-spacing: -fx-ls-body;
+}
+.meta {
+    -fx-font-size: 0.87em;
+    -fx-text-fill: -fx-c-text-tertiary;
+}
+.micro {
+    -fx-font-size: 0.80em;
+    -fx-text-fill: -fx-c-text-tertiary;
+}
+.reading {
+    -fx-font-size: 1.00em;
+    -fx-text-fill: -fx-c-text;
+    -fx-line-spacing: -fx-ls-read;
+    -fx-max-width: 46em;
+}
+
+/* ---------- 按钮（主按钮高度 ≈ 44 逻辑像素，随 em 缩放） ---------- */
+.button {
+    -fx-font-size: 1.00em;
+    -fx-padding: -fx-sp-3 -fx-sp-5;
+    -fx-min-height: 2.9em;
+    -fx-background-radius: -fx-r-control;
+    -fx-background-color: -fx-c-surface;
+    -fx-text-fill: -fx-c-text;
+    -fx-border-color: -fx-c-border-control;
+    -fx-border-radius: -fx-r-control;
+    -fx-border-width: 1;
+    -fx-border-insets: 0;
+}
+.button:hover {
+    -fx-background-color: -fx-c-surface-hover;
+}
+.button:pressed {
+    -fx-background-color: -fx-c-surface-selected;
+}
+.button:disabled {
+    -fx-opacity: 0.45;
+    -fx-text-fill: -fx-c-text-disabled;
+}
+.button.primary {
+    -fx-background-color: -fx-c-accent;
+    -fx-text-fill: -fx-c-on-accent;
+    -fx-border-color: transparent;
+}
+.button.primary:hover {
+    -fx-background-color: -fx-c-accent-hover;
+}
+.button.primary:pressed {
+    -fx-background-color: -fx-c-accent-hover;
+}
+.button.primary:focused {
+    -fx-border-color: -fx-c-focus;
+    -fx-border-insets: -2;
+    -fx-border-width: 2;
+}
+.button.quiet {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-text-fill: -fx-c-accent;
+}
+.button.quiet:hover {
+    -fx-background-color: -fx-c-accent-soft;
+}
+.toggle-button:selected {
+    -fx-background-color: -fx-c-accent-soft;
+    -fx-text-fill: -fx-c-accent;
+}
+
+/* ---------- 输入控件 ---------- */
+.text-field, .text-area, .combo-box, .choice-box, .spinner {
+    -fx-background-color: -fx-c-surface;
+    -fx-background-radius: -fx-r-control;
+    -fx-border-color: -fx-c-border-control;
+    -fx-border-radius: -fx-r-control;
+    -fx-border-width: 1;
+    -fx-text-fill: -fx-c-text;
+    -fx-prompt-text-fill: -fx-c-text-tertiary;
+    -fx-font-size: 1.00em;
+    -fx-padding: -fx-sp-2 -fx-sp-3;
+}
+.text-field {
+    -fx-min-height: 2.4em;
+}
+.text-area {
+    -fx-min-height: 6em;
+    -fx-pref-row-count: 6;
+}
+.text-area .content {
+    -fx-background-color: -fx-c-surface;
+}
+.text-field:focused, .text-area:focused {
+    -fx-border-color: -fx-c-focus;
+}
+.check-box:selected .mark {
+    -fx-background-color: -fx-c-on-accent;
+}
+.check-box:selected .box {
+    -fx-background-color: -fx-c-accent;
+    -fx-border-color: -fx-c-accent;
+}
+.radio-button:selected .dot {
+    -fx-background-color: -fx-c-accent;
+}
+
+/* ---------- 中性提示条（替代 Alert.WARNING / ERROR） ---------- */
+.notice {
+    -fx-background-color: -fx-c-notice-bg;
+    -fx-background-radius: -fx-r-control;
+    -fx-border-color: -fx-c-notice-border;
+    -fx-border-radius: -fx-r-control;
+    -fx-border-width: 1;
+    -fx-padding: -fx-sp-3 -fx-sp-4;
+}
+.notice .label {
+    -fx-text-fill: -fx-c-notice-text;
+    -fx-line-spacing: -fx-ls-body;
+}
+
+/* ---------- 危机资源面板（暖砂中性；唯一强调是左侧色条，用渐变实现，不写死 px） ---------- */
+.crisis-panel {
+    -fx-background-color: -fx-c-crisis-bar, -fx-c-crisis-bg;
+    -fx-background-insets: 0 0 0 0, 0 0 0 0;
+    -fx-background-radius: -fx-r-card, -fx-r-card;
+    -fx-border-color: -fx-c-crisis-border;
+    -fx-border-radius: -fx-r-card;
+    -fx-border-width: 1;
+    -fx-padding: -fx-sp-4 -fx-sp-4 -fx-sp-4 -fx-sp-5;
+}
+.crisis-panel .crisis-title {
+    -fx-text-fill: -fx-c-crisis-text;
+    -fx-font-weight: 600;
+    -fx-font-size: 1.07em;
+}
+.crisis-panel .crisis-body {
+    -fx-text-fill: -fx-c-crisis-text;
+    -fx-line-spacing: -fx-ls-read;
+}
+.crisis-panel .crisis-meta {
+    -fx-text-fill: -fx-c-crisis-meta;
+    -fx-font-size: 0.93em;
+}
+.crisis-bar {
+    -fx-background-color: -fx-c-crisis-bar;
+    -fx-background-radius: -fx-r-card 0 0 -fx-r-card;
+}
+
+/* ---------- 状态 chip（文字 + 形状 + 中性色三重编码） ---------- */
+.chip {
+    -fx-background-radius: -fx-r-pill;
+    -fx-padding: 0.2em 0.6em;
+    -fx-font-size: 0.87em;
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-text-fill: -fx-c-text-secondary;
+}
+.chip.state-active {
+    -fx-text-fill: -fx-c-state-active;
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-border-color: -fx-c-state-active;
+    -fx-border-radius: -fx-r-pill;
+    -fx-border-width: 1;
+}
+.chip.state-done {
+    -fx-text-fill: -fx-c-state-done;
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-border-color: -fx-c-state-done;
+    -fx-border-radius: -fx-r-pill;
+    -fx-border-width: 1;
+}
+.chip.state-paused {
+    -fx-text-fill: -fx-c-state-paused;
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-border-color: -fx-c-state-paused;
+    -fx-border-radius: -fx-r-pill;
+    -fx-border-width: 1;
+}
+.chip.state-cancelled {
+    -fx-text-fill: -fx-c-state-cancelled;
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-border-color: -fx-c-state-cancelled;
+    -fx-border-radius: -fx-r-pill;
+    -fx-border-width: 1;
+}
+/* 待回报：无独立色相，靠虚线形状区分 */
+.chip.state-await {
+    -fx-text-fill: -fx-c-state-await;
+    -fx-background-color: transparent;
+    -fx-border-color: -fx-c-state-await-line;
+    -fx-border-radius: -fx-r-pill;
+    -fx-border-width: 1;
+    -fx-border-style: segments(2, 2);
+}
+
+/* ---------- 表格 ---------- */
+.table-view {
+    -fx-background-color: -fx-c-surface;
+    -fx-background-radius: -fx-r-card;
+    -fx-border-color: -fx-c-border-subtle;
+    -fx-border-radius: -fx-r-card;
+    -fx-border-width: 1;
+    -fx-padding: 0;
+    -fx-table-cell-border-color: transparent;
+}
+.table-view .column-header-background {
+    -fx-background-color: -fx-c-surface-muted;
+}
+.table-view .column-header,
+.table-view .filler {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent transparent -fx-c-border-subtle transparent;
+    -fx-size: 2.6em;
+}
+.table-view .column-header .label {
+    -fx-text-fill: -fx-c-text-secondary;
+    -fx-font-size: 0.87em;
+    -fx-font-weight: 600;
+    -fx-alignment: center-left;
+}
+.table-row-cell {
+    -fx-background-color: -fx-c-surface;
+    -fx-border-color: transparent transparent -fx-c-border-subtle transparent;
+    -fx-table-cell-border-color: transparent;
+    -fx-cell-size: 2.6em;
+}
+.table-row-cell:odd {
+    -fx-background-color: -fx-c-surface-stripe;
+}
+.table-row-cell:hover {
+    -fx-background-color: -fx-c-surface-hover;
+}
+.table-row-cell:selected {
+    -fx-background-color: -fx-c-surface-selected;
+    -fx-text-background-color: -fx-c-text;
+}
+.table-row-cell:selected .table-cell {
+    -fx-text-fill: -fx-c-text;
+}
+.table-view .table-cell {
+    -fx-padding: 0.4em 0.7em;
+    -fx-text-fill: -fx-c-text;
+    -fx-font-size: 0.93em;
+    -fx-alignment: center-left;
+}
+.table-view .table-cell.numeric {
+    -fx-alignment: center-right;
+}
+.table-view .placeholder .label {
+    -fx-text-fill: -fx-c-text-secondary;
+    -fx-font-size: 0.93em;
+}
+
+/* ---------- 列表 ---------- */
+.list-view {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+}
+.list-cell {
+    -fx-background-color: transparent;
+    -fx-padding: -fx-sp-2 -fx-sp-3;
+    -fx-text-fill: -fx-c-text;
+    -fx-font-size: 1.00em;
+    -fx-cell-size: 2.6em;
+}
+.list-cell:hover {
+    -fx-background-color: -fx-c-surface-hover;
+}
+.list-cell:selected {
+    -fx-background-color: -fx-c-surface-selected;
+    -fx-text-fill: -fx-c-text;
+}
+
+/* ---------- 滚动容器 ---------- */
+.scroll-pane, .scroll-pane > .viewport {
+    -fx-background-color: transparent;
+}
+.scroll-pane {
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+}
+.scroll-bar:vertical .thumb, .scroll-bar:horizontal .thumb {
+    -fx-background-color: -fx-c-border-control;
+    -fx-background-radius: -fx-r-pill;
+}
+.scroll-bar:vertical {
+    -fx-pref-width: 0.7em;
+}
+.scroll-bar:horizontal {
+    -fx-pref-height: 0.7em;
+}
+
+/* ---------- 对话框 ---------- */
+.dialog-pane {
+    -fx-background-color: -fx-c-surface;
+    -fx-padding: -fx-sp-4;
+}
+.dialog-pane > .header-panel {
+    -fx-background-color: -fx-c-surface-muted;
+}
+.dialog-pane > .header-panel .label {
+    -fx-text-fill: -fx-c-text;
+    -fx-font-size: 1.07em;
+    -fx-font-weight: 600;
+}
+.dialog-pane .content.label {
+    -fx-text-fill: -fx-c-text;
+    -fx-line-spacing: -fx-ls-body;
+}
+
+/* ---------- 导航（侧栏） ---------- */
+.nav {
+    -fx-background-color: -fx-c-surface;
+    -fx-border-color: transparent -fx-c-border-subtle transparent transparent;
+    -fx-border-width: 0 1 0 0;
+    -fx-padding: -fx-sp-3;
+}
+.nav-item {
+    -fx-background-color: transparent;
+    -fx-background-radius: -fx-r-control;
+    -fx-padding: -fx-sp-2 -fx-sp-3;
+    -fx-text-fill: -fx-c-text-secondary;
+    -fx-font-size: 0.93em;
+}
+.nav-item:hover {
+    -fx-background-color: -fx-c-surface-hover;
+}
+.nav-item.active {
+    -fx-background-color: -fx-c-accent-soft;
+    -fx-text-fill: -fx-c-accent;
+    -fx-border-color: -fx-c-accent;
+    -fx-border-width: 0 0 0 2;
+}
+
+/* ---------- 页头 / 状态条 ---------- */
+.header {
+    -fx-background-color: -fx-c-surface;
+    -fx-border-color: transparent transparent -fx-c-border-subtle transparent;
+    -fx-border-width: 0 0 1 0;
+    -fx-padding: -fx-sp-3 -fx-sp-4;
+}
+.status-bar {
+    -fx-background-color: -fx-c-surface-muted;
+    -fx-border-color: -fx-c-border-subtle transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: -fx-sp-2 -fx-sp-4;
+}
+.status-bar .label {
+    -fx-text-fill: -fx-c-text-tertiary;
+    -fx-font-size: 0.87em;
+}
+
+/* ---------- 图表 ---------- */
+.chart {
+    -fx-padding: 0;
+    -fx-background-color: transparent;
+}
+.chart-plot-background {
+    -fx-background-color: -fx-c-surface;
+}
+.chart-vertical-grid-lines {
+    -fx-stroke: -fx-c-border-subtle;
+}
+.chart-horizontal-grid-lines {
+    -fx-stroke: -fx-c-border-subtle;
+}
+.chart-alternative-row-fill, .chart-alternative-column-fill {
+    -fx-fill: transparent;
+    -fx-stroke: transparent;
+}
+.chart .axis {
+    -fx-tick-label-fill: -fx-c-text-secondary;
+    -fx-tick-label-font-size: 0.87em;
+}
+.chart .chart-series-line {
+    -fx-stroke-width: 2;
+}
+.default-color0.chart-series-line {
+    -fx-stroke: -fx-c-state-active;
+}
+.default-color0.chart-line-symbol {
+    -fx-background-color: -fx-c-surface, -fx-c-state-active;
+    -fx-background-radius: 999, 999;
+    -fx-padding: 0.36em;
+}
+.chart .chart-legend {
+    -fx-background-color: transparent;
+}
+.chart .chart-legend-item {
+    -fx-text-fill: -fx-c-text-secondary;
+}

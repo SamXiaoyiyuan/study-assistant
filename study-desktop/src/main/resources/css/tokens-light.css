@@ -1,0 +1,107 @@
+/* ============================================================
+   Study Assistant — Light Tokens（明色令牌，唯一来源）
+   顺序：① Modena 重着色  ② 项目颜色令牌  ③ 字号/行距/间距/圆角/阴影令牌  ④ 图表序列色
+   规则：
+     - 本文件不写任何具体组件的选择器（.button / .table-view 等），组件样式在 app.css
+     - 值的唯一权威是 docs/superpowers/specs/2026-10-11-javafx-visual-guidelines.md；
+       TokenValueSourceTest 直接从那份 markdown 解析期望值后逐条比对
+     - 除 .root 的 -fx-font-size 外，尺寸一律 em（本机 200% 缩放，写死 px 会破版）
+   ============================================================ */
+
+.root {
+    /* ---------- ① 重着色 Modena 派生基色（让所有标准控件跟随项目配色） ---------- */
+    -fx-base:                     #FFFFFF;
+    -fx-background:               #F7F6FA;
+    -fx-control-inner-background: #FFFFFF;
+    -fx-text-background-color:    #1E2130;
+    -fx-accent:                   #4A55A2;
+    -fx-focus-color:              #3D4AA8;
+    -fx-selection-bar:            #E3E1F2;
+    -fx-selection-bar-non-focused: #EBEAF2;
+
+    /* ---------- ② 项目颜色令牌 ---------- */
+    -fx-c-bg:               #F7F6FA;
+    -fx-c-surface:          #FFFFFF;
+    -fx-c-surface-muted:    #EFEEF4;
+    -fx-c-surface-stripe:   #F2F1F6;
+    -fx-c-surface-hover:    #EBEAF2;
+    -fx-c-surface-selected: #E3E1F2;
+    -fx-c-accent-soft:      #ECEBF7;
+
+    -fx-c-border-subtle:    #E3E1EA;
+    -fx-c-border-control:   #8F8CA0;
+
+    -fx-c-text:             #1E2130;
+    -fx-c-text-secondary:   #565A6E;
+    -fx-c-text-tertiary:    #63677A;
+    -fx-c-text-disabled:    #8F8CA0;
+
+    -fx-c-accent:           #4A55A2;
+    -fx-c-accent-hover:     #3D4AA8;
+    -fx-c-on-accent:        #FFFFFF;
+    -fx-c-focus:            #3D4AA8;
+
+    -fx-c-notice-bg:        #EDF1F6;
+    -fx-c-notice-border:    #C6D2E0;
+    -fx-c-notice-text:      #2F4A66;
+
+    /* 四态中性色 + 待回报：全部中性，无权重差异，不表示好坏 */
+    -fx-c-state-active:     #3F6B9E;
+    -fx-c-state-done:       #5A6478;
+    -fx-c-state-paused:     #6B5F8A;
+    -fx-c-state-cancelled:  #63677A;
+    -fx-c-state-await:      #565A6E;
+    -fx-c-state-await-line: #8F8CA0;
+
+    /* 危机资源面板：暖砂中性，不是红色也不是警告色 */
+    -fx-c-crisis-bg:        #F3EFE7;
+    -fx-c-crisis-border:    #D8CDBA;
+    -fx-c-crisis-bar:       #7A6647;
+    -fx-c-crisis-text:      #4A4238;
+    -fx-c-crisis-meta:      #6B5F4C;
+
+    /* ---------- ③ 非颜色令牌 ---------- */
+    /* 字体族与根字号：全文件唯一允许出现 px 的地方 */
+    -fx-font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Segoe UI";
+    -fx-font-size: 15px;
+
+    -fx-fs-micro:   0.80em;
+    -fx-fs-caption: 0.87em;
+    -fx-fs-small:   0.93em;
+    -fx-fs-body:    1.00em;
+    -fx-fs-h3:      1.07em;
+    -fx-fs-h2:      1.20em;
+    -fx-fs-h1:      1.40em;
+    -fx-fs-display: 1.73em;
+
+    -fx-ls-body: 0.5em;
+    -fx-ls-head: 0.35em;
+    -fx-ls-read: 0.6em;
+
+    -fx-sp-1: 0.27em;
+    -fx-sp-2: 0.53em;
+    -fx-sp-3: 0.80em;
+    -fx-sp-4: 1.07em;
+    -fx-sp-5: 1.60em;
+    -fx-sp-6: 2.13em;
+    -fx-sp-7: 3.20em;
+
+    -fx-r-control: 6;
+    -fx-r-card:    10;
+    -fx-r-dialog:  14;
+    -fx-r-pill:    999;
+
+    -fx-sh-card:   dropshadow(gaussian, rgba(30,33,48,0.07), 3, 0, 0, 1);
+    -fx-sh-raised: dropshadow(gaussian, rgba(30,33,48,0.10), 6, 0, 0, 2);
+    -fx-sh-dialog: dropshadow(gaussian, rgba(30,33,48,0.14), 12, 0, 0, 4);
+
+    /* ---------- ④ 图表序列色：覆盖 Modena 默认（默认首色是橙红） ---------- */
+    CHART_COLOR_1: #3F6B9E;
+    CHART_COLOR_2: #5A6478;
+    CHART_COLOR_3: #6B5F8A;
+    CHART_COLOR_4: #4A55A2;
+    CHART_COLOR_5: #63677A;
+    CHART_COLOR_6: #3D4AA8;
+    CHART_COLOR_7: #8F8CA0;
+    CHART_COLOR_8: #565A6E;
+}
