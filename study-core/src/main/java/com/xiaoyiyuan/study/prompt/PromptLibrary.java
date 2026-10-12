@@ -28,9 +28,13 @@ import java.nio.file.Path;
  * <p><b>不做缓存</b>：spec §7.2 要求「文件存在 → 改后立即生效，无需重新编译」。每次调用都重新读一遍，
  * 用户存完文件下一次发送就生效；本类只在界面动作里被调用，这点开销无关紧要。
  *
+ * <p><b>不是 final</b>：{@link #load(PromptRole)} 可以被替身覆盖，测试要能造出「提示词是空白」
+ * 这类边界输入来钉住 {@code EmotionAnalysis.build} 的运行时自检（那些自检的逻辑在调用方，
+ * 不该为了能测它而把生产类改成接口）。
+ *
  * <p>本类只读，不写。外部提示词文件的创建/编辑由用户自己（或界面用系统默认程序打开）完成。
  */
-public final class PromptLibrary {
+public class PromptLibrary {
 
     /** 内置回退在 classpath 上的目录（spec §7.2：{@code study-core\src\main\resources\prompts\}）。 */
     private static final String BUILT_IN_RESOURCE_DIR = "/prompts/";

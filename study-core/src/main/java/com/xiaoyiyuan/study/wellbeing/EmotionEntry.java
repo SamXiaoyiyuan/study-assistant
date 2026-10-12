@@ -34,8 +34,10 @@ import java.util.Objects;
  * <p><b>本记录不校验文本字段里的换行符或竖线</b>：解析路径必须能如实承载文件里的任意内容
  * （哪怕用户手改成了畸形写法）。写入口的闸门在 {@link EmotionLog} 与界面层，那里才有拒绝的机会。
  *
- * <p><b>public 是硬要求</b>：计划 2 的 Task 9（时间窗选取与发送文本渲染）在 {@code ai} 包里
- * 消费它，界面层也消费它。
+ * <p><b>public 是硬要求</b>：计划 2 的 Task 9（时间窗选取与发送文本渲染）在 {@code wellbeing} 包里
+ * 消费它（{@code AnalysisWindow} 与 {@code EmotionAnalysis} 与它同包；那两个类要读提示词，
+ * 而 {@code ai} 包受「不得出现 {@code java/nio/file/*}」的字节码护栏约束，所以 Task 9 的落点是
+ * {@code wellbeing} 而不是 {@code ai}），界面层也消费它。
  *
  * @param date         日期，非 null（它与标题行是同一个身份的两面）
  * @param mood         情绪词，非 null（界面上是点选，必有一值）

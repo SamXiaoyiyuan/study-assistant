@@ -108,16 +108,32 @@ public final class EmotionAnalysis {
      * @param window  用户选定的时间窗；窗口外的条目<b>一个字节都不会进入请求</b>
      * @param log     已解析的情绪记录
      * @param library 提示词库（外部目录优先、缺失回退内置）
-     * @throws IllegalArgumentException 任一参数为 {@code null}，或组装结果里没有提示词
+     * @throws IllegalArgumentException 任一参数为 {@code null}
+     * @throws IllegalStateException    组装出来的待发送文本里找不到提示词锚点（自检，见 {@link #assemble}）
      */
     public static PendingRequest build(PromptRole role, AnalysisWindow window, EmotionLog log,
                                        PromptLibrary library) {
-        Objects.requireNonNull(role, "role（要按哪个角色取提示词）");
         Objects.requireNonNull(window, "window（只发用户选定的那一窗）");
         Objects.requireNonNull(log, "log（分析的材料是用户的情绪记录）");
+        return assemble(role, window, window.select(log), library);
+    }
+
+    /**
+     * 真正的装配：窗口已经选好，这里只负责拼消息、算预览、跑自检。
+     *
+     * <p>拆出来是为了<b>窗口只选一次</b>（评审 F4）：{@link #buildWithCrisis} 也要用到选中的条目
+     * （危机判定要在「本次真正会发送的那份原文」上做），若它自己再 {@code select} 一遍就是两次扫描，
+     * 而且日后两处的过滤条件一旦分岔，判定用的文本与发送的文本就会悄悄不一样。
+     *
+     * @param selected 窗口内选中的条目（与 user 消息里渲染的必须是同一份）
+     */
+    private static PendingRequest assemble(PromptRole role, AnalysisWindow window,
+                                           List<EmotionEntry> selected, PromptLibrary library) {
+        Objects.requireNonNull(role, "role（要按哪个角色取提示词）");
+        Objects.requireNonNull(window, "window（只发用户选定的那一窗）");
+        Objects.requireNonNull(selected, "selected（窗口内选中的条目）");
         Objects.requireNonNull(library, "library（提示词库；只用内置时传 PromptLibrary.builtIn()）");
 
-        List<EmotionEntry> selected = window.select(log);
         String prompt = library.load(role);
 
         List<AiMessage> messages = List.of(
@@ -129,6 +145,10 @@ public final class EmotionAnalysis {
         // 自检（controller 对 Task 9 的硬性要求）：预览里必须真的有提示词。
         // PendingRequest 的契约只保证「预览 == 实发」——上面若漏了 messages[0]，
         // 预览与实发会「一致地」丢掉提示词，Task 7 的全部断言照样绿。
+        //
+        // 判据刻意写成「prompt 本身没有可用的锚点」或「预览里找不到那个锚点」两件事，
+        // 而不是只看 prompt 非空：只有一个空提示词参数被用掉的实现，锚点会是空串，
+        // 于是这里必须当场拦下（否则「自检」就只剩编译期的那半）。
         String anchor = promptAnchor(prompt);
         if (anchor.isEmpty() || !pending.promptText().contains(anchor)) {
             throw new IllegalStateException(
@@ -184,9 +204,25 @@ public final class EmotionAnalysis {
      */
     public static Outcome buildWithCrisis(PromptRole role, AnalysisWindow window, EmotionLog log,
                                          CrisisDetector detector) {
-        PendingRequest request = build(role, window, log);
+        return buildWithCrisis(role, window, log, detector, PromptLibrary.builtIn());
+    }
+
+    /**
+     * {@link #buildWithCrisis(PromptRole, AnalysisWindow, EmotionLog, CrisisDetector)} 的提示词库版本。
+     *
+     * <p><b>窗口只选一次</b>（评审 F4）：老版本为了做危机判定又 {@code window.select(log)} 了一遍，
+     * 于是同一段记录被扫两次。这里把选好的条目交给私有的组装重载，危机判定直接渲染那一份，
+     * 「判定的文本」与「实际发送的文本」因此是同一个列表、同一个渲染出口——分岔在结构上就不存在。
+     */
+    public static Outcome buildWithCrisis(PromptRole role, AnalysisWindow window, EmotionLog log,
+                                          CrisisDetector detector, PromptLibrary library) {
+        Objects.requireNonNull(window, "window（只判用户选定的那一窗）");
+        Objects.requireNonNull(log, "log（危机判定的材料是用户的情绪记录）");
+        List<EmotionEntry> selected = window.select(log);
+
+        PendingRequest request = assemble(role, window, selected, library);
         boolean triggered = detector != null
-                && detector.detect(renderEntries(window.select(log))).triggered();
+                && detector.detect(renderEntries(selected)).triggered();
         return new Outcome(request, triggered, triggered ? CRISIS_NOTICE : "");
     }
 
@@ -309,6 +345,20 @@ public final class EmotionAnalysis {
         }
 
         /**
+         * 只有三段的便捷构造器：{@code crisisTriggered = false}、{@code crisisNotice = ""}。
+         *
+         * <p>brief 里 {@code Result} 本来就是 3 个组件；本记录多出来的两个是<b>并列的元数据</b>
+         * （三段仍然是纯模型输出）。计划 3 里「先渲染三段、危机面板另走一路」的调用方不必到处
+         * 写 {@code false, ""}——那两处字面量写多了迟早会出现一处写反。
+         *
+         * <p>它<b>不是</b>一个放松校验的口子：这里委托给规范构造器，三段为 {@code null} 时
+         * 由紧凑构造器统一收敛成空串，与 5 参版本的行为完全一致。
+         */
+        public Result(String observations, String factors, String suggestions) {
+            this(observations, factors, suggestions, false, "");
+        }
+
+        /**
          * 从模型输出里取出三段：{@code observations} / {@code factors} / {@code suggestions}。
          *
          * <p>识别规则（宽进严出：宁可多认一段，也不许把整块内容丢掉）：
@@ -408,20 +458,37 @@ public final class EmotionAnalysis {
      * <p>{@code **可能的影响因素**：乙} 这种「整段标题被加粗、冒号在 {@code **} 之后」的写法
      * 要认出来：只看行尾 {@code $} 的加粗剥离对它是无效的（{@code **} 后面还跟着冒号与正文），
      * 所以还要剥掉紧贴冒号之前的装饰符——模型这么写很常见，漏掉就等于整段丢失。
+     * <b>已知边界</b>：那条剥离用的字符类写在 {@code [#*\->•]} 里，而 {@code \->} 在正则里是
+     * 一个<b>区间</b>（反斜杠到右尖括号），全角 {@code ：} 落在区间之外，所以
+     * {@code **可能的影响因素**：乙}（加粗 + 全角冒号）目前认不出来；带加粗的写法要用半角
+     * {@code :}（{@code **可能的影响因素**:乙} 可以）。这不是本类能随手改的：改那条正则属于解析
+     * 行为的变更，超出 Task 9 minor 清算的范围，此处如实记下，由后续任务决定。
+     *
+     * <p><b>{@code after.isEmpty()} 那一分支保留为防御性写法</b>（评审 F6）：在
+     * {@code rest.startsWith(heading)} 成立时它其实是<b>恒假</b>的——{@code heading} 来自
+     * {@link #SECTION_HEADINGS}，{@link #stripLeadingDecorations} 是幂等的，所以剥完装饰之后
+     * 不会剩下只由装饰符组成的尾巴。删掉它会与下面那条冒号判断合并，而合并的写法会把
+     * 「标题：<空正文>」从「标题在第 i 段」变成「这行不是标题」（实测：可编译的等价变异确实如此），
+     * 那是一个会静默丢段的行为变化。所以这里保留分支、把「它恒假」这件事写在注释里，
+     * 而不是为了消掉一个分支去改解析行为。
      */
     private static Heading headingAt(String line) {
         String rest = stripLeadingDecorations(line);
         for (int i = 0; i < SECTION_HEADINGS.length; i++) {
             String heading = SECTION_HEADINGS[i];
-            if (rest.startsWith(heading)) {
-                String after = stripLeadingDecorations(rest.substring(heading.length())).stripLeading();
-                if (after.isEmpty()) {
-                    return new Heading(i, "");
-                }
-                if (after.charAt(0) == '：' || after.charAt(0) == ':') {
-                    return new Heading(i, after.substring(1).strip());
-                }
+            if (!rest.startsWith(heading)) {
+                continue;
             }
+            String after = stripLeadingDecorations(rest.substring(heading.length())).stripLeading();
+            // 防御性分支（恒假，见上面的类 javadoc）：标题单独成行 → 正文从下一行开始
+            if (after.isEmpty()) {
+                return new Heading(i, "");
+            }
+            if (after.charAt(0) == '：' || after.charAt(0) == ':') {
+                // 标题与正文在同一行：冒号后面才是正文（冒号后为空 → rest 为空串）
+                return new Heading(i, after.substring(1).strip());
+            }
+            // 标题后面跟着的不是冒号（例如「观察模式的补充：…」）→ 这行不是标题
         }
         return null;
     }

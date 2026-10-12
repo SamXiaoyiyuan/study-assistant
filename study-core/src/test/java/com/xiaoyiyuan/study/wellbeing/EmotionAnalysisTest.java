@@ -21,12 +21,15 @@ import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -45,8 +48,14 @@ import static org.junit.jupiter.api.Assertions.*;
  *       可以全绿通过。</li>
  *   <li><b>预览 == 待发送内容</b>：{@code PendingRequest.promptText()} 必须等于
  *       {@code PendingRequest.joinContents(messages)}，也要等于确认门自己组装、真正发上线的那一份。</li>
- *   <li><b>不落盘</b>：调用前后 {@code @TempDir} 与进程工作目录的<b>递归</b>快照完全一致，
- *       且分析类型的公开面里没有任何 {@code Path}。</li>
+ *   <li><b>不落盘（覆盖面写在这里，口径与断言名一致）</b>：{@code build} / {@code Result.parse} /
+ *       {@code renderEntries} 跑完之后，以下四处不得出现<b>新条目</b>、也不得有<b>已存在条目被改动</b>
+ *       （快照口径 = 相对路径 → 大小 + mtime，不再只是「相对路径集合」）：
+ *       ① 进程工作目录（<b>递归</b>，含子目录）② {@code java.io.tmpdir}（顶层）
+ *       ③ 用户主目录（顶层；递归会慢且易 flaky）④ 模块 {@code target}（顶层）。
+ *       另加一条<b>顺序无关</b>的子 JVM 断言：在全新的空工作目录里跑同一段分析，那里必须仍然是空的。
+ *       分析类型的公开面里没有任何 {@code Path}，{@code wellbeing} 包内也没有任何写文件 API 引用
+ *       （含 {@code Files.write}）。</li>
  *   <li><b>禁止诊断性标签与 8 个禁用词</b>：产出的一切用户可见文本都过一遍词表断言。</li>
  *   <li><b>危机命中不阻断</b>：记录里含危机关键词时照常产出分析请求（不抛异常、不锁定、不替换），
  *       并保留一份含 120/110、不含禁用词的中性资源提示。</li>
@@ -183,10 +192,30 @@ class EmotionAnalysisTest {
     }
 
     @Test
-    void lastDays_nonPositive_throwsInsteadOfSilentlyReturningEmptyWindow() {
-        assertThrows(IllegalArgumentException.class, () -> AnalysisWindow.lastDays(TODAY, 0),
+    void lastDays_nonPositive_rejectsForTheDayCountReason_andSaysHowManyDaysItGot() {
+        // 评审 V4：老版本只钉「抛 IllegalArgumentException」，于是把 days<1 放宽成 days<0 仍然全绿——
+        // 那时抛的是「起点晚于终点」（窗口回绕成 [明天, 今天]），理由与 javadoc 承诺的完全不同。
+        // 这里同时钉住「类型」与「理由」。
+        IllegalArgumentException zero = assertThrows(IllegalArgumentException.class,
+                () -> AnalysisWindow.lastDays(TODAY, 0),
                 "0 天不是一个时间窗；静默返回空窗会让用户以为「这几天没记录」");
-        assertThrows(IllegalArgumentException.class, () -> AnalysisWindow.lastDays(TODAY, -7));
+        assertTrue(zero.getMessage().contains("天数"),
+                "拒绝理由必须是「天数」不够，而不是「起点晚于终点」（后者会把用户引到错误的方向）；"
+                        + "实际：" + zero.getMessage());
+        assertTrue(zero.getMessage().contains("0"),
+                "消息里要带出实际收到的天数 0；实际：" + zero.getMessage());
+        assertFalse(zero.getMessage().contains("晚于"),
+                "0 天的窗口内部会回绕成 [明天, 今天]，但绝不能拿「起始日不能晚于结束日」当理由；实际："
+                        + zero.getMessage());
+
+        IllegalArgumentException negative = assertThrows(IllegalArgumentException.class,
+                () -> AnalysisWindow.lastDays(TODAY, -7));
+        assertTrue(negative.getMessage().contains("天数"),
+                "-7 天的拒绝理由同样必须是「天数」；实际：" + negative.getMessage());
+        assertTrue(negative.getMessage().contains("-7"),
+                "消息里要带出实际收到的天数 -7；实际：" + negative.getMessage());
+        assertFalse(negative.getMessage().contains("晚于"),
+                "-7 天同样不许拿「起始日不能晚于结束日」当理由；实际：" + negative.getMessage());
     }
 
     @Test
@@ -361,6 +390,29 @@ class EmotionAnalysisTest {
         assertEquals(PromptRole.PLANNER.displayName(), asPlanner.role());
     }
 
+    /**
+     * 评审 F3（变异 V9 全绿的那一半）：{@code build} 的运行时自检必须真的检查
+     * 「待发送文本里含提示词锚点」，而不只是「参数被用到了」。
+     *
+     * <p>给一份 {@code load(role)} 只返回空白的提示词库，锚点就算成空串。只要自检还在，
+     * {@code build} 必须当场抛 {@link IllegalStateException}，而不是安静地发出去一份没有约束的请求。
+     *
+     * <p>变异体：把自检条件从 {@code anchor.isEmpty() || …} 换成 {@code prompt.isEmpty() || …}
+     * （即永不看锚点）→ 本条会以「没有抛异常」红。
+     */
+    @Test
+    void build_selfCheck_throwsWhenTheAssembledTextCarriesNoPromptAnchor() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> EmotionAnalysis.build(PromptRole.COUNSELOR, OCT_4_TO_10, sampleLog(),
+                        new BlankPromptLibrary()),
+                "自检必须拦住「待发送文本里没有提示词锚点」——没有它，一个只拼记录、"
+                        + "丢掉提示词的实现会把「预览 == 实发」一致地做对，而模型失去全部行为约束");
+        assertTrue(e.getMessage().contains("提示词"),
+                "异常消息要说清是提示词没进待发送文本；实际：" + e.getMessage());
+        assertTrue(e.getMessage().contains("锚点"),
+                "异常消息要带上「锚点」这个判定依据，便于定位；实际：" + e.getMessage());
+    }
+
     @Test
     void build_producesPendingRequestWhosePromptTextContainsEverySelectedEntry() {
         String promptText =
@@ -466,115 +518,131 @@ class EmotionAnalysisTest {
     }
 
     // =====================================================================
-    // 5. 不落盘：一个字节都不许写
+    // 5. 不落盘：四处位置都不许新增，也不许改动已有文件
     // =====================================================================
 
+    /**
+     * 本轮加强后的「不落盘」守卫（评审 F1）。
+     *
+     * <p>老版本只比<b>相对路径集合</b>，于是两类写入完全看不见：写到 {@code java.io.tmpdir} /
+     * {@code target} / 用户主目录的<b>新文件</b>（位置根本不在快照范围内），以及<b>追加/改写已有文件</b>
+     * （路径集合不变）。现在压到子 JVM 里跑，快照口径是「路径 → 大小 + mtime」。
+     */
     @Test
-    void build_writesNothing_anywhere(@TempDir Path tempDir) throws Exception {
-        Path workingDirectory = Path.of(System.getProperty("user.dir")).toAbsolutePath();
-        Set<String> cwdBefore = snapshot(workingDirectory);
-        Set<String> tempBefore = snapshot(tempDir);
+    void build_parse_renderEntries_writeNothing_anywhere(@TempDir Path tempDir) throws Exception {
+        Path freshCwd = Files.createDirectory(tempDir.resolve("空工作目录"));
+        Path runnerDir = Files.createDirectory(tempDir.resolve("runner"));
+        Path runnerFile = writeProbeRunner(runnerDir, WatchProbe.MAIN);
 
-        PendingRequest pending =
-                EmotionAnalysis.build(PromptRole.COUNSELOR, OCT_4_TO_10, sampleLog());
-        EmotionAnalysis.Result.parse("观察到的模式：甲\n可能的影响因素：乙\n小建议：丙");
-        EmotionAnalysis.renderEntries(OCT_4_TO_10.select(sampleLog()));
+        String output = runProbeRunner(runnerFile, freshCwd);
 
-        // 前置：这次 build 确实产出了东西，后面的快照断言才有意义（否则「什么都没做」也会绿）。
-        // 锚点用「本次真正加载到的那份提示词」，不是写死的字面量——外部提示词是可替换的。
-        assertTrue(pending.promptText().contains(
-                        PromptLibrary.builtIn().load(PromptRole.COUNSELOR)),
-                "前置不成立：build 没有产出预期的待发送文本");
-
-        assertEquals(tempBefore, snapshot(tempDir),
-                "build / parse / renderEntries 不得在给定目录里创建或修改任何文件");
-        Set<String> cwdAfter = snapshot(workingDirectory);
-        assertEquals(cwdBefore, cwdAfter,
-                "build / parse / renderEntries 不得在工作目录（含子目录）里创建或修改任何文件；差异："
-                        + snapshotDifference(cwdBefore, cwdAfter));
+        assertTrue(output.contains("T9-PROBE-OK"),
+                "子 JVM 没有跑到最后一步（这条测试要证明的是「跑完了但没写文件」）；输出：\n" + output);
+        assertEquals("无差异", decodeDelta(between(output, "T9-PROBE-DELTA-BEGIN", "T9-PROBE-DELTA-END")),
+                "build / Result.parse / renderEntries 不得在【工作目录（递归）/ java.io.tmpdir（顶层）/ "
+                        + "用户主目录（顶层）/ 模块 target（顶层）】四处新建或改动任何文件"
+                        + "（spec §6.4：分析结果不写回情绪记录文件）");
     }
 
     /**
-     * 「一个字节都不许写」的<b>顺序无关</b>版本：在<b>一个全新的空目录</b>里跑同一段分析，
-     * 之后那个目录必须仍然是空的。
+     * 顺序无关版：在<b>一个全新的空目录</b>里跑同一段分析，之后那个目录里的条目必须<b>一个都没有</b>。
      *
-     * <p>为什么需要它：{@link #build_writesNothing_anywhere} 比较的是<b>调用前后</b>的差集，
-     * 而 JUnit 可能把本类里别的用例排到它前面；那些用例若写了文件，文件在「调用之前」就已在盘上，
-     * 差集就是空的——实测：一个真的往工作目录写文件的变异体在那一条下全绿（同时探针文件确实出现）。
-     *
-     * <p>做法是起一个<b>子 JVM</b>，把它的工作目录设成一个新建的空目录，让它在里面跑
-     * {@code EmotionAnalysis.build}；相对路径的文件写入会落在那个空目录里，于是「有没有写过」
-     * 只有一个答案，与 JUnit 的执行顺序无关。用子进程而不是删掉工作目录：删模块目录会让同一次
-     * 运行里其它测试（例如靠相对路径读 {@code src/test/resources} 的那些）连带失败。
+     * <p>为什么需要它：{@code build_parse_renderEntries_writeNothing_anywhere} 比的是<b>子 JVM 内</b>
+     * 调用前后的差集，而 JUnit 可能把本类里别的用例排到它前面；它们若写过文件，文件在「调用之前」
+     * 就已在那个位置，差集就是空的（第一版实测过：真写文件的变异体全绿，而探针确实落盘）。
+     * 把工作目录换成一个全新空目录之后，「里面有没有东西」只有一个答案，与执行顺序无关。
+     * 用子进程而不是删掉工作目录：删模块目录会让同一次运行里其它测试（例如靠相对路径读
+     * {@code src/test/resources} 的那些）连带失败。
      */
     @Test
     void build_writesNothing_inAFreshEmptyWorkingDirectory(@TempDir Path tempDir) throws Exception {
-        Path emptyCwd = Files.createDirectory(tempDir.resolve("空工作目录"));
+        Path freshCwd = Files.createDirectory(tempDir.resolve("空工作目录"));
         Path runnerDir = Files.createDirectory(tempDir.resolve("runner"));
+        Path runnerFile = writeProbeRunner(runnerDir, FreshCwdProbe.MAIN);
 
-        String runnerSource = """
-                import com.xiaoyiyuan.study.ai.PromptRole;
-                import com.xiaoyiyuan.study.wellbeing.AnalysisWindow;
-                import com.xiaoyiyuan.study.wellbeing.EmotionAnalysis;
-                import com.xiaoyiyuan.study.wellbeing.EmotionLog;
-                import java.time.LocalDate;
+        String output = runProbeRunner(runnerFile, freshCwd);
 
-                public class T9WriteProbe {
-                    public static void main(String[] args) {
-                        EmotionLog log = EmotionLog.parse(
-                                "## 2026-10-05（周一）\\n\\n- 情绪：平静 ｜ 强度：3\\n- 备注：探针\\n");
-                        EmotionAnalysis.build(PromptRole.COUNSELOR,
-                                new AnalysisWindow(LocalDate.of(2026, 10, 4), LocalDate.of(2026, 10, 10)),
-                                log);
-                        EmotionAnalysis.Result.parse("观察到的模式：甲");
-                        EmotionAnalysis.renderEntries(log.entries());
-                        System.out.println("T9-OK");
-                    }
-                }
-                """;
-        Path runnerFile = runnerDir.resolve("T9WriteProbe.java");
-        Files.writeString(runnerFile, runnerSource, StandardCharsets.UTF_8);
-
-        String javaExecutable = Path.of(System.getProperty("java.home"), "bin",
-                isWindows() ? "java.exe" : "java").toString();
-        String classpath = System.getProperty("java.class.path");
-
-        ProcessBuilder builder = new ProcessBuilder(javaExecutable, "-cp", classpath, runnerFile.toString());
-        builder.directory(emptyCwd.toFile());
-        builder.redirectErrorStream(true);
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        boolean finished = process.waitFor(2, java.util.concurrent.TimeUnit.MINUTES);
-
-        assertTrue(finished, "子 JVM 没有在 2 分钟内结束；输出：\n" + output);
-        assertEquals(0, process.exitValue(),
-                "子 JVM 里跑分析这一段落本身就失败了（这条测试要证明的是「跑完了但没写文件」）；输出：\n"
-                        + output);
         assertTrue(output.contains("T9-OK"), "子 JVM 没有跑到最后一步；输出：\n" + output);
-
-        assertEquals(Set.of(), snapshot(emptyCwd),
+        String fresh = between(output, "T9-FRESH-BEGIN", "T9-FRESH-END");
+        // 源码启动模式实测不落 .class（JDK 25 的内存编译），所以这里要求「一个条目都不许有」。
+        assertEquals("空", fresh,
                 "在空的子 JVM 工作目录里跑完分析之后，那里必须还是一个空目录"
-                        + "（spec §6.4：分析结果不写回情绪记录文件）。多出来的："
-                        + snapshotDifference(Set.of(), snapshot(emptyCwd)));
+                        + "（spec §6.4：分析结果不写回情绪记录文件）；实测目录内容：\n"
+                        + Files.list(freshCwd).map(Path::toString).collect(Collectors.joining("\n")));
     }
 
-    private static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
-    }
-
+    /**
+     * 守卫机制的自证（一）：快照口径含「大小 + mtime」，所以<b>追加到已存在文件</b>会被看见。
+     *
+     * <p>旧快照只比相对路径集合，这条「追加」在它眼里是完全隐形的。这里对一条真实文件做
+     * {@link StandardOpenOption#APPEND} 写入，断言新快照里两个量都变了——守卫不是纸面覆盖。
+     */
     @Test
-    void analysisTypes_haveNoPathInTheirPublicSurface() {
+    void writeGuard_snapshotRemembersSizeAndTime_soAppendingToAnExistingFileIsVisible(
+            @TempDir Path tempDir) throws Exception {
+        Path existing = tempDir.resolve("已存在.txt");
+        Files.writeString(existing, "base\n", StandardCharsets.UTF_8);
+
+        String before = FileSnapshot.capture(tempDir);
+        assertTrue(before.contains("size=") && before.contains("mtime="),
+                "前置不成立：快照口径里必须同时有大小与 mtime；实际：\n" + before);
+
+        Files.writeString(existing, "追加的一行\n", StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+        String after = FileSnapshot.capture(tempDir);
+
+        assertNotEquals(before, after,
+                "追加到已存在文件必须改变快照（旧口径只比相对路径集合，这里是隐形的）");
+        assertTrue(before.contains("size=5"),
+                "5 = \"base\\n\" 的字节数（UTF-8）；实际：\n" + before);
+        assertNotEquals(extractField(before, "已存在.txt", "size="),
+                extractField(after, "已存在.txt", "size="),
+                "追加之后大小必须变大；before=" + before + "\nafter=" + after);
+        assertTrue(Long.parseLong(extractField(after, "已存在.txt", "size="))
+                        > Long.parseLong(extractField(before, "已存在.txt", "size=")),
+                "追加之后的新大小必须严格大于旧大小；before=" + before + "\nafter=" + after);
+    }
+
+    /** 守卫机制的自证（二）：探针子 JVM 本身跑得起来（子 JVM 起不来时那条断言会以别的方式红）。 */
+    @Test
+    void writeGuard_probeRunnerActuallyRunsTheAnalysis(@TempDir Path tempDir) throws Exception {
+        Path freshCwd = Files.createDirectory(tempDir.resolve("空工作目录"));
+        Path runnerDir = Files.createDirectory(tempDir.resolve("runner"));
+        Path runnerFile = writeProbeRunner(runnerDir, FreshCwdProbe.MAIN);
+
+        String output = runProbeRunner(runnerFile, freshCwd);
+
+        assertTrue(output.contains("T9-OK"),
+                "探针子 JVM 必须真的跑完 EmotionAnalysis.build / parse / renderEntries；输出：\n" + output);
+        assertEquals("", between(output, "T9-STDERR-BEGIN", "T9-STDERR-END"),
+                "探针子 JVM 不许有任何异常输出（有异常时上面那条会以别的方式红）；输出：\n" + output);
+    }
+
+    /**
+     * 分析类型的公开面里不得出现 {@code java.nio.file.Path} / {@code java.io.File}
+     * （spec §6.4：分析结果不写回情绪记录文件）。
+     *
+     * <p>评审 F5：老版本只扫 {@code getDeclaredMethods()}（漏掉继承来的公开方法）、只扫三个类型
+     * （漏 {@link EmotionAnalysis.Outcome} 与私有的 {@code Heading}）、只匹配 {@code java.nio.file}
+     * 与 {@code java.io.File}。现在换成 {@code getMethods()}、扫全部相关类型，并额外匹配
+     * {@code java.io.OutputStream} / {@code Writer} / {@code Reader} / {@code InputStream}
+     * ——「拿得到一个写出口」同样是形态上的缺口。
+     */
+    @Test
+    void analysisTypes_haveNoPathOrFileHandleInTheirPublicSurface() {
         List<String> offenders = new ArrayList<>();
         int scanned = 0;
+        int typeCount = 0;
 
         for (Class<?> type : List.of(AnalysisWindow.class, EmotionAnalysis.class,
-                EmotionAnalysis.Result.class)) {
-            for (Method method : type.getDeclaredMethods()) {
+                EmotionAnalysis.Result.class, EmotionAnalysis.Outcome.class, analysisHeadingType())) {
+            typeCount++;
+            // getMethods()：public 面（含继承来的）；getDeclaredMethods()：包内/私有面，一并扫
+            for (Method method : type.getMethods()) {
                 scanned++;
-                collectIfPath(offenders, type, "方法 " + method.getName() + " 的返回值",
+                collectIfPath(offenders, type, "public 方法 " + method.getName() + " 的返回值",
                         method.getGenericReturnType());
                 for (Type parameter : method.getGenericParameterTypes()) {
-                    collectIfPath(offenders, type, "方法 " + method.getName() + " 的参数", parameter);
+                    collectIfPath(offenders, type, "public 方法 " + method.getName() + " 的参数", parameter);
                 }
             }
             for (Constructor<?> constructor : type.getDeclaredConstructors()) {
@@ -595,11 +663,48 @@ class EmotionAnalysisTest {
             }
         }
 
+        assertEquals(5, typeCount, "扫描面必须是这 5 个类型（漏掉一个就少扫一片公开面）");
         assertTrue(offenders.isEmpty(),
-                "情绪分析的公开面里不得出现 java.nio.file.Path（spec §6.4：分析结果不写回情绪记录文件）；"
-                        + "命中：" + offenders);
+                "情绪分析的公开面里不得出现 java.nio.file.Path / java.io.File / 任何文件句柄"
+                        + "（spec §6.4：分析结果不写回情绪记录文件）；命中：" + offenders);
         // 扫描面本身要非空：上面若因开关写错而一个成员都没扫到，这条也得红
-        assertTrue(scanned > 0, "反射扫描没有覆盖到任何成员");
+        assertTrue(scanned >= 50,
+                "反射扫描覆盖面异常：只扫到 " + scanned + " 个成员（getMethods() 之后应当有几十个）");
+    }
+
+    /**
+     * brief Step 1 明写、但此前<b>不存在</b>的一条断言（评审 F5）：
+     * 「{@code wellbeing} 包内无 {@code Files.write} 引用」。
+     *
+     * <p>反射只看签名，管不了方法体里写文件；这条直接扫源码文本，把「包内出现任何写文件 API」
+     * 变成一次红。当前实现干净（无命中），断言的价值在于这段扫描逻辑会一直跑。
+     */
+    @Test
+    void wellbeingPackage_hasNoFileWriteApiReference() throws Exception {
+        Path sourceRoot = Path.of("src", "main", "java", "com", "xiaoyiyuan", "study", "wellbeing");
+        assertTrue(Files.isDirectory(sourceRoot),
+                "工作目录应当是 study-core 模块根；实际 " + sourceRoot.toAbsolutePath());
+
+        List<Path> sources;
+        try (Stream<Path> files = Files.walk(sourceRoot)) {
+            sources = files.filter(path -> path.toString().endsWith(".java")).sorted().toList();
+        }
+        assertTrue(sources.size() >= 6,
+                "扫描面异常：wellbeing 包下至少应有 6 个生产类；实际：" + sources);
+
+        List<String> hits = new ArrayList<>();
+        for (Path source : sources) {
+            for (String line : Files.readAllLines(source, StandardCharsets.UTF_8)) {
+                if (line.matches(".*(Files\\.write|Files\\.newOutputStream|Files\\.createFile|"
+                        + "FileOutputStream|FileWriter|new\\s+BufferedWriter|RandomAccessFile).*")) {
+                    hits.add(source.getFileName() + " → " + line.strip());
+                }
+            }
+        }
+
+        assertTrue(hits.isEmpty(),
+                "wellbeing 包内不得出现任何写文件 API（brief Step 1：包内无 Files.write 引用；"
+                        + "spec §6.4：分析结果不写回情绪记录文件）；命中：\n" + String.join("\n", hits));
     }
 
     // =====================================================================
@@ -696,6 +801,47 @@ class EmotionAnalysisTest {
                 PromptRole.COUNSELOR, OCT_4_TO_10, sampleLog(), CrisisDetector.builtIn());
         assertFalse(outcome.crisisTriggered(), "这几条记录里没有危机词");
         assertEquals("", outcome.crisisNotice(), "没命中就不许显示任何危机提示");
+    }
+
+    /**
+     * 评审 F4：危机判定必须打在「本次真正会发送的那份原文」上。
+     *
+     * <p>老实现为了判定又 {@code window.select(log)} 了一遍（同一段记录被扫两次），两次选取条件
+     * 一旦分岔，「面板判定的文本」与「实际发送的文本」就会悄悄不一样。这里把「判定用的文本」
+     * 逐字钉到 {@code promptText} 里 {@code # 我的记录（原文）} 与 {@code # 我要的分析} 之间的那一段。
+     *
+     * <p><b>诚实说明</b>：调用次数本身在公开面上<b>不可观测</b>——{@code CrisisDetector} 是
+     * {@code final}、构造器私有的，没法用替身记账；而「选取两次」与「选取一次」在值上完全等价
+     * （{@code select} 是纯函数）。所以这条用例守的是「判定 = 发送」这条性质，
+     * 而不是「只扫描一次」这个实现细节：双选版本的变异体在它下面照样全绿（见报告的变异转录）。
+     */
+    @Test
+    void buildWithCrisis_judgesTheExactTextItSends() {
+        EmotionLog crisisLog = EmotionLog.parse(CRISIS_LOG_TEXT);
+        AnalysisWindow window = window(LocalDate.of(2026, 10, 4), LocalDate.of(2026, 10, 10));
+
+        EmotionAnalysis.Outcome outcome = EmotionAnalysis.buildWithCrisis(
+                PromptRole.COUNSELOR, window, crisisLog, CrisisDetector.builtIn());
+
+        assertTrue(outcome.crisisTriggered(), "这一窗的记录里确实有关键词表命中的表达");
+        String promptText = outcome.request().promptText();
+        int from = promptText.indexOf("# 我的记录（原文）\n\n");
+        int to = promptText.indexOf("\n\n# 我要的分析");
+        assertTrue(from >= 0 && to > from, "待发送文本里应当有「我的记录（原文）」那一段；实际：\n" + promptText);
+        String sent = promptText.substring(from + "# 我的记录（原文）\n\n".length(), to);
+
+        assertEquals(EmotionAnalysis.renderEntries(window.select(crisisLog)), sent,
+                "待发送文本里那一段必须逐字等于 renderEntries(窗口选中的条目)");
+        assertTrue(sent.contains("最近总觉得撑不下去了"),
+                "判定材料里应当有那条备注；实际：\n" + sent);
+        assertFalse(sent.contains("十月三日窗口外备注"), "窗口外的条目一个也不许进判定材料");
+
+        EmotionAnalysis.Outcome withoutDetector =
+                EmotionAnalysis.buildWithCrisis(PromptRole.COUNSELOR, window, crisisLog, null);
+        assertFalse(withoutDetector.crisisTriggered(),
+                "detector 为 null 等价于「不判定」，此时恒为 false（不猜、不阻断）");
+        assertEquals(outcome.request().promptText(), withoutDetector.request().promptText(),
+                "带不带检测器都不许改变待发送文本");
     }
 
     @Test
@@ -818,6 +964,25 @@ class EmotionAnalysisTest {
     }
 
     @Test
+    void parse_recognizesHeadingsWhoseDecorationsAreStripped_butNotLookalikes() {
+        // 与 headingAt 的注释配套：各种装饰形态都要照旧认出来，而「多一个字的近似标题」不算标题。
+        EmotionAnalysis.Result result = EmotionAnalysis.Result.parse("""
+                ## 观察到的模式
+                甲
+                **可能的影响因素**:乙
+                （2）小建议:丙
+                """);
+        assertEquals("甲", result.observations(), "实际：" + result);
+        assertEquals("乙", result.factors(), "实际：" + result);
+        assertEquals("丙", result.suggestions(), "实际：" + result);
+
+        // 反向：多一个字就不是标题（逐字匹配），免得近似匹配把正文整块挪进错误的段
+        EmotionAnalysis.Result lookalike = EmotionAnalysis.Result.parse("观察模式的补充说明：这不是标题");
+        assertTrue(lookalike.hasNoSections(),
+                "「观察模式的补充说明」不是标题，三段都该是空串；实际：" + lookalike);
+    }
+
+    @Test
     void parse_matchesHeadingsWithAsciiColon() {
         EmotionAnalysis.Result result =
                 EmotionAnalysis.Result.parse("观察到的模式:甲\n可能的影响因素:乙\n小建议:丙");
@@ -857,6 +1022,36 @@ class EmotionAnalysisTest {
         }
     }
 
+    /**
+     * 评审要求补的 3 参便捷构造器（brief 原本写的就是 3 组件；三段仍然是纯模型输出，
+     * 危机信息是并列元数据）。计划 3 里「先渲染三段、危机面板另走一路」的代码不必都写 5 个参数。
+     */
+    @Test
+    void result_threeArgumentConvenienceConstructor_equalsTheFiveArgumentOneWithoutCrisis() {
+        EmotionAnalysis.Result convenient =
+                new EmotionAnalysis.Result("观察到甲", "因素乙", "建议丙");
+        EmotionAnalysis.Result canonical =
+                new EmotionAnalysis.Result("观察到甲", "因素乙", "建议丙", false, "");
+
+        assertEquals(canonical, convenient,
+                "3 参构造器必须等价于 crisisTriggered=false、crisisNotice=\"\" 的 5 参版本");
+        assertFalse(convenient.crisisTriggered(), "3 参构造器的 crisisTriggered 恒为 false");
+        assertEquals("", convenient.crisisNotice(), "3 参构造器的 crisisNotice 恒为空串");
+        assertEquals("观察到甲", convenient.observations());
+        assertEquals("因素乙", convenient.factors());
+        assertEquals("建议丙", convenient.suggestions());
+        assertFalse(convenient.hasNoSections(), "三段都非空时 hasNoSections() 必须是 false");
+        assertTrue(new EmotionAnalysis.Result("", "", "").hasNoSections(),
+                "三段都空时 hasNoSections() 必须是 true");
+
+        // 5 组件这个形状本身也要钉住：计划 3 若按 3 参数解构，这里会先红
+        assertEquals(5, EmotionAnalysis.Result.class.getRecordComponents().length,
+                "Result 仍然是 5 个组件（三段 + crisisTriggered + crisisNotice）");
+        EmotionAnalysis.Result parsed = EmotionAnalysis.Result.parse("观察到的模式：甲");
+        assertEquals(new EmotionAnalysis.Result("甲", "", ""), parsed,
+                "parse 出来的结果与 3 参构造器造出来的是同一件事（未命中危机）");
+    }
+
     // =====================================================================
     // 工具
     // =====================================================================
@@ -879,27 +1074,431 @@ class EmotionAnalysisTest {
         return text.length() <= 400 ? text : text.substring(0, 400) + "…（截断显示）";
     }
 
-    /** 递归快照（相对路径集合）；单层快照会漏掉写进子目录的文件。 */
-    private static Set<String> snapshot(Path directory) throws IOException {
-        try (Stream<Path> entries = Files.walk(directory)) {
-            return entries.filter(entry -> !entry.equals(directory))
-                    .map(entry -> directory.relativize(entry).toString())
-                    .collect(Collectors.toCollection(TreeSet::new));
+    /** 反射拿私有内部类型（{@code Heading} 等），不为了测试把它放宽成 public。 */
+    private static Class<?> nestedType(String simpleName) {
+        for (Class<?> nested : EmotionAnalysis.class.getDeclaredClasses()) {
+            if (nested.getSimpleName().equals(simpleName)) {
+                return nested;
+            }
         }
+        throw new AssertionError("EmotionAnalysis 里没有内部类型 " + simpleName
+                + "；实际有：" + java.util.Arrays.toString(EmotionAnalysis.class.getDeclaredClasses()));
     }
 
-    private static String snapshotDifference(Set<String> before, Set<String> after) {
-        Set<String> added = new TreeSet<>(after);
-        added.removeAll(before);
-        Set<String> removed = new TreeSet<>(before);
-        removed.removeAll(after);
-        return "新增：" + added + "；消失：" + removed;
+    private static Class<?> analysisHeadingType() {
+        return nestedType("Heading");
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+    }
+
+    // ---------------------------------------------------------------------
+    // 探针子 JVM：把「有没有写盘」压到一个全新空工作目录里，与执行顺序无关
+    // ---------------------------------------------------------------------
+
+    /** 把探针写成 {@code .java} 文件（放在 {@code @TempDir} 里，不在模块 {@code target} 里留东西）。 */
+    private static Path writeProbeRunner(Path directory, String mainBody) throws IOException {
+        Path runner = directory.resolve("T9WriteProbe.java");
+        Files.writeString(runner, """
+                import com.xiaoyiyuan.study.ai.PromptRole;
+                import com.xiaoyiyuan.study.wellbeing.AnalysisWindow;
+                import com.xiaoyiyuan.study.wellbeing.EmotionAnalysis;
+                import com.xiaoyiyuan.study.wellbeing.EmotionLog;
+                import java.time.LocalDate;
+
+                public class T9WriteProbe {
+
+                """ + mainBody + "}\n", StandardCharsets.UTF_8);
+        return runner;
+    }
+
+    /**
+     * 在子 JVM 里跑探针：工作目录设成 {@code freshCwd}，把父进程的三处目录位置用
+     * {@code -D} 系统属性传进去（路径含空格/中文时命令行参数容易出错，系统属性最稳）。
+     */
+    private static String runProbeRunner(Path runnerFile, Path freshCwd) throws Exception {
+        String javaExecutable = Path.of(System.getProperty("java.home"), "bin",
+                isWindows() ? "java.exe" : "java").toString();
+
+        List<String> command = new ArrayList<>();
+        command.add(javaExecutable);
+        // 探针的输出里有中文（「空」「无差异」），子 JVM 的默认编码在这台机器上是 GBK，
+        // 父进程按 UTF-8 解码就会得到乱码——所以显式把文件编码与 stdout 编码都钉成 UTF-8。
+        command.add("-Dfile.encoding=UTF-8");
+        command.add("-Dstdout.encoding=UTF-8");
+        command.add("-Dstderr.encoding=UTF-8");
+        command.add("-D" + ProbeRunner.HOME_PROPERTY + "=" + System.getProperty("user.home"));
+        command.add("-D" + ProbeRunner.PARENT_CWD_PROPERTY + "="
+                + Path.of(System.getProperty("user.dir")).toAbsolutePath());
+        command.add("-D" + ProbeRunner.TARGET_PROPERTY + "="
+                + Path.of("target").toAbsolutePath());
+        command.add("-cp");
+        command.add(System.getProperty("java.class.path"));
+        command.add(runnerFile.toString());
+
+        ProcessBuilder builder = new ProcessBuilder(command);
+        builder.directory(freshCwd.toFile());
+        builder.redirectErrorStream(false);
+
+        Process process = builder.start();
+        String stdout;
+        String stderr;
+        try (var errorStream = process.getErrorStream(); var outStream = process.getInputStream()) {
+            stderr = new String(errorStream.readAllBytes(), StandardCharsets.UTF_8);
+            stdout = new String(outStream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        boolean finished = process.waitFor(3, TimeUnit.MINUTES);
+
+        assertTrue(finished, "探针子 JVM 没有在 3 分钟内结束；输出：\n" + stdout + "\n" + stderr);
+        assertEquals(0, process.exitValue(),
+                "探针子 JVM 里跑分析这一段落本身就失败了（要证明的是「跑完了但没写文件」）；输出：\n"
+                        + stdout + "\n" + stderr);
+        return stdout + "\n" + ProbeRunner.STDERR_BEGIN + "\n" + stderr + "\n" + ProbeRunner.STDERR_END;
+    }
+
+    private static String between(String text, String begin, String end) {
+        int start = text.indexOf(begin);
+        int stop = text.indexOf(end);
+        assertTrue(start >= 0 && stop > start, "探针输出里没有 " + begin + " … " + end + " 这一段；实际：\n" + text);
+        return text.substring(start + begin.length(), stop).strip();
+    }
+
+    /** 探针把差异做了 Base64（中文路径直接打印会撞上子进程的默认编码）。 */
+    private static String decodeDelta(String base64) {
+        return new String(java.util.Base64.getDecoder().decode(base64),
+                StandardCharsets.UTF_8);
+    }
+
+    /** 从一份快照里取出某个文件的那一项（断言失败时能直接看到是哪一项变了）。 */
+    private static String entryOf(String snapshot, String fileName) {
+        for (String line : snapshot.split("\n", -1)) {
+            if (line.startsWith(fileName + " | ")) {
+                return line;
+            }
+        }
+        return "<快照里没有 " + fileName + ">";
+    }
+
+    private static String extractField(String snapshot, String fileName, String field) {
+        String entry = entryOf(snapshot, fileName);
+        int at = entry.indexOf(field);
+        if (at < 0) {
+            return "<" + fileName + " 的 " + field + " 缺失>";
+        }
+        int end = entry.indexOf(' ', at + field.length());
+        return end < 0 ? entry.substring(at + field.length()) : entry.substring(at + field.length(), end);
     }
 
     private static void collectIfPath(List<String> offenders, Class<?> owner, String where, Type type) {
         String name = type.getTypeName();
-        if (name.contains("java.nio.file") || name.contains("java.io.File")) {
+        if (name.contains("java.nio.file") || name.contains("java.io.File")
+                || name.contains("java.io.OutputStream") || name.contains("java.io.Writer")
+                || name.contains("java.io.InputStream") || name.contains("java.io.Reader")
+                || name.contains("java.io.RandomAccessFile")) {
             offenders.add(owner.getSimpleName() + " 的 " + where + " → " + name);
+        }
+    }
+
+    /**
+     * 「不落盘」快照：目录 → 【相对路径 → 大小 + mtime】。
+     *
+     * <p>比旧的「相对路径集合」多两件事：<b>大小与修改时间</b>。于是「追加/改写已有文件」
+     * （路径集合不变）也会让快照变样。{@link #captureTopLevel} 只列直接子项，给那些
+     * 「递归会很慢、也容易 flaky」的目录用（用户主目录、{@code java.io.tmpdir}、模块 {@code target}）。
+     */
+    private static final class FileSnapshot {
+
+        private static final int ATTEMPTS = 5;
+        private static final long RETRY_SLEEP_MILLIS = 400;
+
+        private FileSnapshot() {
+        }
+
+        private record Item(String path, long size, FileTime modified) {
+
+            String render() {
+                return path + " | size=" + size + " mtime=" + modified.toMillis();
+            }
+        }
+
+        /** 递归快照（含子目录）。 */
+        static String capture(Path directory) throws IOException {
+            return String.join("\n", withRetry(() -> {
+                try (Stream<Path> entries = Files.walk(directory)) {
+                    return entries.filter(entry -> !entry.equals(directory))
+                            .map(entry -> item(directory, entry))
+                            .sorted()
+                            .toList();
+                }
+            }));
+        }
+
+        /** 只列直接子项的浅快照（递归会慢、也容易 flaky 的目录用它）。 */
+        static String captureTopLevel(Path directory) throws IOException {
+            return String.join("\n", withRetry(() -> {
+                try (Stream<Path> entries = Files.list(directory)) {
+                    return entries.map(entry -> item(directory, entry))
+                            .sorted()
+                            .toList();
+                }
+            }));
+        }
+
+        private static String item(Path base, Path entry) {
+            try {
+                return new Item(base.relativize(entry).toString(),
+                        Files.size(entry), Files.getLastModifiedTime(entry)).render();
+            } catch (IOException e) {
+                // 快照途中被别的进程挪走/删掉：如实记成一个条目，让「差异」把它显示出来
+                return new Item(base.relativize(entry).toString(), -1, FileTime.fromMillis(-1)).render();
+            }
+        }
+
+        /**
+         * 重试取快照，最多 5 次。系统或别的进程（Ant、编译器、编辑器……）在一次运行里
+         * 顺手动一下 {@code user.home}/{@code tmpdir} 会让「前后两个瞬间」天然不等——
+         * 那属于噪声，不该算成「这份实现写了盘」。
+         */
+        private static List<String> withRetry(SnapshotAttempt attempt) throws IOException {
+            IOException last = null;
+            for (int i = 0; i < ATTEMPTS; i++) {
+                try {
+                    return attempt.snapshot();
+                } catch (IOException e) {
+                    last = e;
+                    try {
+                        Thread.sleep(RETRY_SLEEP_MILLIS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw e;
+                    }
+                }
+            }
+            throw last;
+        }
+
+        /** 一个目录的快照结果。 */
+        @FunctionalInterface
+        private interface SnapshotAttempt {
+            List<String> snapshot() throws IOException;
+        }
+
+        /** 两份快照的可读差异：无差异时返回「无差异」。 */
+        static String diff(String before, String after) {
+            if (before.equals(after)) {
+                return "无差异";
+            }
+            Set<String> beforeLines = new TreeSet<>(List.of(before.split("\n", -1)));
+            Set<String> afterLines = new TreeSet<>(List.of(after.split("\n", -1)));
+            Set<String> added = new TreeSet<>(afterLines);
+            added.removeAll(beforeLines);
+            Set<String> removed = new TreeSet<>(beforeLines);
+            removed.removeAll(afterLines);
+            return "新增/改动：" + added + "\n消失/改动前：" + removed;
+        }
+    }
+
+    /** 探针程序的正文（被 {@link #writeProbeRunner} 拼进一个 {@code public class T9WriteProbe}）。 */
+    private static final class ProbeRunner {
+
+        static final String HOME_PROPERTY = "t9.probe.user.home";        static final String PARENT_CWD_PROPERTY = "t9.probe.parent.cwd";
+        static final String TARGET_PROPERTY = "t9.probe.target";
+        static final String SKIP_HOME_PROPERTY = "t9.probe.skip.home";
+        static final String DELTA_BEGIN = "T9-PROBE-DELTA-BEGIN";
+        static final String DELTA_END = "T9-PROBE-DELTA-END";
+        static final String STDERR_BEGIN = "T9-STDERR-BEGIN";
+        static final String STDERR_END = "T9-STDERR-END";
+
+        private ProbeRunner() {
+        }
+
+        /**
+         * 探针正文：在子 JVM 里<b>先</b>对四处位置取快照，再跑分析，再取一次快照，打印差异。
+         *
+         * <p>四次快照全在子 JVM 里、紧贴着分析调用，所以「前后」之间的缝隙里没有别的测试代码；
+         * 模块 {@code target} 与用户主目录是<b>顶层</b>浅快照（递归会慢、也容易 flaky），
+         * 工作目录是<b>递归</b>快照。
+         */
+        static final String MAIN = """
+                    private static final String SEP = "\\u0000";
+
+                    public static void main(String[] args) throws Exception {
+                        java.util.List<String> places = new java.util.ArrayList<>();
+                        places.add("工作目录(" + System.getProperty("user.dir") + ",递归)");
+                        if (System.getProperty("%1$s") == null) {
+                            places.add("java.io.tmpdir(" + System.getProperty("java.io.tmpdir") + ",顶层)");
+                        }
+                        if (System.getProperty("%2$s") == null) {
+                            places.add("用户主目录(" + System.getProperty("user.home") + ",顶层)");
+                        }
+                        if (System.getProperty("%3$s") == null) {
+                            places.add("模块 target(顶层)");
+                        }
+
+                        java.util.List<String> before = snapshotAll(places);
+                        runAnalysis();
+                        java.util.List<String> after = snapshotAll(places);
+
+                        System.out.println("T9-PROBE-OK");
+                        System.out.println("%4$s");
+                        System.out.println(diff(before, after));
+                        System.out.println("%5$s");
+                    }
+
+                    private static void runAnalysis() {
+                        EmotionLog log = EmotionLog.parse(
+                                "## 2026-10-05（周一）\\n\\n- 情绪：平静 ｜ 强度：3\\n- 备注：探针\\n");
+                        EmotionAnalysis.build(PromptRole.COUNSELOR,
+                                new AnalysisWindow(LocalDate.of(2026, 10, 4), LocalDate.of(2026, 10, 10)),
+                                log);
+                        EmotionAnalysis.Result.parse("观察到的模式：甲\\n可能的影响因素：乙\\n小建议：丙");
+                        EmotionAnalysis.renderEntries(log.entries());
+                    }
+
+                    private static java.util.List<String> snapshotAll(java.util.List<String> places)
+                            throws Exception {
+                        java.util.List<String> out = new java.util.ArrayList<>();
+                        for (String place : places) {
+                            if (place.startsWith("工作目录")) {
+                                out.add(place + SEP + walk(java.nio.file.Path.of(System.getProperty("user.dir"))));
+                            } else if (place.startsWith("java.io.tmpdir")) {
+                                out.add(place + SEP + topLevel(java.nio.file.Path.of(
+                                        System.getProperty("java.io.tmpdir"))));
+                            } else if (place.startsWith("用户主目录")) {
+                                out.add(place + SEP + topLevel(java.nio.file.Path.of(
+                                        System.getProperty("%1$s"))));
+                            } else {
+                                out.add(place + SEP + topLevel(java.nio.file.Path.of(
+                                        System.getProperty("%3$s"))));
+                            }
+                        }
+                        return out;
+                    }
+
+                    private static String walk(java.nio.file.Path dir) throws Exception {
+                        try (java.util.stream.Stream<java.nio.file.Path> entries =
+                                     java.nio.file.Files.walk(dir)) {
+                            return entries.filter(p -> !p.equals(dir))
+                                    .map(p -> item(dir, p))
+                                    .sorted()
+                                    .collect(java.util.stream.Collectors.joining("\\n"));
+                        }
+                    }
+
+                    private static String topLevel(java.nio.file.Path dir) throws Exception {
+                        if (java.nio.file.Files.isDirectory(dir)) {
+                            try (java.util.stream.Stream<java.nio.file.Path> entries =
+                                         java.nio.file.Files.list(dir)) {
+                                return entries.map(p -> item(dir, p))
+                                        .sorted()
+                                        .collect(java.util.stream.Collectors.joining("\\n"));
+                            }
+                        }
+                        return pathOf(dir);
+                    }
+
+                    private static String item(java.nio.file.Path base, java.nio.file.Path entry) {
+                        try {
+                            return base.relativize(entry) + " | size=" + java.nio.file.Files.size(entry)
+                                    + " mtime=" + java.nio.file.Files.getLastModifiedTime(entry).toMillis();
+                        } catch (java.io.IOException e) {
+                            return base.relativize(entry) + " | 读不到";
+                        }
+                    }
+
+                    private static String pathOf(java.nio.file.Path path) {
+                        return path + " | size=" + (java.nio.file.Files.exists(path) ? "有" : "无");
+                    }
+
+                    private static String diff(java.util.List<String> before, java.util.List<String> after) {
+                        StringBuilder out = new StringBuilder();
+                        for (int i = 0; i < before.size() && i < after.size(); i++) {
+                            String head = before.get(i).substring(0, before.get(i).indexOf(SEP));
+                            String was = before.get(i).substring(before.get(i).indexOf(SEP) + 1);
+                            String now = after.get(i).substring(after.get(i).indexOf(SEP) + 1);
+                            if (!was.equals(now)) {
+                                out.append("【").append(head).append("】新增/改动了：\\n")
+                                        .append(added(was, now)).append('\\n');
+                            }
+                        }
+                        String text = out.length() == 0 ? "无差异" : out.toString().strip();
+                        // Base64：路径与文案里有中文，直接打印会撞上子进程的默认编码
+                        return java.util.Base64.getEncoder().encodeToString(
+                                text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+
+                    private static String added(String was, String now) {
+                        java.util.Set<String> beforeLines = new java.util.TreeSet<>(
+                                java.util.List.of(was.split("\\n", -1)));
+                        java.util.Set<String> afterLines = new java.util.TreeSet<>(
+                                java.util.List.of(now.split("\\n", -1)));
+                        java.util.Set<String> added = new java.util.TreeSet<>(afterLines);
+                        added.removeAll(beforeLines);
+                        java.util.Set<String> removed = new java.util.TreeSet<>(beforeLines);
+                        removed.removeAll(afterLines);
+                        return "  新增/改动：" + added + "\\n  消失/改动前：" + removed;
+                    }
+                """.formatted(HOME_PROPERTY, SKIP_HOME_PROPERTY, TARGET_PROPERTY,
+                DELTA_BEGIN, DELTA_END);
+    }
+
+    /**
+     * 四处位置的探针（评审 F1）：子 JVM 里对「工作目录（递归）/ java.io.tmpdir（顶层）/
+     * 用户主目录（顶层）/ 模块 target（顶层）」各取一次「路径 → 大小 + mtime」快照，
+     * 跑完分析再取一次，打印差异。
+     */
+    private static final class WatchProbe {
+
+        static final String MAIN = ProbeRunner.MAIN;
+
+        private WatchProbe() {
+        }
+    }
+
+    /** 只要「那个空工作目录里有什么」的探针（顺序无关那条断言用它）。 */
+    private static final class FreshCwdProbe {
+
+        static final String MAIN = """
+                    public static void main(String[] args) throws Exception {
+                        runAnalysis();
+                        System.out.println("T9-OK");
+                        System.out.println("T9-FRESH-BEGIN");
+                        java.util.List<String> entries;
+                        try (java.util.stream.Stream<java.nio.file.Path> stream =
+                                     java.nio.file.Files.list(java.nio.file.Path.of(
+                                             System.getProperty("user.dir")))) {
+                            entries = stream.map(java.nio.file.Path::toString).sorted().toList();
+                        }
+                        System.out.println(entries.isEmpty() ? "空" : String.join("\\n", entries));
+                        System.out.println("T9-FRESH-END");
+                    }
+
+                    private static void runAnalysis() {
+                        EmotionLog log = EmotionLog.parse(
+                                "## 2026-10-05（周一）\\n\\n- 情绪：平静 ｜ 强度：3\\n- 备注：探针\\n");
+                        EmotionAnalysis.build(PromptRole.COUNSELOR,
+                                new AnalysisWindow(LocalDate.of(2026, 10, 4), LocalDate.of(2026, 10, 10)),
+                                log);
+                        EmotionAnalysis.Result.parse("观察到的模式：甲");
+                        EmotionAnalysis.renderEntries(log.entries());
+                    }
+                """;
+
+        private FreshCwdProbe() {
+        }
+    }
+
+    /** {@link PromptLibrary} 的替身：返回一份只有空白的提示词，用于自检那半的用例。 */
+    private static final class BlankPromptLibrary extends PromptLibrary {
+
+        BlankPromptLibrary() {
+            super(null);
+        }
+
+        @Override
+        public String load(PromptRole role) {
+            return "   \n\n  \n";
         }
     }
 }

@@ -58,10 +58,14 @@ public record AnalysisWindow(LocalDate from, LocalDate to) {
      */
     public static AnalysisWindow lastDays(LocalDate today, int days) {
         Objects.requireNonNull(today, "today（时间窗要有一个结束日）");
+        // 天数校验必须排在最前，而且理由要说「天数」：把它放到构造器后面靠 from>to 兜住，
+        // 抛出来的会是「起始日不能晚于结束日」——那是回绕出来的假象，会把用户引到错误的方向
+        // （评审 V4：days=0 时窗口回绕成 [明天, 今天]，消息与 javadoc 承诺的完全不是一回事）。
         if (days < 1) {
             throw new IllegalArgumentException(
-                    "时间窗的天数必须至少 1 天，收到 " + days
-                            + "。不返回一个空窗口：用户会把它读成「这几天没有记录」。");
+                    "时间窗的天数必须是至少 1 天的整数，收到 " + days
+                            + " 天。这里既不返回一个空窗口（会被读成「这几天没有记录」），"
+                            + "也不靠窗口回绕之后拿两个端点的大小关系当理由——那描述的不是真正的问题。");
         }
         return new AnalysisWindow(today.minusDays(days - 1L), today);
     }

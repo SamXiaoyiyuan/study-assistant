@@ -55,7 +55,8 @@ import java.util.regex.Pattern;
  * 规范化——这是为了让文件里只有一个「App 写出来的样子」。代价被限制在那一个条目<b>内部</b>：
  * 其余字节、以及所有没被编辑过的条目，一律原样回写。
  *
- * <p><b>本类必须 public</b>：Task 9 的 {@code ai} 包与计划 3 的界面在别的包里消费它。
+ * <p><b>本类必须 public</b>：Task 9 的 {@code wellbeing} 包（{@code AnalysisWindow} /
+ * {@code EmotionAnalysis}）与计划 3 的界面在别的包里消费它。
  */
 public final class EmotionLog {
 
