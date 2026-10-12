@@ -889,7 +889,7 @@ git commit -F <utf8-消息文件>     # 主题：feat(ui): AI 对话页（逐次
 
 **规则（全部必须实现）**
 - **AI 连接三字段 + 超时**（spec §7.1）：`base_url` / `api_key` / `model` / 超时。`base_url` 输入框要有**实时规范化预览**（显示最终请求地址）。**规范化由 `ai` 包负责**（`AiClient.endpoint`，计划 2 Task 4）：界面**只调用它**，**不自己拼 URL**（否则会出现 `/v1/v1`，或两处规范化规则分叉）。
-  - `setRequestTimeoutSec` 要接住 `AppConfig.setRequestTimeout` 的 `IllegalArgumentException`（非正数 / 含亚秒）并显示消息。
+  - `setRequestTimeoutSec` 要接住 `AppConfig.setRequestTimeout` 的 `IllegalArgumentException`（**非正数 / 含亚秒 / 超过 24 小时**——上界 24h 由计划 2 修复轮 1 引入，常量 `AppConfig.MAX_REQUEST_TIMEOUT`）并显示消息。**界面不得自己写死秒数上界**（否则与 core 会分叉）：一律以 core 抛出的异常与其消息为准，只负责把消息显示出来。
   - **「测试连接」按钮**（spec §7.1）：发最小请求。**它也必须过确认门**——它是网络请求。**未确认不得发出。**
   - **Key 明文告知**：固定文案，不许弱化。
 - **study 目录与文件路径**（spec §8.1）：可改 `studyDir`；页面显示**由它派生**的四个绝对路径（计划文件 / 情绪记录 / 备份 / 归档）。
@@ -1107,13 +1107,13 @@ git commit -F <utf8-消息文件>     # 主题：feat(ui): 中性危机资源面
 - [ ] **Step 2: 先跑现有全量，确认基线是绿的** → `MVN -pl study-core clean test`
 - [ ] **Step 3: 跑新测试，确认红** → `MVN -pl study-desktop clean test -Dtest=DisabledWordTest,VisibleTextScannerSelfTest`
 - [ ] **Step 4: 实现扫描器与样例，并**逐条清掉真实命中****
-  - 真实命中**必须逐条处理**：改文案、或（当它确实是 core 异常消息时）由 Task 4 的 `UiText.neutralize(...)` 在**显示前**中立化，并把 core 原文写日志。**裁定 A6 允许中立化作为界面侧的兜底，但同时要求**：`coreUserVisibleExceptionMessages_...` 那条测试**一旦命中就红**，逼实现者把命中位置写进报告、由控制器决定是改 core 消息（要动计划 1/2 的冻结面）还是维持中立化。
+  - 真实命中**必须逐条处理**：**在源码层把文案改掉**（含 core 里会显示给用户的异常消息），并同步受影响的断言。**控制器裁定（推翻 A6 的「中立化」路线）**：`UiText.neutralize(...)` **至多**是「万一漏了」的显示层兜底，**不得作为让 `DisabledWordTest` 变绿的手段**；`coreUserVisibleExceptionMessages_...` 一旦命中，就必须改源码，而不是记一笔、也不是显示前替换掉。core 侧文案的清理并入 **Task 3 的第一件事**（其裁定见 `.superpowers/sdd/2026-10-11-plan-3-desktop-ui/progress.md`）。
   - 已知的真实命中（开工前实测，**不是猜测**）：
     | 位置 | 词 | 是否会被 `DisabledWordTest` 扫到 |
     |---|---|---|
     | `SectionMissingException` 的消息（`"章节「X」定位失败："`） | `失败` | **会**（第 3 条规则），且**会显示在界面上** |
     | `PlanDocument` 的 `SectionMissingException` 调用点消息 | `失败` | **会**（`PlanDocument.class` 在类列表里） |
-    | `AppConfig.setRequestTimeout` 的消息（`"零或负超时会让每次请求直接失败…"`） | `失败` | **会**（只要把 `AppConfig.class` 放进类列表）。**裁定：放进去**——这条消息会被 Task 9 的 `setRequestTimeoutSec` 的 `catch (IllegalArgumentException)` 显示给用户。因此 `coreUserVisibleExceptionMessages_...` 的类列表**必须含 `AppConfig.class`**，而它会命中；处理方式 = 由 `UiText.neutralize` 在显示前中立化（A6），并把「core 消息该改」记进「下一份计划」第 2 条 |
+    | `AppConfig.setRequestTimeout` 的消息（`"零或负超时会让每次请求直接失败…"`） | `失败` | **会**（只要把 `AppConfig.class` 放进类列表）。**裁定：放进去**——这条消息会被 Task 9 的 `setRequestTimeoutSec` 的 `catch (IllegalArgumentException)` 显示给用户。因此 `coreUserVisibleExceptionMessages_...` 的类列表**必须含 `AppConfig.class`**，而它会命中；处理方式 = **源码层改掉 core 这条消息里的 `失败`，并同步受影响的断言**（控制器裁定；`UiText.neutralize` 不得作为让它变绿的手段） |
     | `GoalStatus` 的 javadoc / `GoalStateTest` | `失败`/`落后`/`已放弃` | javadoc 不在常量池里，**扫不到**；`GoalStateTest` 在 test 目录，**不扫** |
 - [ ] **Step 5: 跑新测试，确认绿** → `MVN -pl study-desktop clean test -Dtest=DisabledWordTest,VisibleTextScannerSelfTest`
 - [ ] **Step 6: 变异验证（这一步不许省）**
