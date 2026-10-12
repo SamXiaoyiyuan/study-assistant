@@ -990,7 +990,7 @@ public final class AiClient {
             text.delete(0, start);
         }
 
-        /** 一个事件的载荷：{@code [DONE]} 结束，{@code data:} 取增量，其余（注释行）忽略。 */
+        /** 一个事件的载荷：{@code [DONE]} 结束，{@code data:} 取增量，其余行忽略。 */
         private void handleEvent(String payload, AiStreamListener listener) throws AiFailure {
             // done 判断在这里是<b>第二道</b>防线（第一道在 consume 的读循环与 dispatchCompleteLines）：
             // 读循环一旦看到 [DONE] 就不再发起下一次 read，所以走到这里时 done 为真只可能来自
@@ -1003,14 +1003,25 @@ public final class AiClient {
             for (String line : payload.split("\n")) {
                 String trimmed = line.endsWith("\r")
                         ? line.substring(0, line.length() - 1) : line;
-                if (trimmed.startsWith(":")) {
+                // 按 SSE 规范：一行里没有冒号时，整行是「字段名 = 整行、值为空」——既不是注释
+                // （注释要以 `:` 开头），也不是 data。修前这里把这类行（含「只由空格组成」的行）
+                // <b>原样并进事件载荷</b>：它们既不是 `data:` 也不是以 `:` 开头，于是绕过了下面
+                // 两条 continue，被 append 进 payload → 整个事件拼出的文本不再是合法 JSON →
+                // 解析失败被跳过 → <b>同一事件里前后的正文一起丢</b>。
+                // 真实网关确实会插这种行（多余的空白、非标准字段），而按规范它们应当被忽略。
+                int colon = trimmed.indexOf(':');
+                if (colon < 0) {
+                    continue;
+                }
+                if (colon == 0) {
                     continue; // 注释行（心跳）
                 }
-                if (!trimmed.startsWith("data:")) {
+                String field = trimmed.substring(0, colon);
+                if (!"data".equals(field)) {
                     continue; // event: / id: / retry: 等字段对本功能无意义
                 }
                 // `data:` 与 `data: ` 都合法：冒号后那<b>一个</b>空格是分隔符，不是内容
-                String value = trimmed.substring("data:".length());
+                String value = trimmed.substring(colon + 1);
                 if (value.startsWith(" ")) {
                     value = value.substring(1);
                 }

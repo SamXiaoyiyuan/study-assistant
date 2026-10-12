@@ -540,6 +540,267 @@ class CrisisKeywordTest {
                 "命中的必须是资源表里的字面「一了百了」；实际：" + s.matchedKeywords());
     }
 
+    // ================= minor 清算批（Task 3 复审 Minor-1…Minor-5） =================
+
+    /**
+     * 白名单 public 面扫描必须看得见「<b>非 public 类祖先</b>提供的 {@code public} 方法」
+     * （minor 清算批，Task 3 复审 Minor-1 / F5 缺口）。
+     *
+     * <p><b>先说清实测到的事实</b>（与复审报告的措辞不同，故如实记录）：在<b>本机 JDK 25</b> 上，
+     * {@code getMethods()} <b>会</b>返回非 public 祖先提供的 public 方法——无论是「直接父类是非
+     * public 类」还是「祖先里隔着非 public 类」，本测试都实测它看得见。复审报告称 M8b-A
+     * （{@code CrisisDetector extends 包级私有父类}）因 {@code getMethods()} 失明而全绿，
+     * 这一条我<b>未能复现</b>（见 {@code task-minors-report.md} §B6 的对照实验与原始输出）。
+     *
+     * <p>尽管如此，扫描器仍改为「沿 {@code getSuperclass()} 链取每一级的
+     * {@code getDeclaredMethods()}」：F5 要的是「多出任何 public 成员都必须变红」，
+     * 而 {@code getMethods()} 的行为是 JDK 实现细节（本机看得见不代表别的版本也看得见，
+     * 这正是复审者声称看到的现象）。本测试因此把两件事都钉住：① 两条来自不同祖先层的 public
+     * 方法都必须在扫描面里；② 扫描面仍恰好等于白名单（不许因为多走了链而多算成员）。
+     */
+    @Test
+    void publicSurface_seesInheritedMethods_fromNonPublicAncestor() {
+        assertFalse(java.lang.reflect.Modifier.isPublic(RefusalBase.class.getModifiers()),
+                "前置条件：基类必须是非 public 的类（public 父类走 getMethods() 就能看见）");
+        assertTrue(java.lang.reflect.Modifier.isPublic(PublicRefusalMid.class.getModifiers()),
+                "前置条件：中间父类必须是 public 的类");
+        assertTrue(declaredMethodNames(PublicRefusalMid.class).contains("stopEverything"),
+                "前置条件：第二层拒绝式 API 声明在 public 中间类上");
+
+        // 两条来自不同祖先层的 public 方法都必须被收进来。
+        // 对照实测：本机 JDK 25 的 getMethods() 也收得到它们（连「隔着非 public 祖先」那一档都收得到）
+        // ——所以这一条不是「getMethods() 会漏」，而是「扫描面必须含全部祖先层的 public 成员」。
+        assertFalse(hasDeclaredMethod(PublicRefusalMidStub.class, "haltAnyway"),
+                "前置条件：haltAnyway() 不在子类自己声明的成员里");
+        assertFalse(hasDeclaredMethod(PublicRefusalMidStub.class, "stopEverything"),
+                "前置条件：stopEverything() 也不在子类自己声明的成员里");
+        assertTrue(hasMethod(PublicRefusalMidStub.class, "haltAnyway"),
+                "对照实测：本机 JDK 25 的 getMethods() 收进了基类那一层的 haltAnyway()；实际 "
+                        + java.util.Arrays.stream(PublicRefusalMidStub.class.getMethods())
+                                .map(m -> m.getName() + "@" + m.getDeclaringClass().getSimpleName())
+                                .distinct().sorted().toList()
+                        + "；若这里变成 false（换了 JDK 行为），说明本条对照要改写——"
+                        + "沿父类链上溯的实现正是为了不依赖这个行为");
+        assertTrue(publicSurface(PublicRefusalMidStub.class).contains("haltAnyway"),
+                "public 面扫描器必须把非 public 祖先的 public 方法收进来；实际："
+                        + publicSurface(PublicRefusalMidStub.class));
+        assertTrue(publicSurface(PublicRefusalMidStub.class).contains("stopEverything"),
+                "同一条链上 public 父类那一层也不能漏；实际："
+                        + publicSurface(PublicRefusalMidStub.class));
+        assertEquals(List.of("haltAnyway", "stopEverything"),
+                publicSurface(PublicRefusalMidStub.class).stream()
+                        .filter(n -> n.startsWith("halt") || n.startsWith("stop")).toList(),
+                "两层祖先的拒绝式 API 都必须落在扫描面里");
+
+        // 真实目标：CrisisDetector 的 public 面仍恰好等于白名单（上溯不得多算出别的成员）
+        assertEquals(EXPECTED_DETECTOR_SURFACE, publicSurface(CrisisDetector.class),
+                "沿父类链上溯之后，CrisisDetector 的 public 面仍必须恰好等于白名单");
+    }
+
+    /** 词表里「归一后为空」的行必须被跳过（minor 清算批，Task 3 复审 Minor-2 / Minor-4）。 */
+    @Test
+    void whitespaceOnlyKeywordLine_isSkipped(@TempDir Path dir) throws IOException {
+        // 整行只有空白（普通空格 / TAB）——strip() 之后就是空串，与「空行」同义。
+        // 这一条与 keywordWithTabOrInvisibleInside_isKeptAndMatches 配对：词行是「空白 + 词」
+        // 时不可见字符被保留在字面里，而词行「整体只是空白」时整行跳过。
+        for (String content : List.of(" \n", cp(0x09) + "\n", "  香蕉  \n", "香蕉\n   \n")) {
+            CrisisDetector d = CrisisDetector.load(writeKeywordFile(dir, content));
+            assertFalse(d.keywords().contains(""), "词表里不得出现空串词条；文件：" + escape(content));
+            for (String k : d.keywords()) {
+                assertFalse(k.isBlank(), "词表里不得出现空白词条；文件：" + escape(content)
+                        + " → 词：「" + escape(k) + "」");
+            }
+        }
+        CrisisDetector d = CrisisDetector.load(writeKeywordFile(dir, "  香蕉  \n"));
+        assertEquals(Set.of("香蕉"), d.keywords(), "首尾空白仍按老规则去掉；实际：" + d.keywords());
+    }
+
+    /**
+     * <b>「归一化后为空」的词行必须被跳过</b>（minor 清算批，Task 3 复审 Minor-2 / Minor-3 / Minor-8）。
+     *
+     * <p>复核实测的失败路径：词表里只有一行 NBSP（U+00A0）。{@code String.strip()} 用的是
+     * {@code Character.isWhitespace}，而 NBSP / U+2007 / U+202F 都是 {@code false}——于是这一行
+     * 既没被 strip 掉、又不是 FORMAT/CONTROL，就<b>成了词表里的一个词</b>。可它的归一形态是空串，
+     * 判定时被「空形态」守卫跳过：{@code keywords()} 非空（1 个词）、而<b>有效词数为 0</b>，
+     * 「空表回退」因此不触发——兜底静默归零复发，同时与 {@code load} 的
+     * 「永不为『装 0 个词』的检测器」直接矛盾。
+     *
+     * <p>所以判据是两条：① 只含 NBSP 的词表必须回退内置表（词数 > 1）；② 回退回来的检测器
+     * 对普通文本<b>不得</b>命中——只断言 ① 会漏掉「词表非空但有效词数为 0」这一半
+     * （那正是 M9 变异体全绿的原因：去掉空形态守卫后 {@code contains("")} 恒真，任何输入都命中）。
+     */
+    @Test
+    void keywordFileWithInvisibleOnlyLine_isSkippedAndFallsBackToBuiltin(@TempDir Path dir)
+            throws IOException {
+        List<String> invisibleOnlyContents = List.of(
+                cp(0x00A0),                        // NBSP：isSpaceChar 但<b>不是</b> isWhitespace
+                cp(0x00A0) + "\n",
+                cp(0x2007),                        // FIGURE SPACE，同上
+                cp(0x202F),                        // NARROW NO-BREAK SPACE，同上
+                cp(0x200B) + "\n",                 // 零宽空格（FORMAT）
+                cp(0xFEFF) + "\n",                 // BOM 单独成行
+                cp(0x00A0) + "\n" + cp(0x200B) + "\n" + cp(0x202F) + "\n");
+
+        for (String content : invisibleOnlyContents) {
+            CrisisDetector d = CrisisDetector.load(writeKeywordFile(dir, content));
+            assertTrue(d.keywords().size() > 1,
+                    "整份词表「归一化后为空」时必须回退内置表，而不是装进一个有效词数为 0 的检测器；"
+                            + "文件内容：" + escape(content) + " → 实际词表：" + d.keywords());
+            assertFalse(d.detect("今天做了两小时数学，还行").triggered(),
+                    "回退回来的检测器不得对普通文本命中（去掉空形态守卫后 contains(\"\") 恒真）；"
+                            + "文件内容：" + escape(content));
+            assertTrue(d.detect("我想自杀").triggered(),
+                    "回退后危机语句必须仍然命中；文件内容：" + escape(content));
+        }
+
+        // 另一半：不可见行被跳过，但同一份文件里的<b>正常词</b>必须照旧生效（不是「整份表被顶掉」）。
+        CrisisDetector mixed = CrisisDetector.load(
+                writeKeywordFile(dir, cp(0x00A0) + "\n香蕉\n" + cp(0x200B) + "\n"));
+        assertEquals(Set.of("香蕉"), mixed.keywords(),
+                "不可见行被跳过，正常词一条不少；实际：" + mixed.keywords());
+        assertTrue(mixed.detect("我想吃香蕉").triggered(), "正常词必须仍生效");
+        assertFalse(mixed.detect("我想自杀").triggered(), "磁盘表非空时不得被内置表顶替");
+    }
+
+    /**
+     * 词表里每个词的「匹配形态」都不得为空（minor 清算批）。
+     *
+     * <p>这是 {@code detect} 里那条空形态守卫的<b>前置条件</b>断言：解析层保证装进来的词都有
+     * 非空的匹配形态，守卫才只是「万一」的防线而不是「恒真的死代码」。把 {@code fromLines}
+     * 的空形态过滤去掉，这一条与上面的 NBSP 用例会一起变红。
+     */
+    @Test
+    void everyLoadedKeywordHasNonEmptyMatchingForm(@TempDir Path dir) throws IOException {
+        List<CrisisDetector> detectors = List.of(
+                CrisisDetector.builtIn(),
+                CrisisDetector.load(writeKeywordFile(dir, "香蕉\nkill myself\n一了百了\n")),
+                CrisisDetector.load(writeKeywordFile(dir, cp(0x00A0) + "\n香蕉\n")),
+                CrisisDetector.load(writeKeywordFile(dir, "kill" + cp(0x09) + "myself\n")));
+        for (CrisisDetector d : detectors) {
+            assertFalse(d.keywords().isEmpty(), "前置条件：词表不得为空");
+            for (String k : d.keywords()) {
+                assertFalse(collapseInvisible(k).isEmpty(),
+                        "词表里每个词在归一口径下都必须有非空匹配形态，否则 contains(\"\") 恒真、"
+                                + "任何输入都会命中；词：「" + escape(k) + "」");
+            }
+        }
+    }
+
+    /**
+     * <b>词行里的制表符/零宽字符不再让整行消失</b>（minor 清算批，Task 3 复审 Minor-4）。
+     *
+     * <p>输入侧的口径是「去掉全部不可见字符后做包含匹配」，词表侧却曾把「含 FORMAT/CONTROL 的行」
+     * 整行丢掉——两侧不对称：用户在<b>输入</b>里写「自[TAB]杀」会命中，而他把同一个词写进
+     * <b>词表</b>时，这个词会静默消失（而且因为「解析后为空则回退内置表」，极端情况下用户的整份
+     * 自定义表都会被悄悄换成内置 37 词，用户无从得知自己的表没生效）。
+     *
+     * <p>本轮按与输入侧同一口径收口：<b>字面原样保留，匹配形态走归一</b>。
+     * 断言三件事：① 词表里保住的仍是<b>原字面</b>（不被静默改写成连写）；② 同一形状的输入命中，
+     * 且命中词就是这个字面；③ 不构成该词时（多一个字）仍不命中，证明不是「删掉不可见字符就乱命中」。
+     */
+    @Test
+    void keywordWithTabOrInvisibleInside_isKeptAndMatches(@TempDir Path dir) throws IOException {
+        List<String> literals = List.of(
+                "自" + cp(0x09) + "杀",           // 制表符
+                "自" + cp(0x200B) + "杀",         // 零宽空格
+                "kill" + cp(0x09) + "myself",     // 英文短语被制表符拆开
+                "自" + cp(0x00A0) + "杀");        // NBSP（isSpaceChar，词中间的普通空白口径）
+
+        for (String literal : literals) {
+            CrisisDetector d = CrisisDetector.load(
+                    writeKeywordFile(dir, literal + "\n"));
+            assertEquals(Set.of(literal), d.keywords(),
+                    "词行里的分隔用不可见字符不得让整行消失，也不得被静默改写成连写；"
+                            + "词行原样：" + escape(literal) + " → 实际词表：" + d.keywords());
+            assertTrue(d.detect(literal).triggered(),
+                    "词表里保住的词必须真的能触发兜底；词行原样：" + escape(literal));
+            assertTrue(d.detect(literal).matchedKeywords().contains(literal),
+                    "命中词必须是词表里的原字面；词行原样：" + escape(literal) + " → 实际命中词："
+                            + d.detect(literal).matchedKeywords());
+            assertFalse(d.detect(literal + "呀").triggered() && d.keywords().isEmpty(),
+                    "前置条件：词表非空");
+        }
+
+        // 反例：同一条词表里，「自\t杀」保住了，但普通文本仍然不命中（不是「什么都命中」）。
+        CrisisDetector d = CrisisDetector.load(writeKeywordFile(dir, "自" + cp(0x09) + "杀\n"));
+        assertFalse(d.detect("今天做了两小时数学，还行").triggered(),
+                "保住带制表符的词之后，普通文本仍不得命中");
+    }
+
+    /**
+     * 零宽/控制字符行被跳过之后，<b>词表不会退化成「装 0 个词」</b>——
+     * 与 {@code emptyKeywordFile_fallsBackToBuiltin_neverSilentlyZero} 配对，
+     * 盯的是「解析后有效词数为 0」这条新判据（而不是「文本为空」这条旧判据）。
+     */
+    @Test
+    void invisibleOnlyKeywordFile_neverYieldsZeroEffectiveWords(@TempDir Path dir)
+            throws IOException {
+        for (String content : List.of(cp(0x00A0), cp(0x2007) + "\n", cp(0x00A0) + cp(0x200B))) {
+            CrisisDetector d = CrisisDetector.load(writeKeywordFile(dir, content));
+            long effective = d.keywords().stream().filter(k -> !collapseInvisible(k).isEmpty()).count();
+            assertTrue(effective > 0,
+                    "有效词数不得为 0（文件内容：" + escape(content) + "）；实际词表：" + d.keywords());
+        }
+    }
+
+    /**
+     * 归一化覆盖<b>组合符</b>与<b>NFKC 兼容形式</b>（minor 清算批，Task 3 复审 Minor-5）。
+     *
+     * <p>复核实测两类真实 MISS：
+     * <ul>
+     *   <li>组合符拆字「自」+ U+0301 + 「杀」：这是<b>同一个词</b>的另一种码点写法，
+     *       与「自[空格]杀」同类，不做归一就是静默漏报；</li>
+     *   <li>全角拉丁 {@code ＫＩＬＬ　ＭＹＳＥＬＦ}：<b>有真实用户面</b>——中文输入法的「全角」
+     *       模式下敲英文就是全角字母，而它整句不命中。</li>
+     * </ul>
+     * 处理顺序刻意是「先去不可见字符与组合符、再 NFKC」（NFKC 之后可能又冒出不可见字符）。
+     * 每条都断言<b>命中词是词表字面</b>，防止「命中了但说不清因为哪个词」。
+     */
+    @Test
+    void normalization_coversCombiningMarksAndFullwidthForms() {
+        CrisisDetector d = CrisisDetector.builtIn();
+
+        // —— 组合符（Mn）：自 + U+0301 + 杀 ——
+        // 只列真正的「组合符」NON_SPACING_MARK：U+0301 重音、U+0300 重音、U+0308 分音符、
+        // U+FE00/U+FE0F 变体选择符。U+20E3（组合用包围键帽）属于 ENCLOSING_MARK：它自带宽度
+        // 与可见形状，剥掉它等于改写用户写的字，故明确不在此列（见报告 §B7 的已知边界）。
+        for (int mark : new int[] {0x0301, 0x0300, 0x0308, 0xFE00, 0xFE0F}) {
+            String broken = "自" + cp(mark) + "杀";
+            CrisisSignal s = d.detect(broken);
+            assertTrue(s.triggered(),
+                    "组合符（U+" + Integer.toHexString(mark).toUpperCase(Locale.ROOT)
+                            + "）拆开的「自杀」必须命中；输入：" + escape(broken) + " → 实际：" + s);
+            assertTrue(s.matchedKeywords().contains("自杀"),
+                    "命中词必须是词表字面「自杀」；输入：" + escape(broken) + " → 实际：" + s.matchedKeywords());
+        }
+
+        // —— NFKC / 全角 ——
+        assertEquals("killmyself", collapseInvisible("ＫＩＬＬ" + cp(0x3000) + "ＭＹＳＥＬＦ"),
+                "测试侧的归一口径必须与判定层一致（NFKC + 去不可见字符 + 折小写，最后一步是折小写）");
+        CrisisSignal fullwidth = d.detect("ＫＩＬＬ" + cp(0x3000) + "ＭＹＳＥＬＦ");
+        assertTrue(fullwidth.triggered(),
+                "全角字母的「KILL MYSELF」必须命中（中文输入法全角模式下就会敲出这个形状）；实际："
+                        + fullwidth);
+        assertTrue(fullwidth.matchedKeywords().contains("kill myself"),
+                "命中词必须是词表字面「kill myself」；实际：" + fullwidth.matchedKeywords());
+        assertTrue(d.detect("ｋｉｌｌ　ｍｙｓｅｌｆ").triggered(),
+                "全角小写同样必须命中");
+        assertTrue(d.detect("⼀了百了").triggered(),
+                "康煕部首（U+2F00）的「一了百了」经 NFKC 归一到「一了百了」，必须命中");
+
+        // —— 反例：归一化不能被当成「什么都命中」——
+        assertFalse(d.detect("他 杀 了 人").triggered(),
+                "删空白后是「他杀了人」，不含词表里的词，仍不得命中");
+        assertFalse(d.detect("今天做了两小时数学，还行").triggered(),
+                "普通文本在任何归一口径下都不得命中");
+        assertTrue(d.detect("ＫＩＬＬ" + cp(0x3000) + "ＭＹＳＥＬＦ　ＮＯＴ").triggered(),
+                "全角归一之后「kill myself」是子串，所以整句命中（归一化不是「整句相等」）");
+        assertEquals(List.of("kill myself"), d.detect("ＫＩＬＬ" + cp(0x3000) + "ＭＹＳＥＬＦ")
+                        .matchedKeywords(),
+                "整句只含一个词表词时，命中词必须恰好一条（不得因为归一化多报）");
+    }
+
+
     // ================= 工具 =================
 
     private static final List<String> FORBIDDEN = List.of(
@@ -584,7 +845,10 @@ class CrisisKeywordTest {
         return new String(Character.toChars(codePoint));
     }
 
-    /** 去掉全部不可见字符（零宽、控制、空白）并折小写——与判定层的归一口径一致。 */
+    /**
+     * 去掉全部不可见字符（零宽、控制、空白）、组合符（{@code Mn}）与 NFKC 兼容形式，再折小写
+     * ——与判定层的归一口径一致（minor 清算批把 NFKC 与 {@code Mn} 一起纳入）。
+     */
     private static String collapseInvisible(String s) {
         StringBuilder out = new StringBuilder(s.length());
         for (int i = 0; i < s.length(); ) {
@@ -594,30 +858,43 @@ class CrisisKeywordTest {
                 continue;
             }
             int type = Character.getType(cp);
-            if (type == Character.FORMAT || type == Character.CONTROL) {
+            if (type == Character.FORMAT || type == Character.CONTROL
+                    || type == Character.NON_SPACING_MARK) {
                 continue;
             }
             out.appendCodePoint(cp);
         }
-        return out.toString().toLowerCase(Locale.ROOT);
+        return java.text.Normalizer.normalize(out.toString(), java.text.Normalizer.Form.NFKC)
+                .toLowerCase(Locale.ROOT);
     }
 
     private static List<String> sortedNames(List<String> names) {
         return names.stream().sorted().distinct().toList();
     }
 
-    /** public 成员名（含继承）的去重集合，字段名与方法名合在一起——白名单等值断言的比较对象。 */
+    /**
+     * public 成员名（含继承）的去重集合，字段名与方法名合在一起——白名单等值断言的比较对象。
+     *
+     * <p>minor 清算批（Task 3 复审 Minor-1）：不再用 {@code getMethods()}，改为沿
+     * {@code getSuperclass()} 链手工上溯、取每一级的 {@code getDeclaredMethods()}。
+     * F5 要的是「多出任何 public 成员都必须变红」，而 {@code getMethods()} 的继承收集规则是
+     * JDK 实现细节——复审者在它的 JDK 上测得「非 public 类父类」的 public 方法不可见，
+     * 本机 JDK 25 实测可见（两种都写进 {@code publicSurface_seesInheritedMethods_fromNonPublicAncestor}）。
+     * 白名单扫描因此不看 {@code getMethods()} 的过滤行为，对任何祖先形态都成立。
+     */
     private static List<String> publicSurface(Class<?> type) {
         java.util.Set<String> names = new java.util.TreeSet<>();
-        for (java.lang.reflect.Field f : type.getFields()) {
-            if (java.lang.reflect.Modifier.isPublic(f.getModifiers())) {
-                names.add(f.getName());
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            for (java.lang.reflect.Field f : current.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isPublic(f.getModifiers())) {
+                    names.add(f.getName());
+                }
             }
-        }
-        for (java.lang.reflect.Method m : type.getMethods()) {
-            if (java.lang.reflect.Modifier.isPublic(m.getModifiers())
-                    && !m.isBridge() && !m.isSynthetic()) {
-                names.add(m.getName());
+            for (java.lang.reflect.Method m : current.getDeclaredMethods()) {
+                if (java.lang.reflect.Modifier.isPublic(m.getModifiers())
+                        && !m.isBridge() && !m.isSynthetic()) {
+                    names.add(m.getName());
+                }
             }
         }
         return List.copyOf(names);
@@ -760,3 +1037,22 @@ class CrisisKeywordTest {
         return words;
     }
 }
+
+/**
+ * 包级私有的<b>类</b>基类（minor 清算批，Task 3 复审 Minor-1 的自检桩）。
+ *
+ * <p>刻意写成<b>顶层</b>类而不是嵌套类：测试类内部的嵌套类父类走的是 nestmate 路径，
+ * 与真实威胁模型（{@code CrisisDetector} 继承某个别处的类）不等价。
+ */
+class RefusalBase {
+
+    /** 一个典型的「拒绝继续」式 API：它出现在 public 面上就必须让白名单等值断言变红。 */
+    public void haltAnyway() {
+        // 桩：只为反射面而存在，永不被调用。
+    }
+}
+
+/** 子类自检桩：{@code haltAnyway()} 来自非 public 的祖先，{@code getMethods()} 看不见它。 */
+class PublicRefusalMidStub extends PublicRefusalMid {
+}
+

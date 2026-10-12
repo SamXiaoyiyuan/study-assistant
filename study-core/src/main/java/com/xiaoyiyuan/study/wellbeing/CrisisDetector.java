@@ -41,22 +41,28 @@ import java.util.Set;
  * {@code #} 开头为注释、空行忽略、其余每行一个词，自动去空白、去 BOM、吃 CRLF。
  * 匹配时大小写不敏感（中英文都适用）。
  *
- * <h2>归一口径：先去掉空白与不可见字符，再做包含匹配</h2>
- * <p>两侧（输入与关键词）都先按同一个 {@code normalize} 口径去掉<b>空白与不可见字符</b>
- * （空格、制表符、换行、零宽空格 U+200B、零宽连接符 U+200D、LRM U+200E……），然后才做
- * {@code String.contains}。所以「自 杀」「自\u200B杀」「kill&#92;nmyself」这类被折行、空格或
- * 零宽字符切开的写法，与连写的写法命中结果完全一致。
+ * <p><b>词行里的不可见字符不再让整行消失</b>（minor 清算批）：字面原样保留（用户看到的还是他写的
+ * 那一行），匹配走归一形态。只有<b>整行归一后为空</b>的行（例如整行只有一个 NBSP）才跳过——
+ * 那种行既不成词，又会让「解析后为空则回退内置表」失效（见 {@link #load}）。
  *
- * <p>为什么非要归一化：这些写法是<b>同一条求助信息</b>，只是字形被切开。漏掉它们的代价与
- * 漏掉整句话一样，都是静默漏报；而多做一次归一化的代价仍是「可能多一个中性面板」——
- * 与上一节「宁误报不漏报」同一取向。（输入里的零散字符仍可能凑成一个词，这一条是已知且
- * 可接受的代价：漏报的代价不对称地更高。）
+ * <h2>归一口径：先去掉空白、不可见字符与组合符，再 NFKC，最后做包含匹配</h2>
+ * <p>两侧（输入与关键词）都先按同一个 {@code normalize} 口径去掉<b>空白与不可见字符</b>
+ * （空格、制表符、换行、零宽空格 U+200B、零宽连接符 U+200D、LRM U+200E……）与<b>组合符
+ * （U+0301 之类）</b>、做 <b>NFKC 兼容归一</b>，然后才做 {@code String.contains}。所以
+ * 「自 杀」「自\u200B杀」「自&#92;u0301杀」「kill&#92;nmyself」以及全角字母的
+ * 「ＫＩＬＬ　ＭＹＳＥＬＦ」这类写法，与连写的写法命中结果完全一致。
+ *
+ * <p>为什么非要归一化：这些写法是<b>同一条求助信息</b>，只是字形被切开或换了一种码点写法。
+ * 漏掉它们的代价与漏掉整句话一样，都是静默漏报；而多做一次归一化的代价仍是「可能多一个中性
+ * 面板」——与上一节「宁误报不漏报」同一取向。（输入里的零散字符仍可能凑成一个词、NFKC 也会把
+ * {@code ①} 折成 {@code 1}，这些是已知且可接受的代价：漏报的代价不对称地更高。）
  *
  * <h2>词表被清空时不静默归零</h2>
- * <p>外部文件读不到、读不动，<b>或解析后一个词都没有</b>（空文件、只剩注释）时，一律回退到
- * 内置资源表。理由与 {@code 120}/{@code 110} 的删除保护同源：<b>不能让安全兜底静默变成零</b>
- * ——App 照常启动、界面照常渲染，却再也不会提示任何求助渠道，而且这一切没有任何提示音。
- * 用户要收窄范围，删掉具体几行即可；真要「一个词都不要」，那也不是把兜底关掉的理由。
+ * <p>外部文件读不到、读不动，<b>或解析后一个词都没有</b>（空文件、只剩注释、只剩归一后为空的行）
+ * 时，一律回退到内置资源表。理由与 {@code 120}/{@code 110} 的删除保护同源：<b>不能让安全兜底
+ * 静默变成零</b>——App 照常启动、界面照常渲染，却再也不会提示任何求助渠道，而且这一切没有
+ * 任何提示音。用户要收窄范围，删掉具体几行即可；真要「一个词都不要」，那也不是把兜底关掉的
+ * 理由。
  *
  * <p><b>本类只读文件，不写任何文件</b>：它没有写入口，误用也写不坏用户的词表。
  */
@@ -108,6 +114,12 @@ public final class CrisisDetector {
      * {@code 110} 写删除保护的理由是同一个：安全兜底的条数不能无声地变成 0。
      * 因此这里与「读不到 / 读不动」走同一条回退路径；解析后非空的外来词表仍<b>完全以磁盘为准</b>
      * （见 {@code keywordFileFromDisk_isUsed_andOverridesBuiltin}）。
+     *
+     * <p><b>「有效词数为 0」也回退</b>（minor 清算批 / Task 3 复审 Minor-2）：
+     * 解析后非空、但每个词在归一口径下都是空串（整行只有一个 NBSP / U+2007 / U+202F 这类
+     * {@code isSpaceChar} 却<b>不是</b> {@code isWhitespace} 的空白）时，检测器会「装着若干个
+     * 永远匹配不上的词」，效果与空表完全一样。这种行现在由 {@link #fromLines(List)} 直接跳过，
+     * 于是这里看到的仍是空表、照常回退。
      *
      * <p><b>不抛异常</b>：读盘不成功（权限、非法 UTF-8……）同样回退内置资源。
      * 一个安全兜底不该因为读不到配置文件就消失。
@@ -167,7 +179,9 @@ public final class CrisisDetector {
         List<String> hits = new ArrayList<>();
         for (int i = 0; i < keywords.size(); i++) {
             String form = keywordForms.get(i);
-            // form 为空串时 contains 恒真，会把普通文本误判成命中：跳过（空词解析时已丢弃）。
+            // form 为空串时 contains 恒真，会把普通文本误判成命中——最坏的结果不是漏报而是
+            // 「什么都命中」。解析层已保证每个词的归一形态非空（fromLines 跳过归一后为空的行，
+            // 由 everyLoadedKeywordHasNonEmptyMatchingForm 钉住），这里是万一的防线。
             if (!form.isEmpty() && flat.contains(form)) {
                 // 给出的是词表里的字面（不是归一后的连写形态）：界面展示与用户排查都要用它。
                 hits.add(keywords.get(i));
@@ -209,10 +223,19 @@ public final class CrisisDetector {
             if (literal.isEmpty() || literal.startsWith("#")) {
                 continue;
             }
-            // 词本身夹着零宽字符或控制字符（例如「kill\u200Bmyself」）：不猜用户想要什么，
-            // 跳过这一行——被静默改写的词比少一个词更难发现。词中间的普通空白是合法的
-            // （正常多词短语 "kill myself" 就靠它），匹配时按 normalize 得到的连写形态比对。
-            if (containsFormatOrControl(literal)) {
+            // 词本身在归一口径下为空（整行只有 NBSP、U+2007 U+202F 这类 isSpaceChar 的空白，
+            // 或零宽字符）：跳过这一行。
+            //
+            // 为什么必须在这里拦一道（minor 清算批 / Task 3 复审 Minor-2、Minor-3、Minor-8）：
+            // `strip()` 用的是 `isWhitespace`，而 NBSP / U+2007 / U+202F 都不是它——于是这样的行
+            // 既没被 strip 掉、又不是 FORMAT/CONTROL，就<b>成了词表里的一个词</b>；可它的归一形态
+            // 是空串，判定时会被空形态守卫跳过。结果是「词表非空、有效词数为 0」：
+            // 「解析后为空则回退内置表」不触发，兜底静默归零复发，与 load 的
+            // 「永不为『装 0 个词』的检测器」直接矛盾。
+            //
+            // 注意这里「跳过」只针对<b>归一后为空</b>的行。夹在词中间的不可见/空白字符不再让整行
+            // 消失（见下面 normalize 的说明）：那是与输入侧同一口径的收口。
+            if (normalize(literal).isEmpty()) {
                 continue;
             }
             unique.add(literal.toLowerCase(Locale.ROOT));
@@ -225,30 +248,37 @@ public final class CrisisDetector {
         return s != null && !s.isEmpty() && s.charAt(0) == '\uFEFF' ? s.substring(1) : s;
     }
 
-    /** 这一行里有没有格式/控制字符（零宽字符、制表符等）。 */
-    private static boolean containsFormatOrControl(String s) {
-        for (int i = 0; i < s.length(); ) {
-            int cp = s.codePointAt(i);
-            i += Character.charCount(cp);
-            if (isFormatOrControl(cp)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /** 完全不可见的码点：空白 + 格式字符 + 控制字符。 */
     private static boolean isInvisible(int cp) {
         return Character.isWhitespace(cp) || Character.isSpaceChar(cp) || isFormatOrControl(cp);
     }
 
+    /** 组合符（{@code Mn}）：如 U+0301、U+FE0F。它们与基字合成一个字，本身不占位。 */
+    private static boolean isCombiningMark(int cp) {
+        return Character.getType(cp) == Character.NON_SPACING_MARK;
+    }
+
     /**
-     * 归一口径：去掉<b>全部不可见字符</b>（空白、零宽字符等格式字符、控制字符），再按
-     * {@link Locale#ROOT} 折小写。<b>输入侧与关键词侧必须用同一个口径</b>，否则「自 杀」能命中
-     * 而关键词「kill myself」永远也不命中带空格的写法。词表里的字面不被改写，只有匹配形态
-     * 走这里（见构造器与 {@link #fromLines(List)}）。
+     * 归一口径：去掉<b>全部不可见字符</b>（空白、零宽字符等格式字符、控制字符）与<b>组合符
+     * （{@code Mn}）</b>，再做 <b>NFKC</b> 兼容分解，最后按 {@link Locale#ROOT} 折小写。
+     * <b>输入侧与关键词侧必须用同一个口径</b>，否则「自 杀」能命中而关键词「kill myself」
+     * 永远也不命中带空格的写法。词表里的字面不被改写，只有匹配形态走这里
+     * （见构造器与 {@link #fromLines(List)}）。
      *
      * <p>按<b>码点</b>遍历：孤立代理项不该被当字符处理，成对代理项要整体保留（emoji 不能被打碎）。
+     *
+     * <p><b>为什么还要 NFKC 与组合符</b>（minor 清算批 / Task 3 复审 Minor-5）：
+     * <ul>
+     *   <li>「自」+ U+0301 +「杀」与「自 杀」是<b>同一个词</b>的两种码点写法（组合符不占位），
+     *       不做归一就是静默漏报；</li>
+     *   <li>NFKC 把全角拉丁 {@code ＫＩＬＬ} 折成 {@code KILL}、把康煕部首 {@code ⼀} 折成 {@code 一}。
+     *       这一条<b>有真实用户面</b>：中文输入法的「全角」模式下敲英文，产出的就是全角字母，
+     *       而整句会因此不命中。NFKC 的副作用（{@code ①→1}、{@code ㎏→kg}）与「宁误报不漏报」
+     *       的取向一致：命中不阻断，多一次中性面板远好过静默漏报。</li>
+     * </ul>
+     * 顺序是「先去不可见字符与组合符、再 NFKC」——NFKC 之后仍可能冒出组合符，
+     * 而测试侧的独立实现（{@code CrisisKeywordTest.collapseInvisible}）用同一个顺序，
+     * 两边口径必须逐字一致，否则「来源」断言会失去意义。
      */
     private static String normalize(String s) {
         if (s == null || s.isEmpty()) {
@@ -258,11 +288,12 @@ public final class CrisisDetector {
         for (int i = 0; i < s.length(); ) {
             int cp = s.codePointAt(i);
             i += Character.charCount(cp);
-            if (!isInvisible(cp)) {
+            if (!isInvisible(cp) && !isCombiningMark(cp)) {
                 out.appendCodePoint(cp);
             }
         }
-        return out.toString().toLowerCase(Locale.ROOT);
+        return java.text.Normalizer.normalize(out.toString(), java.text.Normalizer.Form.NFKC)
+                .toLowerCase(Locale.ROOT);
     }
 
     /**

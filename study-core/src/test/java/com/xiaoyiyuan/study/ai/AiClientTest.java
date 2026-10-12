@@ -812,17 +812,30 @@ class AiClientTest {
             "java/lang/Runtime", "java/lang/ProcessBuilder", "java/lang/Process");
 
     /**
-     * 「从一个字符串拿到一个 {@code Class}」的<b>全部</b>入口方法名。
+     * 禁止清单之三：<b>「从一个字符串拿到一个 {@code Class}」的入口方法名</b>
+     * （修复轮 2 加入，minor 清算批补齐）。
      *
      * <p>把类名拆开拼（{@code "java.nio." + "file.Fi" + "les"}）能躲过字面量匹配，但躲不过这层：
-     * 无论怎么拼，最后都要调用这三个方法之一才能把名字变成 {@code Class}——而 {@code Class} 到手之后
-     * 想调用任何方法都要经过 {@code java/lang/reflect/}（拿 {@code Method} 的返回值/描述符），
-     * 那一条已在禁止清单里。{@code java/lang/invoke/*} 刻意<b>不</b>禁止：记录类与 lambda 都要用它。
+     * 无论怎么拼，最后都要调用这几个方法之一才能把名字变成 {@code Class}。
+     *
+     * <p><b>它们不是全部——「字节 → Class」还有第四个入口</b>（minor 清算批 / Task 4 修复轮 2
+     * 复审 §3.4）：{@code MethodHandles.Lookup#defineClass(byte[])} 与
+     * {@code defineHiddenClass(byte[],boolean,ClassOption...)} <b>不需要类名字符串</b>，
+     * 方法名也不在上面那三个里；拿到 {@code Class} 之后靠<b>编译期已知接口的 cast</b> 就能调用，
+     * <b>完全不需要 {@code java.lang.reflect}</b>。所以「三条入口是全部」这个说法不成立，
+     * 上一版注释里那句「{@code Class} 到手之后想调用任何方法都要经过 {@code java/lang/reflect/}」
+     * 同样不成立——评审用一个放进 {@code ai} 包的探针证明过：判定与真实用例断言<b>双双全绿</b>，
+     * 而文件真的被写了出来。现在这两个方法名也进了清单。
+     *
+     * <p>接受风险（如实记录）：清单是「已知入口」的枚举，不是「能力封闭」的证明——
+     * JNI / {@code Unsafe} / java agent 仍在范围外（见报告 §7 的已知边界）。
      */
     private static final List<String> FORBIDDEN_CLASS_LOOKUP_METHODS = List.of(
-            "forName",    // java.lang.Class.forName(String)
-            "loadClass",  // java.lang.ClassLoader.loadClass(String)
-            "findClass"); // java.lang.invoke.MethodHandles.Lookup.findClass(String)
+            "forName",         // java.lang.Class.forName(String)
+            "loadClass",       // java.lang.ClassLoader.loadClass(String)
+            "findClass",       // java.lang.invoke.MethodHandles.Lookup.findClass(String)
+            "defineClass",     // java.lang.invoke.MethodHandles.Lookup.defineClass(byte[])：无需类名
+            "defineHiddenClass"); // ……defineHiddenClass(byte[], boolean, ClassOption...)：同上
 
     @Test
     void aiPackageBytecode_hasNoFileWriteOrProcessExecutionReferences() throws Exception {
@@ -836,8 +849,11 @@ class AiClientTest {
                 "点号形态清单被改动（Class.forName / findClass 用的就是点号）");
         assertEquals(List.of("java/lang/Runtime", "java/lang/ProcessBuilder", "java/lang/Process"),
                 FORBIDDEN_EXACT_TYPES, "精确匹配清单被改动");
-        assertEquals(List.of("forName", "loadClass", "findClass"), FORBIDDEN_CLASS_LOOKUP_METHODS,
-                "反射入口清单被改动：少一项就等于「拼接类名」可以绕过");
+        assertEquals(List.of("forName", "loadClass", "findClass", "defineClass",
+                        "defineHiddenClass"), FORBIDDEN_CLASS_LOOKUP_METHODS,
+                "「字节/名 → Class」入口清单被改动：少一项就等于那一条路可以绕过"
+                        + "（defineClass / defineHiddenClass 是评审实测的第四条路，不需要类名字符串，"
+                        + "也不需要 java.lang.reflect）");
 
         Path aiClasses = mainClassesDirectory().resolve("com/xiaoyiyuan/study/ai");
         assertTrue(Files.isDirectory(aiClasses), "找不到 ai 包的 class 目录：" + aiClasses);
@@ -866,6 +882,20 @@ class AiClientTest {
                         + " 与 AiClient$SilenceWatchdog.class）；少一个就等于那个类的方法体没被扫");
         assertTrue(names.contains("AiClient$SseReader.class"),
                 "必须连内部类的 class 一起扫，否则方法体藏在内部类里就漏了；实际扫到：" + names);
+        // minor 清算批（Task 4 修复轮 2 复审 X12）：扫描面<b>逐个具名</b>钉住内部类。
+        // 上面的集合等值已经能抓住「收窄扫描面」，但它依赖两处枚举恰好写对：一处
+        // Files.list、一处 Files.walk。评审者证明把<b>收窄</b>那侧（假设有人把等值改成「≥10」）
+        // 之后全绿——所以这里再加一道独立的、指名道姓的断言：SSE 解析器是「方法体里最可能
+        // 藏写文件」的地方（它处理外部输入），它必须出现在被扫集合里。
+        for (String innerClass : List.of("AiClient$SseReader.class", "AiClient$SilenceWatchdog.class")) {
+            assertTrue(names.contains(innerClass),
+                    "内部类 " + innerClass + " 必须逐个出现在扫描集合里（等值断言之外的独立一道防线）；"
+                            + "实际扫到：" + names);
+        }
+        assertEquals(List.of("AiClient$SilenceWatchdog.class", "AiClient$SseReader.class"),
+                names.stream().filter(name -> name.contains("$")).sorted().toList(),
+                "内部类清单逐个具名断言：ai 包里目前恰好这两个内部类，"
+                        + "多一个（新加的内部类）或少一个都必须在这里显式登记；实际：" + names);
 
         Set<String> offenders = new LinkedHashSet<>();
         int scannedConstants = 0;
@@ -902,6 +932,11 @@ class AiClientTest {
         assertNotEquals(null, forbiddenReference("forName"), "Class.forName 必须被挡住");
         assertNotEquals(null, forbiddenReference("findClass"),
                 "MethodHandles.Lookup.findClass 必须被挡住（拼接类名的另一条路）");
+        assertNotEquals(null, forbiddenReference("defineClass"),
+                "MethodHandles.Lookup.defineClass 必须被挡住——它是清单外的第四条「字节 → Class」"
+                        + "入口，不需要类名字符串、也不需要 java.lang.reflect（minor 清算批补入）");
+        assertNotEquals(null, forbiddenReference("defineHiddenClass"),
+                "defineHiddenClass 与 defineClass 同一族，必须一起挡住");
 
         // 阴性对照：合法引用不得被误伤（记录类与 lambda 都要走 java/lang/invoke）
         assertEquals(null, forbiddenReference("java/lang/RuntimeException"));
@@ -1265,7 +1300,10 @@ class AiClientTest {
      *       {@code Lookup.findClass} 的实参只能是点号，这是最有价值的信号之一；</li>
      *   <li><b>精确类名</b>（修复轮 1）：{@code Runtime} / {@code ProcessBuilder} / {@code Process}。
      *       {@code Runtime} 必须精确匹配，否则 {@code RuntimeException} 会被误伤；</li>
-     *   <li><b>反射入口方法名</b>（修复轮 2）：把类名拆开拼也躲不过这几个名字。</li>
+     *   <li><b>「名/字节 → Class」入口方法名</b>（修复轮 2 + minor 清算批）：{@code forName} /
+     *       {@code loadClass} / {@code findClass} / {@code defineClass} / {@code defineHiddenClass}。
+     *       前三个吃类名字符串（拼接类名也躲不过），后两个吃<b>字节码</b>、不需要类名，
+     *       也不需要 {@code java.lang.reflect}——所以它们必须单列在清单里。</li>
      * </ol>
      */
     private static String forbiddenReference(String constant) {

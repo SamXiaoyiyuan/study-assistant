@@ -279,6 +279,55 @@ class AiStreamTest {
     }
 
     @Test
+    void stream_linesWithoutColon_areIgnored_notFoldedIntoTheDataPayload() throws Exception {
+        // minor 清算批（`ai` 修复轮 2 复审 §「新登记边界」）：按 SSE 规范，一行里没有冒号时
+        // 整行是「字段名 = 整行、值为空」——既不是注释（要以 `:` 开头），也不是 data。
+        //
+        // 关键形状是「无冒号的行夹在<b>同一个事件的 data 行与空行之间</b>」：修前它会被并进
+        // 载荷，于是这个事件拼出的文本不再是合法 JSON → 该事件被跳过 → <b>它前后两个事件的
+        // 正文一起丢</b>。这里两种噪音各来一遍：只有空白的行 / 有内容但没冒号的行。
+        for (String noise : List.of("   ", "dumps map (not a field)", "\t")) {
+            // 三段：正常事件 → （同一事件内的 data + 无冒号行）→ 正常事件 → [DONE]
+            String body = sse(delta("甲"))
+                    + "data: " + delta("乙") + "\n" + noise + "\n\n"
+                    + sse(delta("丙"))
+                    + "data: [DONE]\n\n";
+            stub = StreamStub.scripted(List.of(chunk(body, 0)));
+            RecordingListener listener = new RecordingListener();
+
+            client().stream(streamRequest("hi"), listener);
+
+            assertEquals(List.of("甲", "乙", "丙"), listener.deltas(),
+                    "无冒号的行（" + escapeForMessage(noise) + "）在同一个事件里必须被忽略，不能并进 "
+                            + "data 载荷——并进去会让该事件的 JSON 非法、前后两个事件的正文一起丢；"
+                            + "实际：" + listener.deltas());
+            assertEquals("甲乙丙", listener.full(), "三个事件都必须正常投递");
+            assertEquals(1, listener.completeCount(), "[DONE] 仍必须正常收尾");
+        }
+    }
+
+    @Test
+    void stream_ignoresOtherFieldLines_butKeepsDataPrefixForms() throws Exception {
+        // 与上一条同一性质，另加两个「不许顺手改坏」的对照：
+        // ① 规范里的其它字段（event: / id: / retry:）必须被忽略而不是当成 data；
+        // ② `data:` 与 `data: ` 两种前缀形态仍必须都认（按 SSE 规范，冒号后<b>一个</b>空格
+        //    是分隔符，不是内容）。
+        stub = StreamStub.scripted(List.of(
+                chunk("event: message\nid: 42\nretry: 1000\n" + sse(delta("甲")), 0),
+                chunk("data:" + delta("乙") + "\n\n", 0),
+                chunk("data: " + delta("丙") + "\n\n", 0),
+                chunk(sse("[DONE]"), 0)));
+        RecordingListener listener = new RecordingListener();
+
+        client().stream(streamRequest("hi"), listener);
+
+        assertEquals(List.of("甲", "乙", "丙"), listener.deltas(),
+                "event:/id:/retry: 行必须被忽略，`data:` 与 `data: ` 两种前缀都必须照常投递；实际："
+                        + listener.deltas());
+        assertEquals("甲乙丙", listener.full());
+    }
+
+    @Test
     void stream_dataPrefixWithoutSpace_isAccepted() throws Exception {
         // `data:` 与 `data: ` 是同一件事（OpenAI 用后者，但协议允许前者）
         stub = StreamStub.scripted(List.of(
@@ -965,6 +1014,25 @@ class AiStreamTest {
 
     private static AiRequest streamRequest(String content) {
         return new AiRequest(MODEL, List.of(new AiMessage("user", content)), true);
+    }
+
+    /** 把一行噪音渲染成可读形态（失败消息里能看清到底是哪种不可见字符）。 */
+    private static String escapeForMessage(String s) {
+        StringBuilder out = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (c == '\t') {
+                out.append("\\t");
+            } else if (c == '\n') {
+                out.append("\\n");
+            } else if (c == '\r') {
+                out.append("\\r");
+            } else if (c < 0x20 || c > 0x7E) {
+                out.append(String.format(Locale.ROOT, "\\u%04X", (int) c));
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     /** 一个 SSE 事件：{@code data: <payload>\n\n}。 */

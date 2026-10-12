@@ -362,15 +362,17 @@ class AppConfigTest {
      *
      * <p>用例的选取各有分工：①② 各缺一条必需号码；③ 编号越界（{@code Integer.parseInt} 抛
      * {@code NumberFormatException}，旧实现 {@code continue} 整条丢弃）；④ 负编号（旧实现直接丢）；
-     * ⑤ 编号跳跃（旧实现保留，是回归网）；⑥ 正常自定义列表，钉住「标签原样保留、顺序不变」。
-     * 前五条都不在旧实现的保护范围内，而 {@code 120}/{@code 110} 的存在是硬要求。
+     * ⑤ 编号跳跃（旧实现保留，是回归网）；⑥ 正常自定义列表，钉住「标签原样保留、顺序不变」；
+     * ⑦ 非整数编号（{@code crisis.abc.number=119}，旧实现整条丢弃——判据是「值本身可辨识」，
+     * 见 minor 清算批）。前五条与第七条都不在旧实现的保护范围内，而 {@code 120}/{@code 110}
+     * 的存在是硬要求。
      */
     @Test
     void crisisSave_fromAnyFileContent_keeps120And110(@TempDir Path dir) throws IOException {
         assertEquals(List.of("只有 120 的文件", "只有 110 的文件", "越界编号", "负编号", "编号跳跃",
-                        "正常自定义列表"),
+                        "正常自定义列表", "非整数编号"),
                 ADVERSARIAL_CRISIS_FILES.stream().map(AdversarialCrisisFile::name).toList(),
-                "①–⑥ 一条都不能少：少一条等于这张性质表少钉一个角");
+                "①–⑦ 一条都不能少：少一条等于这张性质表少钉一个角");
 
         for (AdversarialCrisisFile item : ADVERSARIAL_CRISIS_FILES) {
             String context = "[" + item.name() + "] 文件原文：" + item.fileContent().replace("\n", "\\n");
@@ -435,7 +437,17 @@ class AppConfigTest {
                             + "crisis.3.label=学校心理中心\ncrisis.3.number=1234-5678\n",
                     List.of("120", "110", "1234-5678"),
                     List.of("crisis.1.label=我改的名字", "crisis.3.label=学校心理中心",
-                            "crisis.3.number=1234-5678")));
+                            "crisis.3.number=1234-5678")),
+            // ⑦ 非整数编号（minor 清算批 / Task 2 复审 Minor-3）：号码值 119 本身可辨识，
+            // 用户写的这条渠道必须留在文件里，不得静默消失。
+            // 顺序规则：正常编号（升序）→ 非整数/越界/负编号（按文件出现顺序）→ 补齐的必需号码。
+            // 这条护栏是「别把它改回静默丢弃」，不是「修一个当前存在的缺陷」——写这条时我先
+            // 实测过工作树版本（见 task-minors-report.md §A2）。
+            new AdversarialCrisisFile("非整数编号",
+                    "crisis.abc.label=校园热线\ncrisis.abc.number=119\n"
+                            + "crisis.1.label=急救\ncrisis.1.number=120\n",
+                    List.of("120", "119", "110"),
+                    List.of("crisis.2.label=校园热线", "crisis.2.number=119")));
 
     /**
      * 契约（Minor-2）：{@code setCrisisResources} 收到<b>含 null 元素</b>的列表时，必须抛
@@ -500,6 +512,149 @@ class AppConfigTest {
         assertEquals(Duration.ofSeconds(60), AppConfig.load(f).requestTimeout(), "86401 秒 > 24 小时，回退默认");
         writeConfig(f, "request_timeout=86400\n");
         assertEquals(Duration.ofHours(24), AppConfig.load(f).requestTimeout(), "86400 秒 = 24 小时，合法");
+    }
+
+    // —— minor 清算批（Task 2 复审 Minor-1 / Minor-3 / Minor-4） ——
+
+    /**
+     * <b>幂等性：同一文件连续两轮 {@code load → save} 必须逐字节相等</b>（minor 清算批，Task 2 复审
+     * Minor-4）。
+     *
+     * <p>复审者用变异验证证明了它的必要性：把「补齐必需号码」的两个方法<b>同时</b>反转
+     * （缺失判定恒真 + 不判重直接追加）之后，每一轮都会把 120/110 再追加一遍，
+     * {@code crisis.N.number} 行逐轮增殖（第 1 轮 3 条、第 2 轮 5 条、第 3 轮 7 条），
+     * 而当时击杀它的只是「号码表/顺序」类断言，没有一条断言直接盯着「保存是不是收敛」。
+     * 单看某一轮的磁盘文本看不出问题（它自洽），只有<b>两轮对比</b>才暴露「每保存一次就变长」。
+     *
+     * <p>三条断言各堵一个漏洞：① 两轮文本逐字相等；② 磁盘上确实有危机行（否则空转式全绿）；
+     * ③ 两轮之后条目数一模一样（不增殖）。
+     */
+    @Test
+    void crisisSave_isIdempotent_secondLoadSaveIsByteIdentical(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("idempotent.properties");
+        writeConfig(f, "studyDir=E:\\我的目录\n"
+                + "crisis.1.label=我改的名字\ncrisis.1.number=120\n");
+
+        AppConfig firstRound = AppConfig.load(f);
+        firstRound.setSchoolCounseling("校医院三楼 心理中心 021-1234-5678");
+        firstRound.save();
+        String roundOne = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+        int countAfterFirstRound = AppConfig.load(f).crisisResources().size();
+
+        AppConfig secondRound = AppConfig.load(f);
+        secondRound.save();
+        String roundTwo = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+        int countAfterSecondRound = AppConfig.load(f).crisisResources().size();
+
+        assertEquals(roundOne, roundTwo,
+                "第二轮 load→save 必须与第一轮逐字节相同；否则「保存」本身在改文件，"
+                        + "每次点保存都会产生无意义的 diff（疑似必需号码每轮增殖）。第一轮：\n"
+                        + roundOne.replace("\n", "\\n") + "\n第二轮：\n" + roundTwo.replace("\n", "\\n"));
+        assertTrue(roundOne.contains("crisis.") && roundOne.contains(".number=120"),
+                "前置条件：磁盘上必须有危机行，否则上面的等值是「空对空」；实际："
+                        + roundOne.replace("\n", "\\n"));
+        assertEquals(countAfterFirstRound, countAfterSecondRound,
+                "条目数不得逐轮增殖（把补齐的两个方法同时写错就会每轮多一组 120/110）");
+    }
+
+    /**
+     * 幂等性不止对「只有一个 120」的文件成立，而要对整张对抗性表成立（minor 清算批）。
+     *
+     * <p>表里的形状各有一个容易写错的补齐路径：缺 110、缺 120、越界编号、负编号、非整数编号。
+     * 统一要求：第 2 轮与第 3 轮的磁盘文本逐字相同、且条目数不变。
+     */
+    @Test
+    void crisisSave_isIdempotent_forEveryAdversarialFileContent(@TempDir Path dir) throws IOException {
+        for (AdversarialCrisisFile item : ADVERSARIAL_CRISIS_FILES) {
+            String context = "[" + item.name() + "] 文件原文：" + item.fileContent().replace("\n", "\\n");
+            Path f = dir.resolve("idem-" + item.name().hashCode() + ".properties");
+            writeConfig(f, item.fileContent());
+
+            AppConfig first = AppConfig.load(f);
+            first.save();
+            String roundTwo = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+            int countAfterRoundTwo = AppConfig.load(f).crisisResources().size();
+
+            AppConfig second = AppConfig.load(f);
+            second.save();
+            String roundThree = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+            int countAfterRoundThree = AppConfig.load(f).crisisResources().size();
+
+            assertEquals(roundTwo, roundThree,
+                    context + " → 第二轮与第三轮 load→save 必须逐字节相同；第二轮：\n"
+                            + roundTwo.replace("\n", "\\n") + "\n第三轮：\n"
+                            + roundThree.replace("\n", "\\n"));
+            assertEquals(countAfterRoundTwo, countAfterRoundThree,
+                    context + " → 条目数不得逐轮增殖");
+        }
+    }
+
+    /**
+     * 幂等性不许为了「看起来稳定」而<b>减</b>内容：每一轮保存后，用户原始文件里可识别的条目
+     * 都还必须在，必需号码也还必须在（与 {@link #crisisSave_fromAnyFileContent_keeps120And110}
+     * 是同一性质，这里盯的是「第二轮」）。
+     */
+    @Test
+    void crisisSave_secondRoundStillKeepsEverything(@TempDir Path dir) throws IOException {
+        for (AdversarialCrisisFile item : ADVERSARIAL_CRISIS_FILES) {
+            String context = "[" + item.name() + "]";
+            Path f = dir.resolve("keep2-" + item.name().hashCode() + ".properties");
+            writeConfig(f, item.fileContent());
+
+            AppConfig first = AppConfig.load(f);
+            first.save();
+            AppConfig second = AppConfig.load(f);
+            second.save();
+
+            AppConfig reloaded = AppConfig.load(f);
+            List<String> numbers = reloaded.crisisResources().stream()
+                    .map(CrisisResource::number).toList();
+            String diskText = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+
+            assertEquals(item.expectedNumbers(), numbers,
+                    context + " → 第二轮保存后的号码表/顺序；实际磁盘："
+                            + diskText.replace("\n", "\\n"));
+            assertTrue(numbers.contains("120") && numbers.contains("110"),
+                    context + " → 任何轮次保存后都必须仍有 120 与 110；实际：" + numbers);
+        }
+    }
+
+    /**
+     * 合法自定义文案<b>永不</b>被默认文案顶掉——这条是给 {@code unionByNumber} 的 javadoc
+     * 说法做实证（minor 清算批，Task 2 复审 Minor-1；该 javadoc 已改成与实现一致）。
+     *
+     * <p>复审者指出的措辞风险是：「读取端号码相同时用默认那条替换掉文件里那条」会让下一位
+     * 维护者以为用户自定义的 120 文案会被顶掉，而正确行为恰恰相反。实测四种文件形态下
+     * 「我的热线」都必须逐字保留；替换分支只有在「该号码本就被判为缺失」时才可能走到。
+     */
+    @Test
+    void crisisSave_customLabelSurvivesEveryFileShape(@TempDir Path dir) throws IOException {
+        for (String content : List.of(
+                "crisis.1.label=我的热线\ncrisis.1.number=120\ncrisis.2.label=报警\ncrisis.2.number=110\n",
+                "crisis.1.label=我的热线\ncrisis.1.number=120\n",
+                "crisis.1.number=120\ncrisis.1.label=我的热线\ncrisis.9.label=远端\ncrisis.9.number=119\n",
+                "crisis.abc.label=我的热线\ncrisis.abc.number=120\n")) {
+            Path f = dir.resolve("label-" + content.hashCode() + ".properties");
+            writeConfig(f, content);
+
+            AppConfig loaded = AppConfig.load(f);
+            assertTrue(loaded.crisisResources().stream()
+                            .anyMatch(r -> "我的热线".equals(r.label()) && "120".equals(r.number())),
+                    "合法自定义 120 文案不得被默认文案顶掉；文件：" + content.replace("\n", "\\n")
+                            + " → 实际：" + loaded.crisisResources());
+
+            loaded.save();
+            String diskText = Files.readString(f, java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(diskText.contains("我的热线"),
+                    "自定义 120 文案必须留在磁盘上；文件：" + content.replace("\n", "\\n")
+                            + " → 磁盘：" + diskText.replace("\n", "\\n"));
+
+            AppConfig again = AppConfig.load(f);
+            assertTrue(again.crisisResources().stream()
+                            .anyMatch(r -> "我的热线".equals(r.label()) && "120".equals(r.number())),
+                    "第二轮读回时自定义 120 文案仍必须在；磁盘："
+                            + diskText.replace("\n", "\\n") + " → 实际：" + again.crisisResources());
+        }
     }
 
     /** 测试用：把配置文件原文按 UTF-8（无 BOM）写到磁盘。 */

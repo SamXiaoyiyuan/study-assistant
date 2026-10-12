@@ -616,11 +616,18 @@ public final class AppConfig {
      * <p>{@code appendedWinsOnSameNumber} 用来区分两种调用：
      * <ul>
      *   <li>{@code false}（界面上「用户改了 120 的文案」）：号码已存在就保留用户那条，一个字段都不动；</li>
-     *   <li>{@code true}（读取端补保底号码）：必须保证「120/110 都在且可用」，所以号码相同时
-     *       用默认那条替换掉文件里那条——否则一条越界键写出来的 {@code crisis.2147483648.number=110}
-     *       会把必需号码占住成一个空文案条目，等于用「数字在」蒙混过「渠道可用」。
-     *       这种情况只可能是序号写坏的条目，替换掉它不损失用户能识别的信息。</li>
+     *   <li>{@code true}（读取端补保底号码）：号码相同时，<b>仅当该号码本就被判定为缺失才替换</b>
+     *       ——也就是说，替换的只是「文件里那条正好等于某个必需号码、却被读成了不可用的形态」。
+     *       合法自定义的 {@code 120}（有号码、有文案）<b>永远不会</b>被默认那条顶掉：它在
+     *       {@code missingRequiredResources} 那里就不算缺失，压根不会作为候选出现在 {@code appended} 里
+     *       （本轮 minor 清算批把这段措辞改成与实现一致；Task 2 复审 Minor-1 指出旧措辞
+     *       「号码相同时用默认那条替换掉文件里那条」夸大了范围，会让维护者以为
+     *       「读取端会把用户自定义的 120 文案顶掉」——那恰恰是被 {@code
+     *       crisisSave_customLabelSurvivesEveryFileShape} 钉住的反面）。</li>
      * </ul>
+     * 在当前的 {@code missingRequiredResources} 实现下，「号码既在缺失集合、又已在 {@code primary} 里」
+     * 这个交集<b>不可达</b>；这一分支保留是为了不让「数字在、文案空」这种形态蒙混过「渠道可用」，
+     * 而不是为了覆盖一条真实存在的路径。
      *
      * <p>{@code primary} 为空是特例：没有「用户顺序」需要保，直接交给 {@code appended}
      * （默认五条），保底面板不能只剩两条必需号码。
@@ -660,9 +667,11 @@ public final class AppConfig {
      * 的本分，展示与否交给界面。
      *
      * <p>编号两侧对用户都无意义（文件是手改的），所以这里不收窄认得出的形状：
-     * <b>负编号与超出 {@code int} 的编号都不再整条丢弃</b>，它们的值照样进列表，只是排在
-     * 所有正常编号之后（写回时由 {@link #render} 重新编号）。理由是「丢的偏偏是安全号码」——
-     * 用户手滑敲成 {@code crisis.-1.number=119} 时，他要的是这条渠道留下，而不是消失。
+     * <b>负编号、超出 {@code int} 的编号、以及根本不是整数的编号（{@code crisis.abc.number=119}）
+     * 都不再整条丢弃</b>，它们的值照样进列表，只是排在所有正常编号之后（写回时由 {@link #render}
+     * 重新编号）。理由是「丢的偏偏是安全号码」——用户手滑敲成 {@code crisis.-1.number=119}、
+     * 或把序号写成别的东西时，他要的是这条渠道留下，而不是消失；而 {@code .number=} 后面的值
+     * 本身是可辨识的（minor 清算批按「不得静默丢弃可识别的条目」收口）。
      */
     private static List<CrisisResource> parseCrisisResources(List<String> lines) {
         TreeMap<Integer, String[]> byIndex = new TreeMap<>();
@@ -736,8 +745,10 @@ public final class AppConfig {
     }
 
     /**
-     * 键里的编号：能<b>无损</b>表示成 {@code int} 且为正才算正常编号，其余（负数、
-     * 超出 {@code int}、根本不是整数）返回 {@code null}。
+     * 键里的编号：能<b>无损</b>表示成 {@code int} 且为正才算「正常编号」（决定它在面板上的位置），
+     * 其余（负数、超出 {@code int}、<b>根本不是整数</b>）返回 {@code null}——由调用方归进溢出桶，
+     * 排在正常条目之后、但<b>照样保留</b>。返回 {@code null} 只表示「不是正常编号」，
+     * 不表示「这条该丢」。
      *
      * <p>不用 {@code Integer.parseInt} 判：它对 {@code 2147483648} 抛
      * {@link NumberFormatException}，而这是一个「用户敲出来的大数」，不是乱码——
