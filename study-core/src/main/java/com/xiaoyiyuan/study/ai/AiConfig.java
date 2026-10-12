@@ -15,6 +15,17 @@ import java.time.Duration;
  * 都可能把合法密钥改成非法密钥。{@code base_url} 相反——它是拿来做拼接的，
  * 首尾空白会让规范化的第一步就落空（拼出 {@code %20}），所以这里去掉。
  *
+ * <p><b>{@code toString()} 刻意不给 record 的自动实现</b>：自动实现会把 {@code apiKey} 明文
+ * 拼进去，而这个实例极容易出现在日志、断言失败信息、调试输出里（spec §7.1 允许「明文存盘」，
+ * 但那不等于「在日志里明文打印」）。覆写后密钥位置只留 {@code ***}。
+ *
+ * <p><b>超时口径与 {@code config.AppConfig} 刻意不同</b>：{@code AppConfig.requestTimeout()}
+ * 关心的是「能不能无损写进配置文件」（整秒、且不超过 24 小时，见 {@code setRequestTimeout}）；
+ * 本类关心的是「能不能真的用出去」，所以只要求为正。方向只有一个是对的，且由测试守住：
+ * {@code AppConfig} 能产出的任何值，本类都必须原样接受（否则 Task 7 的接线会当场抛异常）；
+ * 反过来本类接受更细/更大的值（如 {@code PT0.5S}、{@code PT100H}）是允许的——
+ * 亚秒超时是合法的传输配置，也是测试里快速触发超时的唯一手段。
+ *
  * @param baseUrl OpenAI 兼容端点的基础地址，如 {@code https://api.deepseek.com}；
  *                允许带子路径；最终请求地址由 {@link AiClient#endpoint(String)} 规范化
  * @param apiKey  明文密钥（spec §7.1：不做假加密，界面如实告知）
@@ -41,5 +52,18 @@ public record AiConfig(String baseUrl, String apiKey, String model, Duration tim
             throw new IllegalArgumentException(
                     "请求超时必须为正数；收到：" + timeout + "。零或负超时会让每次请求直接失败。");
         }
+    }
+
+    /**
+     * 显式覆写 record 的自动 {@code toString()}：把 {@code apiKey} 换成 {@code ***}。
+     *
+     * <p>自动实现形如 {@code AiConfig[baseUrl=…, apiKey=sk-…, model=…, timeout=…]}——一行日志、
+     * 一条断言失败信息、一次 {@code "" + config} 都会把密钥带出去。其余三项照常输出，
+     * 保留排查价值。
+     */
+    @Override
+    public String toString() {
+        return "AiConfig[baseUrl=" + baseUrl + ", apiKey=***, model=" + model
+                + ", timeout=" + timeout + "]";
     }
 }

@@ -7,6 +7,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -21,6 +22,12 @@ import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * OpenAI 兼容的 AI 客户端（非流式 + 流式；spec §7.1）。
@@ -100,28 +107,38 @@ public final class AiClient {
                     "本方法只处理非流式请求；流式请走流式入口（当前版本尚未提供）。");
         }
 
-        URI endpoint = endpoint(config.baseUrl());
-        String payload = new Gson().toJson(request);
-        HttpRequest httpRequest = HttpRequest.newBuilder(endpoint)
-                .header("Authorization", "Bearer " + config.apiKey())
-                .header("Content-Type", JSON_CONTENT_TYPE)
-                .header("Accept", "application/json")
-                .timeout(config.timeout())
-                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
-                .build();
+        HttpRequest httpRequest = buildRequest(request, false);
 
+        // 这里刻意用 sendAsync + orTimeout，而不是 send(...)：
+        // 请求级 timeout 只管到「响应头到达」为止（JDK 的语义如此）。服务端声明了 Content-Length
+        // 却少发字节、又保持连接时，读完 body 的那一步不受它约束——评审实测 timeout=PT5S 下
+        // 180.2 秒仍 alive，界面会永远停在「正在请求」，用户只能杀进程。
+        // 「整次请求（含读完 body）」的期限必须在客户端侧另外钉一层。
+        CompletableFuture<HttpResponse<String>> pending = httpClient.sendAsync(httpRequest,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         HttpResponse<String> response;
         try {
-            response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString(
-                    StandardCharsets.UTF_8));
-        } catch (HttpConnectTimeoutException e) {
-            // 连都没连上就超时：对用户与「回得太慢」是同一件事——超过了设定的超时时间。
-            // 单独 catch 一次是为了让这条映射有据可查（它是 HttpTimeoutException 的子类）。
-            throw timeoutFailure(e);
-        } catch (HttpTimeoutException e) {
-            throw timeoutFailure(e);
-        } catch (IOException e) {
-            throw networkFailure(e, "");
+            response = pending.orTimeout(requestDeadlineMillis(), TimeUnit.MILLISECONDS).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof TimeoutException) {
+                pending.cancel(true); // 别把连接与读取线程留在后台
+                throw timeoutFailure(e);
+            }
+            if (cause instanceof HttpConnectTimeoutException connectTimeout) {
+                // 连都没连上就超时：对用户与「回得太慢」是同一件事——超过了设定的超时时间。
+                throw timeoutFailure(connectTimeout);
+            }
+            if (cause instanceof HttpTimeoutException httpTimeout) {
+                throw timeoutFailure(httpTimeout);
+            }
+            if (cause instanceof IOException io) {
+                throw networkFailure(io, "");
+            }
+            throw networkFailure(new IOException(describe(cause)), "");
+        } catch (InterruptedException interrupted) {
+            pending.cancel(true);
+            throw interrupted;
         }
 
         return readContent(response.statusCode(), response.body());
@@ -179,14 +196,22 @@ public final class AiClient {
         }
 
         classifyStatus(response.statusCode());
-        SseReader reader;
+        SseReader reader = new SseReader();
         boolean cleanEof = false;
-        try (InputStream body = response.body()) {
-            reader = new SseReader();
+        InputStream body = response.body();
+        // 事件间静默超时（修复轮 1 / 评审 Major-1 的流式那一半）：SSE 开始之后请求级 timeout
+        // 就失效了，read() 会一直阻塞。「服务端发了响应头就再也不出字节」必须按超时收场，
+        // 而不是把界面永远停在等待上。
+        SilenceWatchdog watchdog = new SilenceWatchdog(config.timeout(), body);
+        try (InputStream in = body) {
+            watchdog.start();
             try {
-                reader.consume(body, listener);
+                reader.consume(in, listener, watchdog::touch);
                 cleanEof = true;
             } catch (IOException broken) {
+                if (watchdog.fired()) {
+                    throw silenceTimeoutFailure(broken);
+                }
                 if (Thread.currentThread().isInterrupted()) {
                     // 取消路径：JDK 的 HttpClient 在中断时会让这次读以 IOException 收场。
                     // 中断必须原样表达（AiFailureKind 刻意不含「用户取消」），
@@ -196,11 +221,16 @@ public final class AiClient {
                 throw networkFailure(broken, "已收到的内容保留在对话里，界面可以标记「回复不完整」。");
             }
         } catch (IOException interruptedClose) {
+            if (watchdog.fired()) {
+                throw silenceTimeoutFailure(interruptedClose);
+            }
             if (Thread.currentThread().isInterrupted()) {
                 throw new InterruptedException("流式请求已被中断。");
             }
             throw networkFailure(interruptedClose, "已收到的内容保留在对话里，界面可以标记"
                     + "「回复不完整」。");
+        } finally {
+            watchdog.stop(); // 不留悬挂的守夜线程
         }
         if (cleanEof && !reader.sawDone()) {
             // 流干净地结束了（分块传输的终止符），但始终没出现 [DONE]：做收尾解码，
@@ -213,12 +243,13 @@ public final class AiClient {
             // 已经收到过正文却断在半路 → 网络问题；一个增量都没有 → 更像是服务端回的不是 SSE，
             // 分类成「响应不是预期形状」对用户更有指向性（该去查 base_url / 模型，而不是查网络）。
             throw reader.sawAnything()
-                    ? new AiFailure(AiFailureKind.NETWORK,
+                    ? failure(AiFailureKind.NETWORK,
                             "网络连接在回复过程中断开了，已收到的内容保留在对话里，界面可以标记"
-                                    + "「回复不完整」。请重试以获取完整回复。")
-                    : new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+                                    + "「回复不完整」。请重试以获取完整回复。", null)
+                    : failure(AiFailureKind.MALFORMED_RESPONSE,
                             "服务端没有按流式（SSE）格式返回任何内容，也没有结束标记 [DONE]。"
-                                    + "请确认 base_url 指向的是 OpenAI 兼容服务，且模型支持流式输出。");
+                                    + "请确认 base_url 指向的是 OpenAI 兼容服务，且模型支持流式输出。",
+                            null);
         }
     }
 
@@ -237,7 +268,7 @@ public final class AiClient {
 
     /** 连不上：消息里必须给出可执行的动作（检查 base_url 与网络），{@code partial} 补充取舍说明。 */
     private AiFailure networkFailure(IOException cause, String partial) {
-        return new AiFailure(AiFailureKind.NETWORK,
+        return failure(AiFailureKind.NETWORK,
                 "连接不上服务（" + describe(cause) + "）。请检查 base_url（" + config.baseUrl()
                         + "）与网络是否可用，然后重试。" + partial,
                 cause);
@@ -245,10 +276,68 @@ public final class AiClient {
 
     /** 超时消息统一在这里生成，保证两种超时给用户的是同一句话。 */
     private AiFailure timeoutFailure(Exception cause) {
-        return new AiFailure(AiFailureKind.TIMEOUT,
+        return failure(AiFailureKind.TIMEOUT,
                 "请求超过超时时间（" + config.timeout() + "）。可以在设置里把 request_timeout 调大，"
                         + "然后重试。",
                 cause);
+    }
+
+    /**
+     * 事件间静默超时（修复轮 1）：服务端在约定时间内没有再吐一个字节。
+     *
+     * <p>措辞刻意与 {@link #timeoutFailure} 区分开：这里失败的原因是「没有任何新内容」，
+     * 而不是「整次请求太久」——长回答本身是正常的，用户需要知道的是「卡住了、已收到的部分还在」。
+     */
+    private AiFailure silenceTimeoutFailure(Exception cause) {
+        return failure(AiFailureKind.TIMEOUT,
+                "等待服务端返回新内容超过超时时间（" + config.timeout()
+                        + "），已停止读取。已收到的内容保留在对话里，界面可以标记「回复不完整」。"
+                        + "可以在设置里把 request_timeout 调大，然后重试。",
+                cause);
+    }
+
+    /**
+     * 用户可见失败的唯一出口（修复轮 1 / 评审 Major-2）。
+     *
+     * <p>消息里会拼进底层异常的文案（{@link #describe}）、Gson 解析异常的文案、以及 base_url——
+     * 这些文本的分母不归本类控制。模板本身「碰巧」不带 api_key，但碰巧不是一条性质；
+     * 唯一的出口做一次替换，才能让「密钥不出现在任何用户可见消息里」由代码保证。
+     */
+    private AiFailure failure(AiFailureKind kind, String message, Throwable cause) {
+        return new AiFailure(kind, redactSecret(message), cause);
+    }
+
+    /** 把消息里出现的 api_key 换成占位符（没出现就原样返回，保持消息可读）。 */
+    private String redactSecret(String message) {
+        String key = config.apiKey();
+        if (key == null || key.isEmpty() || !message.contains(key)) {
+            return message;
+        }
+        return message.replace(key, "***");
+    }
+
+    /**
+     * 整次请求（含读完 body）的硬期限，毫秒。
+     *
+     * <p>{@link Duration#toMillis()} 对天文数字会抛 {@link ArithmeticException}：那种配置在
+     * 语义上就是「几乎不超时」，绝不能因为一次换算溢出而变成「立刻超时」。亚毫秒的超时则抬到 1ms，
+     * 避免「期限为 0」这种会被 JDK 当成「已经到点」的边界值。
+     */
+    private long requestDeadlineMillis() {
+        try {
+            return Math.max(1L, config.timeout().toMillis());
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** 关掉一个流并吞掉 IOException：呼叫方多半已经因为别的原因在失败路径上。 */
+    private static void closeQuietly(Closeable closeable) {
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+            // 已经断开的连接再关一次会抛，这不是新信息
+        }
     }
 
     /**
@@ -271,9 +360,14 @@ public final class AiClient {
      * <p>带查询串的地址被<b>拒绝</b>而不是硬拼：追加路径的位置会落到 {@code ?} 之后，
      * 生成一个打到别处的地址——那比当场报错难查得多。
      *
+     * <p>「必须能真正发出去」这条承诺落在实测口径上：非 http(s) 协议、主机名里的非 ASCII 字符、
+     * 非法端口（{@code :-1}、{@code :0}、{@code :99999}）都在这里当场拒绝并给出中文原因，
+     * 而不是留给 {@code HttpRequest.newBuilder} 抛一行英文。
+     *
      * @param baseUrl 用户填的地址，如 {@code https://api.deepseek.com} 或 {@code https://x.com/v1}
      * @return 最终请求地址
-     * @throws IllegalArgumentException 空白、缺 scheme/主机、或带查询串（消息点明原因）
+     * @throws IllegalArgumentException 空白、缺 scheme/主机、带查询串、非 http(s) 协议、
+     *                                  非法端口（消息点明原因）
      */
     public static URI endpoint(String baseUrl) {
         if (baseUrl == null || baseUrl.isBlank()) {
@@ -308,6 +402,26 @@ public final class AiClient {
                 || parsed.getRawAuthority().isEmpty()) {
             throw new IllegalArgumentException(
                     "base_url 必须带上协议与主机（例如 https://api.deepseek.com）；收到：" + baseUrl);
+        }
+        // 「能真正发出去」这条承诺要落到 HttpClient 真的收不收上（实测口径）：
+        //   · `https://x.com:-1`、`https://中文.com` → HttpRequest.newBuilder 抛 "unsupported URI"；
+        //   · `ftp://x.com` / `file:///...` → 抛 "invalid URI scheme"。
+        // 这些地址在 URI 层能解析，若不在这里拦住，用户看到的就是一行 JDK 英文异常。
+        if (parsed.getHost() == null) {
+            throw new IllegalArgumentException(
+                    "base_url 的主机部分不是能发出去的形状（例如端口写成了 :-1，或主机名里有中文等"
+                            + "非 ASCII 字符）；请按 https://api.deepseek.com 这样填写；收到：" + baseUrl);
+        }
+        String scheme = parsed.getScheme();
+        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+            throw new IllegalArgumentException(
+                    "base_url 的协议必须是 http 或 https（HttpClient 不支持 " + scheme
+                            + "）；收到：" + baseUrl);
+        }
+        int port = parsed.getPort();
+        if (port != -1 && (port < 1 || port > 65535)) {
+            throw new IllegalArgumentException(
+                    "base_url 的端口号必须在 1–65535 之间；收到：" + baseUrl);
         }
 
         String path = parsed.getRawPath() == null ? "" : parsed.getRawPath();
@@ -358,83 +472,85 @@ public final class AiClient {
     }
 
     /** 把状态码与响应体翻译成「正文」或一次分类好的失败。 */
-    private static String readContent(int status, String body) throws AiFailure {
+    private String readContent(int status, String body) throws AiFailure {
         classifyStatus(status);
 
         if (body == null || body.isBlank()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
-                    "服务端返回了空响应体（HTTP " + status + "），没有可显示的内容。请稍后重试。");
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
+                    "服务端返回了空响应体（HTTP " + status + "），没有可显示的内容。请稍后重试。", null);
         }
         JsonObject root = parseObject(body, "响应体不是合法的 JSON（HTTP " + status + "）");
         if (!root.has("choices") || !root.get("choices").isJsonArray()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
                     "响应体里没有 choices 数组（HTTP " + status + "），不是预期的对话补全格式。"
-                            + "请确认 base_url 指向的是 OpenAI 兼容服务。");
+                            + "请确认 base_url 指向的是 OpenAI 兼容服务。", null);
         }
         JsonArray choices = root.getAsJsonArray("choices");
         if (choices.isEmpty()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
-                    "响应体的 choices 是空数组（HTTP " + status + "），没有可显示的内容。请稍后重试。");
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
+                    "响应体的 choices 是空数组（HTTP " + status + "），没有可显示的内容。请稍后重试。",
+                    null);
         }
         JsonElement first = choices.get(0);
         if (!first.isJsonObject()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
-                    "响应体的 choices 里第 1 项不是对象（HTTP " + status + "），不是预期的对话补全格式。");
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
+                    "响应体的 choices 里第 1 项不是对象（HTTP " + status + "），不是预期的对话补全格式。",
+                    null);
         }
         JsonObject message = asObject(first.getAsJsonObject().get("message"));
         if (message == null) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
                     "响应体的 choices[0] 里没有 message 对象（HTTP " + status + "），"
-                            + "不是预期的对话补全格式。");
+                            + "不是预期的对话补全格式。", null);
         }
         JsonElement content = message.get("content");
         if (content == null || content.isJsonNull()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
                     "响应体的 choices[0].message.content 是 null（HTTP " + status + "），"
-                            + "没有可显示的内容。请稍后重试。");
+                            + "没有可显示的内容。请稍后重试。", null);
         }
         if (!content.isJsonPrimitive() || !content.getAsJsonPrimitive().isString()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
                     "响应体的 choices[0].message.content 不是字符串（HTTP " + status + "），"
-                            + "不是预期的对话补全格式。");
+                            + "不是预期的对话补全格式。", null);
         }
         String text = content.getAsString();
         if (text.isBlank()) {
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
+            throw failure(AiFailureKind.MALFORMED_RESPONSE,
                     "响应体的 choices[0].message.content 是空白内容（HTTP " + status + "），"
-                            + "没有可显示的内容。请稍后重试。");
+                            + "没有可显示的内容。请稍后重试。", null);
         }
         return text;
     }
 
     /** 非 2xx 一律先分类成失败：任何状态码下都不把错误页正文当成回复。 */
-    private static void classifyStatus(int status) throws AiFailure {
+    private void classifyStatus(int status) throws AiFailure {
         if (status >= 200 && status < 300) {
             return;
         }
         if (status == 401 || status == 403) {
-            throw new AiFailure(AiFailureKind.UNAUTHORIZED,
-                    "密钥被拒绝（HTTP " + status + "），请检查 API Key 是否填写正确。");
+            throw failure(AiFailureKind.UNAUTHORIZED,
+                    "密钥被拒绝（HTTP " + status + "），请检查 API Key 是否填写正确。", null);
         }
         if (status == 429) {
-            throw new AiFailure(AiFailureKind.RATE_LIMITED,
-                    "请求过于频繁（HTTP 429），请稍后重试。");
+            throw failure(AiFailureKind.RATE_LIMITED,
+                    "请求过于频繁（HTTP 429），请稍后重试。", null);
         }
         if (status >= 500) {
-            throw new AiFailure(AiFailureKind.SERVER_ERROR,
-                    "服务端返回 " + status + "，请稍后重试；若持续如此，可换一个 base_url 试试。");
+            throw failure(AiFailureKind.SERVER_ERROR,
+                    "服务端返回 " + status + "，请稍后重试；若持续如此，可换一个 base_url 试试。", null);
         }
-        throw new AiFailure(AiFailureKind.RATE_LIMITED,
-                "服务端没有接受这次请求（HTTP " + status + "）。请检查 model 名与请求内容，然后重试。");
+        throw failure(AiFailureKind.RATE_LIMITED,
+                "服务端没有接受这次请求（HTTP " + status + "）。请检查 model 名与请求内容，然后重试。",
+                null);
     }
 
-    /** 解析成对象；任何解析问题都收敛成 {@link AiFailureKind#MALFORMED_RESPONSE}，不外泄 JSON 异常。 */
-    private static JsonObject parseObject(String body, String prefix) throws AiFailure {
+    /** 解析成对象；失败时抛 {@link AiFailure}（内部走 {@link #failure} 做密钥脱敏）。 */
+    private JsonObject parseObject(String body, String prefix) throws AiFailure {
         try {
             JsonElement parsed = JsonParser.parseString(body);
             if (parsed == null || !parsed.isJsonObject()) {
-                throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
-                        prefix + "：顶层不是 JSON 对象。");
+                throw failure(AiFailureKind.MALFORMED_RESPONSE, prefix + "：顶层不是 JSON 对象。", null);
             }
             return parsed.getAsJsonObject();
         } catch (AiFailure alreadyClassified) {
@@ -442,8 +558,7 @@ public final class AiClient {
         } catch (RuntimeException e) {
             // JsonSyntaxException / IllegalStateException / NumberFormatException……
             // 全部在这里收口：用户需要的是「不是预期格式」，不是一行 Gson 的栈。
-            throw new AiFailure(AiFailureKind.MALFORMED_RESPONSE,
-                    prefix + "：" + describe(e) + "。", e);
+            throw failure(AiFailureKind.MALFORMED_RESPONSE, prefix + "：" + describe(e) + "。", e);
         }
     }
 
@@ -464,6 +579,99 @@ public final class AiClient {
     // ------------------------------------------------------------------
     // SSE 读取：字节级分帧 + 字节级累积解码
     // ------------------------------------------------------------------
+
+    /**
+     * 事件间静默超时的守夜人（修复轮 1 / 评审 Major-1 的流式那一半）。
+     *
+     * <p><b>为什么不能用「总时长」当超时</b>：一次长回答持续几分钟是正常的，按总时长掐断会把
+     * 正常的长回复当成失败。要钉住的是「超过配置超时<b>没有任何新字节到达</b>」——网络断开、
+     * 服务端卡死、中间设备静默丢包都是这个形状，而它们在没有读超时的 {@code HttpClient} 上
+     * 表现为 {@code read()} 永远阻塞（评审实测 180 秒以上不返回）。
+     *
+     * <p><b>做法</b>：独立守护线程等待「最近一次收到字节的时间 + 超时」；到点还没有新字节，
+     * 就<b>关掉响应体</b>。关流会立刻解除调用线程上 {@code read()} 的阻塞（实测：另一个线程
+     * {@code close()} 时阻塞中的读当场以 IOException 收场），调用方据此把这次失败归类成 TIMEOUT。
+     * 任何返回值/异常路径最后都会 {@link #stop()} 它，不留悬挂线程。
+     */
+    private static final class SilenceWatchdog {
+
+        private final Object lock = new Object();
+        private final long limitNanos;
+        private final InputStream body;
+        private final Thread thread;
+        private final AtomicBoolean fired = new AtomicBoolean();
+        private boolean finished;
+        private long deadlineNanos;
+
+        SilenceWatchdog(Duration timeout, InputStream body) {
+            this.limitNanos = limitNanos(timeout);
+            this.body = body;
+            this.deadlineNanos = System.nanoTime() + limitNanos;
+            this.thread = new Thread(this::awaitSilence, "ai-stream-silence-watchdog");
+            this.thread.setDaemon(true);
+        }
+
+        /** 超时的纳秒数；天文数字的配置值按「几乎不超时」处理，避免加法溢出。 */
+        private static long limitNanos(Duration timeout) {
+            long nanos;
+            try {
+                nanos = timeout.toNanos();
+            } catch (ArithmeticException overflow) {
+                nanos = Long.MAX_VALUE;
+            }
+            return Math.max(1L, Math.min(nanos, Long.MAX_VALUE / 4));
+        }
+
+        void start() {
+            thread.start();
+        }
+
+        /** 有新字节到达：把期限推到「现在 + 超时」。 */
+        void touch() {
+            synchronized (lock) {
+                deadlineNanos = System.nanoTime() + limitNanos;
+                lock.notifyAll();
+            }
+        }
+
+        /** 守夜人是否已经因为静默超时而关掉了响应体（调用方据此把 IOException 认成超时）。 */
+        boolean fired() {
+            return fired.get();
+        }
+
+        /** 收工：叫醒守夜线程并等它退出。 */
+        void stop() {
+            synchronized (lock) {
+                finished = true;
+                lock.notifyAll();
+            }
+            try {
+                thread.join(500);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private void awaitSilence() {
+            synchronized (lock) {
+                while (!finished) {
+                    long remainingNanos = deadlineNanos - System.nanoTime();
+                    if (remainingNanos <= 0) {
+                        // 先立旗再关流：调用方靠这面旗子把随之而来的 IOException 认成超时
+                        fired.set(true);
+                        closeQuietly(body);
+                        return;
+                    }
+                    try {
+                        lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * {@code text/event-stream} 的解析状态机。
@@ -499,9 +707,13 @@ public final class AiClient {
         private boolean sawAnything;
 
         /** 一边读一边解码分帧；<b>不做收尾</b>（收尾由 {@link #finish} 在确认流干净结束时做）。 */
-        void consume(InputStream body, AiStreamListener listener) throws IOException, AiFailure {
+        void consume(InputStream body, AiStreamListener listener, Runnable onBytesArrived)
+                throws IOException, AiFailure {
             int read;
             while (!done && (read = body.read(readBuffer)) != -1) {
+                // 有新字节到达 → 把「事件间静默」的期限推后（修复轮 1：长回答是正常的，
+                // 要钉的是「一直没有新字节」）。
+                onBytesArrived.run();
                 pending.write(readBuffer, 0, read);
                 decodePending(false);
                 dispatchCompleteLines(listener);

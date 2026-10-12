@@ -28,12 +28,18 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -78,6 +84,15 @@ class AiStreamTest {
 
     /** 轮询等待的默认上限。本地桩正常在毫秒级完成，超时即视为「该到的没到」。 */
     private static final long DEFAULT_AWAIT_MILLIS = 5_000;
+
+    /**
+     * 修复轮 1：「必须结束」类用例的等待上界。
+     *
+     * <p>15 秒是刻意的余量：配置超时只有 1 秒，正常实现应当在 1 秒出头返回；而评审实测
+     * 「SSE 开始之后 read() 一直阻塞」时是<b>永不返回</b>。15 秒既远离 1 秒（不会 flaky），
+     * 也远离「永不」（真挂住时一定判得出来）。
+     */
+    private static final long HANG_DEADLINE_MILLIS = 15_000;
 
     private StreamStub stub;
 
@@ -133,6 +148,22 @@ class AiStreamTest {
         String accept = stub.lastHeader("Accept");
         assertTrue(accept != null && accept.contains("text/event-stream"),
                 "必须声明 Accept: text/event-stream，实际：" + accept);
+
+        // 修复轮 1（Major-2）：api_key 只许出现在 Authorization 头里。桩端断言的是收到的
+        // <b>完整</b>头部集合，因此「多发一个密钥头」这类改动会被这条抓住。
+        Map<String, List<String>> received = stub.lastHeaders();
+        for (Map.Entry<String, List<String>> entry : received.entrySet()) {
+            for (String value : entry.getValue()) {
+                if (value.contains(API_KEY)) {
+                    assertEquals("authorization", entry.getKey().toLowerCase(Locale.ROOT),
+                            "api_key 只允许出现在 Authorization 头里，实际还在：" + entry.getKey()
+                                    + "；收到：" + received);
+                }
+            }
+        }
+        assertTrue(received.values().stream().flatMap(List::stream)
+                        .anyMatch(value -> value.contains(API_KEY)),
+                "密钥必须真的发出去（否则上一条会「因为哪儿都没有」而空转通过）：" + received);
     }
 
     // ------------------------------------------------------------------
@@ -652,6 +683,10 @@ class AiStreamTest {
                 chunk(sse("[DONE]"), 0)));
         Path target = tempDir.resolve("不该出现的目录");
         assertFalse(Files.exists(target));
+        // 修复轮 1（Major-4）：与 complete_doesNotWriteAnyFile 同一个姿态——只查 @TempDir 抓不到
+        // 「写到进程工作目录」那种最省事的写法，所以同时快照工作目录的条目集合。
+        Path workingDirectory = Path.of(System.getProperty("user.dir")).toAbsolutePath();
+        Set<String> entriesBefore = entryNames(workingDirectory);
 
         RecordingListener listener = new RecordingListener();
         client().stream(streamRequest("hi"), listener);
@@ -661,6 +696,94 @@ class AiStreamTest {
         try (var children = Files.list(tempDir)) {
             assertEquals(List.of(), children.toList(), "stream 前后 tempDir 必须没有新条目");
         }
+        assertEquals(entriesBefore, entryNames(workingDirectory),
+                "stream 前后工作目录（" + workingDirectory + "）不得出现新条目");
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Major-1）：超时必须覆盖流式读取
+    // ------------------------------------------------------------------
+
+    @Test
+    void stream_silenceAfterOneDelta_failsAsTIMEOUT_withinBoundedTime() throws Exception {
+        // 性质 B：不能用「总时长」当超时（长回答是正常的），但「超过配置超时没有任何新字节到达」
+        // 必须按 TIMEOUT 收场。SSE 开始之后请求级 timeout 就失效了——没有这条护栏时 read()
+        // 会一直阻塞（评审实测 180s+ 不返回），界面永远停在「正在请求」，用户只能杀进程。
+        Duration silenceTimeout = Duration.ofSeconds(1);
+        stub = StreamStub.openEnded(sse(delta("一")));
+        RecordingListener listener = new RecordingListener();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicReference<String> diag = new AtomicReference<>("(not finished)");
+
+        long startedAt = System.nanoTime();
+        Thread worker = new Thread(() -> {
+            try {
+                clientWithTimeout(silenceTimeout).stream(streamRequest("hi"), listener);
+                diag.set("returned normally, interrupted=" + Thread.currentThread().isInterrupted());
+            } catch (Throwable t) {
+                thrown.set(t);
+                diag.set(t.getClass().getName() + ": " + t.getMessage());
+            }
+        }, "ai-stream-silence-test");
+        worker.setDaemon(true);
+        worker.start();
+        worker.join(HANG_DEADLINE_MILLIS);
+        long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+
+        assertFalse(worker.isAlive(),
+                "服务端发完一个增量后无限静默时，stream() 必须在配置超时（" + silenceTimeout
+                        + "）+ 余量内结束；实际 " + elapsedMillis + "ms 后仍未返回（Major-1 的挂死形状）");
+        assertInstanceOf(AiFailure.class, thrown.get(),
+                "结束方式必须是 TIMEOUT 类失败，实际：" + diag.get());
+        AiFailure failure = (AiFailure) thrown.get();
+        assertEquals(AiFailureKind.TIMEOUT, failure.kind(),
+                "静默超时必须归为 TIMEOUT，实际：" + failure.kind());
+        assertTrue(failure.getMessage().contains("超时"), "实际：" + failure.getMessage());
+        assertTrue(failure.getMessage().contains(silenceTimeout.toString()),
+                "消息要带上具体超时值（" + silenceTimeout + "），实际：" + failure.getMessage());
+        assertTrue(elapsedMillis < HANG_DEADLINE_MILLIS,
+                "耗时上界必须真的被钉住：实际 " + elapsedMillis + "ms");
+        assertEquals(1, listener.deltaCount(), "已经收到的增量不得回滚");
+        assertEquals(0, listener.completeCount(), "静默超时不是正常结束，不得调用 onComplete");
+        awaitTrue("静默超时后必须真的关掉连接（否则每次卡死都会泄漏一条连接）",
+                stub::disconnectObserved, 5_000);
+    }
+
+    @Test
+    void stream_noResponseHeadersWithinTimeout_failsAsTIMEOUT() throws Exception {
+        // 性质 A 在流式入口上的对应面：服务端接了连接却迟迟不给响应头时，也必须有界失败。
+        // 桩睡足 60 秒：比用例的 15 秒上界长得多，所以「实现没有遵守配置超时」时一定是
+        // 「15 秒后仍没返回」这种可读的红，而不是恰好等到桩自己发响应头。
+        Duration headerTimeout = Duration.ofSeconds(1);
+        stub = StreamStub.slowHeaders(60_000);
+        RecordingListener listener = new RecordingListener();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+
+        long startedAt = System.nanoTime();
+        Thread worker = new Thread(() -> {
+            try {
+                clientWithTimeout(headerTimeout).stream(streamRequest("hi"), listener);
+                thrown.set(new AssertionError("响应头都迟迟不来时不得正常返回"));
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        }, "ai-stream-header-timeout-test");
+        worker.setDaemon(true);
+        worker.start();
+        worker.join(HANG_DEADLINE_MILLIS);
+        long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+
+        assertFalse(worker.isAlive(),
+                "响应头超时后 stream() 必须结束；实际 " + elapsedMillis + "ms 后仍在跑");
+        assertInstanceOf(AiFailure.class, thrown.get(), "实际：" + thrown.get());
+        AiFailure failure = (AiFailure) thrown.get();
+        assertEquals(AiFailureKind.TIMEOUT, failure.kind(), "实际：" + failure.kind());
+        assertTrue(failure.getMessage().contains("超时"), "实际：" + failure.getMessage());
+        assertTrue(failure.getMessage().contains(headerTimeout.toString()),
+                "消息要带上具体超时值（" + headerTimeout + "），实际：" + failure.getMessage());
+        assertTrue(elapsedMillis < HANG_DEADLINE_MILLIS, "耗时上界：实际 " + elapsedMillis + "ms");
+        assertEquals(0, listener.deltaCount());
+        assertEquals(0, listener.completeCount());
     }
 
     // ------------------------------------------------------------------
@@ -670,6 +793,20 @@ class AiStreamTest {
     private AiClient client() {
         return new AiClient(new AiConfig(stub.baseUrl(), API_KEY, MODEL, TIMEOUT),
                 HttpClient.newHttpClient());
+    }
+
+    /** 修复轮 1：需要快速触发超时的用例用这个（静默 / 响应头超时）。 */
+    private AiClient clientWithTimeout(Duration timeout) {
+        return new AiClient(new AiConfig(stub.baseUrl(), API_KEY, MODEL, timeout),
+                HttpClient.newHttpClient());
+    }
+
+    /** 一个目录里的条目名集合（「调用前后不得出现新文件」的快照对比用）。 */
+    private static Set<String> entryNames(Path directory) throws IOException {
+        try (var entries = Files.list(directory)) {
+            return entries.map(entry -> entry.getFileName().toString())
+                    .collect(Collectors.toCollection(TreeSet::new));
+        }
     }
 
     private static AiRequest streamRequest(String content) {
@@ -908,6 +1045,7 @@ class AiStreamTest {
         private final List<String> bodies = new ArrayList<>();
         private final List<String> authHeaders = new ArrayList<>();
         private final List<String> acceptHeaders = new ArrayList<>();
+        private final List<Map<String, List<String>>> allHeaders = new ArrayList<>();
 
         private StreamStub(HttpServer server, ExecutorService executor) {
             this.server = server;
@@ -956,6 +1094,33 @@ class AiStreamTest {
                 }
                 exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
                 // 长度必须显式给出：0 在 HttpServer 里等于「分块传输」，-1 才是「长度为 0」
+                exchange.sendResponseHeaders(200, -1);
+                exchange.getResponseBody().close();
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
+        }
+
+        /**
+         * 修复轮 1：读到请求后先睡 {@code delayMillis} 毫秒<b>再</b>发响应头
+         * （模拟「服务端接了连接却迟迟不出结果」；评审 Minor-3 说的「没有读超时」的另一半）。
+         */
+        static StreamStub slowHeaders(int delayMillis) throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(4);
+            StreamStub stub = new StreamStub(server, executor);
+            server.createContext("/", exchange -> {
+                try (InputStream in = exchange.getRequestBody()) {
+                    stub.record(exchange, new String(in.readAllBytes(), StandardCharsets.UTF_8));
+                }
+                try {
+                    Thread.sleep(delayMillis);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return; // 不写响应头就退出：连接由 HttpServer 收掉
+                }
+                exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
                 exchange.sendResponseHeaders(200, -1);
                 exchange.getResponseBody().close();
             });
@@ -1014,6 +1179,8 @@ class AiStreamTest {
             bodies.add(body);
             authHeaders.add(exchange.getRequestHeaders().getFirst("Authorization"));
             acceptHeaders.add(exchange.getRequestHeaders().getFirst("Accept"));
+            // 修复轮 1：连全部头部一起记下来（拷贝一份），供「api_key 只许在 Authorization 里」断言
+            allHeaders.add(new LinkedHashMap<>(exchange.getRequestHeaders()));
         }
 
         String lastPath() {
@@ -1033,6 +1200,11 @@ class AiStreamTest {
                 return authHeaders.isEmpty() ? null : authHeaders.get(authHeaders.size() - 1);
             }
             return acceptHeaders.isEmpty() ? null : acceptHeaders.get(acceptHeaders.size() - 1);
+        }
+
+        /** 最后一次请求收到的<b>完整</b>头部集合（修复轮 1 的密钥位置断言用）。 */
+        Map<String, List<String>> lastHeaders() {
+            return allHeaders.isEmpty() ? Map.of() : allHeaders.get(allHeaders.size() - 1);
         }
 
         boolean requestSeen() {

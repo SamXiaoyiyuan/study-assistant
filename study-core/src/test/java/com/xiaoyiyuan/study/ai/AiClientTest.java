@@ -2,18 +2,24 @@ package com.xiaoyiyuan.study.ai;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.xiaoyiyuan.study.config.AppConfig;
 
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -32,10 +38,18 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -72,6 +86,18 @@ class AiClientTest {
 
     /** 超时用例专用：短到桩的 3 秒 sleep 一定跑不完。 */
     private static final Duration TIMEOUT_FOR_SLOW_STUB = Duration.ofMillis(250);
+
+    /** 修复轮 1：挂起类用例（谎报 Content-Length / 截断响应体）用的超时。 */
+    private static final Duration TIMEOUT_FOR_HANGING_STUB = Duration.ofSeconds(1);
+
+    /**
+     * 修复轮 1：「必须结束」类用例的等待上界。
+     *
+     * <p>取 15 秒是刻意的余量：配置超时只有 1 秒，正常实现应当在 1 秒出头返回；
+     * 而评审实测「挂死」的那次在 180 秒后仍然活着。15 秒既远离 1 秒（不会 flaky），
+     * 也远离 180 秒（真挂住时一定判得出来）。
+     */
+    private static final long HANG_DEADLINE_MILLIS = 15_000;
 
     /** 一个形状完全正确的 chat.completion 响应体（逐字，含嵌套 message）。 */
     private static final String GOOD_BODY = """
@@ -499,6 +525,14 @@ class AiClientTest {
         Path target = tempDir.resolve("不该出现的目录");
         assertFalse(Files.exists(target));
 
+        // 修复轮 1（Major-4）：只查 @TempDir 抓不到最省事的那种写法——直接把字符串变成 Path 写到
+        // 进程工作目录（评审 M8d：`Files.write(Path.of("cwd-write-probe.tmp"))` 当时全绿，文件却真的
+        // 写出来了）。所以同时快照工作目录的条目集合，调用前后必须完全一致。
+        // （没有一并快照 java.io.tmpdir：那是多个进程共用的目录，前后对比会引入 flaky；
+        //   方法体内的写入由 aiPackageBytecode_hasNoFileWriteOrProcessExecutionReferences 结构性覆盖。）
+        Path workingDirectory = Path.of(System.getProperty("user.dir")).toAbsolutePath();
+        Set<String> entriesBefore = entryNames(workingDirectory);
+
         AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
         assertEquals("你好", client.complete(request("hi")));
 
@@ -506,15 +540,626 @@ class AiClientTest {
         try (Stream<Path> children = Files.list(tempDir)) {
             assertEquals(List.of(), children.toList(), "complete 前后 tempDir 必须没有新条目");
         }
+        assertEquals(entriesBefore, entryNames(workingDirectory),
+                "complete 前后工作目录（" + workingDirectory + "）不得出现新条目；"
+                        + "评审 M8d 就是靠这里漏过去的");
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Major-1 / 性质 A）：complete() 必须在「超时 + 余量」内结束
+    // ------------------------------------------------------------------
+
+    @Test
+    void complete_lyingContentLengthAndOpenConnection_endsWithinTimeout() throws Exception {
+        // 评审 B1 的最小复现：桩声明 10MB、只发 43 字节、然后<b>保持连接</b>。
+        // 请求级 HttpRequest.timeout 只管到响应头为止，body 读取不受它约束——评审实测 180.2 秒
+        // 仍然 alive。这条断言不是在「检查抛了异常」，而是在检查<b>耗时上界</b>。
+        stub = Stub.lyingContentLength(10_000_000L, GOOD_BODY, 60_000);
+        AiClient client = new AiClient(
+                new AiConfig(stub.baseUrl(), API_KEY, MODEL, TIMEOUT_FOR_HANGING_STUB),
+                HttpClient.newHttpClient());
+
+        long startedAt = System.nanoTime();
+        CallOutcome outcome = runWithDeadline(() -> client.complete(request("hi")),
+                HANG_DEADLINE_MILLIS);
+        long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+
+        assertTrue(outcome.finished(),
+                "服务端谎报 Content-Length 并保持连接时，complete() 必须在配置超时（"
+                        + TIMEOUT_FOR_HANGING_STUB + "）+ 余量内结束；实际 " + elapsedMillis
+                        + "ms 后仍未返回（Major-1 的挂死复现）");
+        assertInstanceOf(AiFailure.class, outcome.thrown(),
+                "结束方式必须是超时类失败，实际：" + outcome.thrown());
+        AiFailure failure = (AiFailure) outcome.thrown();
+        assertEquals(AiFailureKind.TIMEOUT, failure.kind(),
+                "「响应头已到、body 不给足」必须归为 TIMEOUT，实际：" + failure.kind());
+        assertTrue(failure.getMessage().contains("超时"), "实际：" + failure.getMessage());
+        assertTrue(elapsedMillis < HANG_DEADLINE_MILLIS,
+                "耗时上界必须真的被钉住：实际 " + elapsedMillis + "ms");
+    }
+
+    @Test
+    void complete_contentLengthLargerThanSent_thenClose_endsWithinTimeout() throws Exception {
+        // 评审 B2：声明长度大于实发字节、然后<b>正常关闭</b>（真实世界「代理截断响应」的形态）。
+        // 同样要求有界结束，且不允许把半截 body 当成一次成功回复。
+        stub = Stub.overlongContentLength(GOOD_BODY.getBytes(StandardCharsets.UTF_8).length * 10L,
+                GOOD_BODY);
+        AiClient client = new AiClient(
+                new AiConfig(stub.baseUrl(), API_KEY, MODEL, TIMEOUT_FOR_HANGING_STUB),
+                HttpClient.newHttpClient());
+
+        long startedAt = System.nanoTime();
+        CallOutcome outcome = runWithDeadline(() -> client.complete(request("hi")),
+                HANG_DEADLINE_MILLIS);
+        long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+
+        assertTrue(outcome.finished(),
+                "响应体被截断（声明长度大于实发）时 complete() 必须有界结束；实际 " + elapsedMillis
+                        + "ms 后仍未返回");
+        assertInstanceOf(AiFailure.class, outcome.thrown(),
+                "半截响应体绝不能当成成功回复，实际：" + outcome.thrown());
+        AiFailureKind kind = ((AiFailure) outcome.thrown()).kind();
+        assertTrue(kind == AiFailureKind.TIMEOUT || kind == AiFailureKind.NETWORK,
+                "截断的响应体要么按超时、要么按网络中断收场，实际：" + kind);
+        assertTrue(elapsedMillis < HANG_DEADLINE_MILLIS,
+                "耗时上界必须真的被钉住：实际 " + elapsedMillis + "ms");
+    }
+
+    @Test
+    void complete_interruptedWhileWaiting_throwsInterruptedException() throws Exception {
+        // 评审 Minor-10：complete 声明会原样抛 InterruptedException，但此前没有一条用例覆盖它。
+        // 取消路径必须让调用线程及时返回——否则界面只能杀进程。
+        stub = Stub.slow(5_000);
+        AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicReference<String> diag = new AtomicReference<>("(not finished)");
+        Thread worker = new Thread(() -> {
+            try {
+                client.complete(request("hi"));
+                diag.set("returned normally, interrupted=" + Thread.currentThread().isInterrupted());
+            } catch (Throwable t) {
+                thrown.set(t);
+                diag.set(t.getClass().getName() + ": " + t.getMessage());
+            }
+        }, "ai-complete-interrupt-test");
+        worker.setDaemon(true);
+        worker.start();
+
+        Thread.sleep(200); // 让请求确实进到「等服务端」里
+        worker.interrupt();
+        worker.join(5_000);
+
+        assertFalse(worker.isAlive(), "中断后 complete() 必须及时返回，不得把调用线程挂住");
+        assertInstanceOf(InterruptedException.class, thrown.get(),
+                "取消必须原样表达为 InterruptedException，实际：" + diag.get());
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Major-2）：api_key 只许出现在 Authorization 头里
+    // ------------------------------------------------------------------
+
+    @Test
+    void complete_sendsOnlyTheAllowedHeaders_andKeyOnlyInAuthorization() throws Exception {
+        stub = Stub.serving(200, "application/json", GOOD_BODY);
+        AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        assertEquals("你好", client.complete(request("hi")));
+
+        Map<String, List<String>> received = stub.lastHeaders();
+
+        // 1) 桩端断言收到的<b>完整</b>头部集合：除传输层自己加的头之外，客户端只许加这三个。
+        //    多一个 X-Debug-Api-Key（评审 M10）之类的头会当场让这条变红。
+        Set<String> frameworkHeaders = Set.of("host", "content-length", "user-agent", "connection",
+                "upgrade", "http2-settings");
+        Set<String> clientHeaders = new TreeSet<>();
+        for (String name : received.keySet()) {
+            if (!frameworkHeaders.contains(name.toLowerCase(Locale.ROOT))) {
+                clientHeaders.add(name.toLowerCase(Locale.ROOT));
+            }
+        }
+        assertEquals(new TreeSet<>(Set.of("authorization", "content-type", "accept")), clientHeaders,
+                "客户端只许发 Authorization / Content-Type / Accept 三个头；实际收到：" + received);
+
+        // 2) 任何头（名字与值都算）里出现 api_key 的，只能是 Authorization
+        for (Map.Entry<String, List<String>> entry : received.entrySet()) {
+            for (String value : entry.getValue()) {
+                if (value.contains(API_KEY)) {
+                    assertEquals("authorization", entry.getKey().toLowerCase(Locale.ROOT),
+                            "api_key 只允许出现在 Authorization 头里，实际还在：" + entry.getKey());
+                }
+            }
+        }
+        assertFalse(received.keySet().stream()
+                        .anyMatch(name -> name.toLowerCase(Locale.ROOT).contains("key")
+                                && !name.equalsIgnoreCase("Authorization")),
+                "不得存在任何名字里带 key 的头（Authorization 除外）：" + received.keySet());
+
+        // 3) 反面保险：密钥必须真的在 Authorization 里，否则上面两条会「因为哪儿都没有」而空转
+        assertTrue(received.get("Authorization") != null
+                        && received.get("Authorization").contains("Bearer " + API_KEY),
+                "Authorization 必须原样承载密钥，实际：" + received.get("Authorization"));
+    }
+
+    @Test
+    void complete_neverPutsApiKeyInFailureMessageOrCauseChain() throws Exception {
+        // 成功路径：返回值里也不该出现密钥
+        stub = Stub.serving(200, "application/json", GOOD_BODY);
+        AiClient ok = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        assertFalse(ok.complete(request("hi")).contains(API_KEY), "回复正文里不该出现密钥");
+        stopCurrentStub();
+
+        // 各类失败路径：NETWORK / TIMEOUT / UNAUTHORIZED / RATE_LIMITED / SERVER_ERROR(4xx其它) / MALFORMED
+        int closedPort = freeThenClosedPort();
+        AiClient refused = new AiClient(config("http://127.0.0.1:" + closedPort),
+                HttpClient.newHttpClient());
+        assertNoSecretInFailure("连接不上", () -> refused.complete(request("hi")));
+
+        stub = Stub.slow(3_000);
+        AiClient slow = new AiClient(
+                new AiConfig(stub.baseUrl(), API_KEY, MODEL, TIMEOUT_FOR_SLOW_STUB),
+                HttpClient.newHttpClient());
+        assertNoSecretInFailure("超时", () -> slow.complete(request("hi")));
+        stopCurrentStub();
+
+        for (int status : new int[] {401, 403, 429, 500, 400}) {
+            stub = Stub.serving(status, "application/json",
+                    "{\"error\":{\"message\":\"key=" + API_KEY + "\"}}");
+            AiClient failing = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+            assertNoSecretInFailure("HTTP " + status, () -> failing.complete(request("hi")));
+            stopCurrentStub();
+        }
+
+        // 响应体里带着密钥、且走的是「解析失败」这条路（消息里会拼进 Gson 的文案）：
+        // 用户可见消息是消息分母最不可控的一处，必须也守得住。
+        stub = Stub.serving(200, "application/json", "<html>bad gateway " + API_KEY + "</html>");
+        AiClient malformed = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        assertNoSecretInFailure("响应体不是 JSON", () -> malformed.complete(request("hi")));
+        stopCurrentStub();
+
+        stub = Stub.serving(200, "application/json",
+                "{\"choices\":[]}{\"echo\":\"" + API_KEY + "\"");
+        AiClient truncated = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        assertNoSecretInFailure("截断 JSON", () -> truncated.complete(request("hi")));
+        stopCurrentStub();
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Major-3）：AiConfig 不得明文打印 api_key
+    // ------------------------------------------------------------------
+
+    @Test
+    void aiConfig_toStringNeverPrintsTheApiKey() {
+        AiConfig clientConfig = config("https://x.com");
+
+        assertFalse(clientConfig.toString().contains(API_KEY),
+                "record 自动实现的 toString() 会明文打印密钥（评审实测）；实际：" + clientConfig);
+        assertFalse(String.valueOf((Object) clientConfig).contains(API_KEY));
+        assertFalse(("" + clientConfig).contains(API_KEY));
+
+        // 脱敏不得影响真正的取值，否则就是「靠改坏功能来换绿」
+        assertEquals(API_KEY, clientConfig.apiKey(), "toString 的脱敏不得影响取值");
+        // 仍然要有排查价值：地址 / 模型 / 超时都要在，密钥位置要有占位符
+        assertTrue(clientConfig.toString().contains("https://x.com"),
+                "toString 应当保留 base_url，实际：" + clientConfig);
+        assertTrue(clientConfig.toString().contains(MODEL),
+                "toString 应当保留 model，实际：" + clientConfig);
+        assertTrue(clientConfig.toString().contains(SHORT_TIMEOUT.toString()),
+                "toString 应当保留 timeout，实际：" + clientConfig);
+        assertTrue(clientConfig.toString().contains("***"),
+                "密钥位置应给出占位符（让读日志的人知道「这里有密钥」），实际：" + clientConfig);
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Major-4）：ai 包的<b>字节码</b>里不得有写文件 / 执行进程
+    // ------------------------------------------------------------------
+
+    @Test
+    void aiPackageBytecode_hasNoFileWriteOrProcessExecutionReferences() throws Exception {
+        Path aiClasses = mainClassesDirectory().resolve("com/xiaoyiyuan/study/ai");
+        assertTrue(Files.isDirectory(aiClasses), "找不到 ai 包的 class 目录：" + aiClasses);
+        List<Path> classFiles;
+        try (Stream<Path> entries = Files.list(aiClasses)) {
+            classFiles = entries.filter(entry -> entry.getFileName().toString().endsWith(".class"))
+                    .toList();
+        }
+        Set<String> names = classFiles.stream().map(entry -> entry.getFileName().toString())
+                .collect(Collectors.toCollection(TreeSet::new));
+
+        // 扫描面本身必须够宽：内部类（AiClient$SseReader）也要扫——方法体完全可能长在里面。
+        // 这条同时是「loader/路径写错时不会变成空转的绿灯」的保险。
+        assertTrue(names.contains("AiClient$SseReader.class"),
+                "必须连内部类的 class 一起扫，否则方法体藏在内部类里就漏了；实际扫到：" + names);
+        assertTrue(classFiles.size() >= 8,
+                "ai 包的 class 个数不对（扫不到东西时不能算通过）：" + names);
+
+        Set<String> offenders = new LinkedHashSet<>();
+        int scannedConstants = 0;
+        for (Path classFile : classFiles) {
+            byte[] bytes = Files.readAllBytes(classFile);
+            assertTrue(bytes.length > 8 && (bytes[0] & 0xFF) == 0xCA && (bytes[1] & 0xFF) == 0xFE,
+                    "不是 class 文件（魔数不符）：" + classFile);
+            List<String> constants = constantPoolUtf8(bytes);
+            scannedConstants += constants.size();
+            for (String constant : constants) {
+                String hit = forbiddenReference(constant);
+                if (hit != null) {
+                    offenders.add(classFile.getFileName() + " → " + hit);
+                }
+            }
+        }
+        assertTrue(scannedConstants > 100,
+                "常量池里一条字符串都没扫到（解析器坏了会变成空转的绿灯）：" + scannedConstants);
+        assertTrue(offenders.isEmpty(),
+                "ai 包的字节码里不得出现「写文件 / 执行进程」的引用（spec §3.3 / §7.5）；命中："
+                        + offenders);
+
+        // 阳性对照：同一个解析器必须能读出 AiClient 真的引用的类（否则「什么都没扫到」也会绿）
+        List<String> clientConstants =
+                constantPoolUtf8(Files.readAllBytes(aiClasses.resolve("AiClient.class")));
+        assertTrue(clientConstants.contains("java/net/http/HttpClient"),
+                "常量池解析器必须能读出真实的类引用（阳性对照失败 = 这条护栏是空转的）");
+        assertTrue(clientConstants.contains("java/net/http/HttpRequest"),
+                "阳性对照第二例（避免只对了一个巧合的字符串）");
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 §5.1）：URL 规范化仍未被覆盖的形状
+    // ------------------------------------------------------------------
+
+    @Test
+    void endpoint_preservesSchemeAndAuthorityCase_andTreatsUppercaseV1AsASubpath() {
+        // 评审 M13：把 scheme/authority 小写化曾是全绿变异。URI 的大小写是语义的一部分，
+        // 逐字保留（这条断言是字符级的，任何小写化渲染都会被抓住）。
+        assertEquals("HTTPS://X.COM/v1/chat/completions",
+                AiClient.endpoint("HTTPS://X.COM").toString());
+        assertEquals("https://X.COM/v1/chat/completions",
+                AiClient.endpoint("https://X.COM").toString());
+        // 版本段判定区分大小写：`/V1` 不被当成 `/v1`，因此会补一个规范化的 `/v1/...`
+        assertEquals("HTTPS://X.COM/V1/v1/chat/completions",
+                AiClient.endpoint("HTTPS://X.COM/V1").toString());
+    }
+
+    @Test
+    void endpoint_ipv6AndInternationalForms_matchWhatTheJdkCanActuallySend() {
+        assertEquals("http://[::1]:8080/v1/chat/completions",
+                AiClient.endpoint("http://[::1]:8080").toString());
+        assertEquals("https://[2001:db8::1]/v1/chat/completions",
+                AiClient.endpoint("https://[2001:db8::1]").toString());
+        // 路径里的非 ASCII 是可发的（主机名里的不行，见下一条用例）
+        assertEquals("https://x.com/\u4e2d\u6587/v1/chat/completions",
+                AiClient.endpoint("https://x.com/\u4e2d\u6587").toString());
+        // 用户信息（user:pass@）保留现状：属规格未规定，这里只钉住「不静默改地址」
+        assertEquals("http://user:pass@host/v1/chat/completions",
+                AiClient.endpoint("http://user:pass@host").toString());
+    }
+
+    @Test
+    void endpoint_v1SubstringTraps_areNotTreatedAsVersionSegment() {
+        // 评审 M14：`/v1` 尾判定必须是<b>按段</b>比较。退化成 contains("v1") / endsWith("v1")
+        // 之类的子串匹配时，下面这些地址会被误判成「已经带版本段」，拼出来的 URL 打到错的地方。
+        assertEquals("https://x.com/v1beta/v1/chat/completions",
+                AiClient.endpoint("https://x.com/v1beta").toString());
+        assertEquals("https://x.com/myv1/v1/chat/completions",
+                AiClient.endpoint("https://x.com/myv1").toString());
+        assertEquals("https://x.com/v1/extra/v1/chat/completions",
+                AiClient.endpoint("https://x.com/v1/extra").toString());
+        assertEquals("https://v1.example.com/v1/chat/completions",
+                AiClient.endpoint("https://v1.example.com").toString());
+        // 反面对照：真正的版本段照旧原样保留（否则上面几条可以靠「永不加版本段」蒙过去）
+        assertEquals("https://x.com/v1/chat/completions",
+                AiClient.endpoint("https://x.com/v1").toString());
+        assertEquals("https://x.com/openai/v1/chat/completions",
+                AiClient.endpoint("https://x.com/openai/v1").toString());
+    }
+
+    @Test
+    void endpoint_rejectsAddressesThatCouldNotBeSentAtAll() {
+        // 修复轮 1：`endpoint()` 的既有承诺是「必须能真正发出去」。下面这些地址 URI 能解析，
+        // 但 HttpRequest.newBuilder 会拒绝（实测：:-1 / 中文主机 → "unsupported URI"，
+        // ftp:// → "invalid URI scheme"）；:99999 与 :65536 则连不上。
+        // 在 endpoint() 里用中文说清原因，比让用户在几秒后看到一行 JDK 英文异常好。
+        for (String bad : List.of("https://x.com:-1", "https://x.com:99999", "https://x.com:65536",
+                "https://x.com:0", "https://\u4e2d\u6587.com", "ftp://x.com",
+                "file:///etc/passwd", "//x.com")) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> AiClient.endpoint(bad), "这个地址必须当场被拒绝：" + bad);
+            assertTrue(e.getMessage() != null && !e.getMessage().isBlank(),
+                    "拒绝消息必须可读：" + bad + " → " + e.getMessage());
+        }
+        // 合法端口照收（否则上面那条可以靠「见到端口就拒绝」蒙过去）
+        assertEquals("https://x.com:8443/v1/chat/completions",
+                AiClient.endpoint("https://x.com:8443").toString());
+        assertEquals("http://127.0.0.1:65535/v1/chat/completions",
+                AiClient.endpoint("http://127.0.0.1:65535").toString());
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 §5.2）：失败分类矩阵的其余格子
+    // ------------------------------------------------------------------
+
+    @Test
+    void complete_classifiesRedirects_asServerRejection_withTheStatusCodeInTheMessage()
+            throws Exception {
+        for (int status : new int[] {301, 302, 303, 307, 308}) {
+            final int current = status;
+            stub = Stub.redirecting(current);
+            AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+            AiFailure failure = assertThrows(AiFailure.class,
+                    () -> client.complete(request("hi")),
+                    "HTTP " + current + " 应当抛 AiFailure");
+            assertEquals(AiFailureKind.RATE_LIMITED, failure.kind(),
+                    "HTTP " + current + " 的分类不符：" + failure.kind());
+            assertTrue(failure.getMessage().contains(String.valueOf(current)),
+                    "消息必须带上具体状态码，实际：" + failure.getMessage());
+            stopCurrentStub();
+        }
+    }
+
+    @Test
+    void complete_defaultClientFollowsASameHostRedirect() throws Exception {
+        // 评审 Minor-11：`Redirect.NORMAL` 这条策略此前无人守。生产构造器 AiClient(AiConfig)
+        // 就是用它——重定向网关（常见于自建/代理）要么被跟随、要么被当成失败，不能看运气。
+        stub = Stub.redirectingOnce("/v1/chat/completions", GOOD_BODY);
+        AiClient client = new AiClient(config(stub.baseUrl()));
+
+        assertEquals("你好", client.complete(request("hi")), "302 应当被生产构造器跟随");
+        assertEquals(2, stub.requestCount(), "跟随重定向意味着桩应当收到两次请求");
+        assertEquals("/v1/chat/completions", stub.lastPath(), "第二次请求应打到 Location 指向的路径");
+    }
+
+    @Test
+    void complete_classifiesEveryRemaining4xxStatus() throws Exception {
+        // 401/403/429 已单独覆盖；其余 4xx 一律是「服务端没有接受这次请求」，
+        // 消息里必须能定位到具体状态码（此前 404/408/413/451/499 一个都没有）。
+        for (int status : new int[] {404, 405, 408, 409, 413, 422, 451, 499}) {
+            assertFailure(AiFailureKind.RATE_LIMITED, status,
+                    "{\"error\":{\"message\":\"nope\"}}", String.valueOf(status));
+        }
+    }
+
+    @Test
+    void complete_neverTreatsAnInterim1xxAsSuccess() throws Exception {
+        // 1xx 是中间响应：客户端看不到「最终结果」。JDK 的 HttpServer 发不出真正的 1xx
+        // （评审实测），所以这里钉住的性质是「1xx 绝不被当成一次成功回复」，且<b>有界结束</b>：
+        // 本机实测这一段由请求级超时兜住（TIMEOUT，约 1 秒），服务端若直接收掉连接则是 NETWORK。
+        stub = Stub.interimOnly(100);
+        AiClient client = new AiClient(
+                new AiConfig(stub.baseUrl(), API_KEY, MODEL, TIMEOUT_FOR_HANGING_STUB),
+                HttpClient.newHttpClient());
+
+        long startedAt = System.nanoTime();
+        CallOutcome outcome = runWithDeadline(() -> client.complete(request("hi")),
+                HANG_DEADLINE_MILLIS);
+        long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
+
+        assertTrue(outcome.finished(), "只有中间响应时 complete() 必须有界结束；实际 "
+                + elapsedMillis + "ms 后仍未返回");
+        assertInstanceOf(AiFailure.class, outcome.thrown(),
+                "只有中间响应、没有最终响应时必须失败，实际：" + outcome.thrown());
+        AiFailureKind kind = ((AiFailure) outcome.thrown()).kind();
+        assertTrue(kind == AiFailureKind.TIMEOUT || kind == AiFailureKind.NETWORK,
+                "1xx 只能收场为超时或网络类失败，实际：" + kind);
+        assertTrue(elapsedMillis < 5_000,
+                "1 秒超时之下必须在 5 秒内结束，实际 " + elapsedMillis + "ms");
+    }
+
+    @Test
+    void complete_nonStringContent_isMALFORMED_RESPONSE_forEveryJsonKind() throws Exception {
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200,
+                "{\"choices\":[{\"message\":{\"content\":123}}]}", "content", "不是字符串");
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200,
+                "{\"choices\":[{\"message\":{\"content\":{\"a\":1}}}]}", "content", "不是字符串");
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200,
+                "{\"choices\":[{\"message\":{\"content\":[\"x\"]}}]}", "content", "不是字符串");
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200,
+                "{\"choices\":[{\"message\":{\"content\":true}}]}", "content", "不是字符串");
+    }
+
+    @Test
+    void complete_topLevelNonObject_isMALFORMED_RESPONSE() throws Exception {
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200, "[]", "顶层不是 JSON 对象");
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200, "\"just a string\"", "顶层不是 JSON 对象");
+        assertFailure(AiFailureKind.MALFORMED_RESPONSE, 200, "123", "顶层不是 JSON 对象");
+    }
+
+    @Test
+    void complete_duplicateJsonKeys_lastOneWins_pinnedBoundary() throws Exception {
+        // 规格未规定重复键的取舍。Gson 取「后出现的那个」——固定住现状，避免依赖升级后
+        // 悄悄变成另一种取舍而无人察觉。
+        stub = Stub.serving(200, "application/json",
+                "{\"choices\":[],\"choices\":[{\"message\":{\"content\":\"后者\"}}]}");
+        AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        assertEquals("后者", client.complete(request("hi")), "重复键取后者（Gson 现状）");
+    }
+
+    // ------------------------------------------------------------------
+    // 修复轮 1（评审 Minor-9）：与 AppConfig 的超时口径
+    // ------------------------------------------------------------------
+
+    @Test
+    void aiConfigTimeout_acceptsEveryValueAppConfigCanProduce(@TempDir Path tempDir) {
+        // 口径不同是刻意的（见 AiConfig 的 javadoc），但方向只有一个是对的：
+        // <b>AppConfig 能产出的任何超时值，AiConfig 都必须接受</b>——否则 Task 7 的接线
+        // （timeout 取自 AppConfig.requestTimeout()）会当场抛异常。
+        AppConfig appConfig = AppConfig.load(tempDir.resolve("不存在.properties"));
+        for (Duration timeout : List.of(Duration.ofSeconds(1), Duration.ofSeconds(60),
+                Duration.ofHours(24), appConfig.requestTimeout())) {
+            appConfig.setRequestTimeout(timeout); // 先证明 AppConfig 真的接受这个值
+            assertEquals(timeout, appConfig.requestTimeout(), "AppConfig 应原样保存：" + timeout);
+            assertEquals(timeout,
+                    new AiConfig("https://x.com", API_KEY, MODEL, timeout).timeout(),
+                    "AppConfig 能产出的超时值，AiConfig 必须原样接受：" + timeout);
+        }
+    }
+
+    @Test
+    void aiConfigTimeout_rejectsADifferentSetThanAppConfig_intentionalAndPinned(
+            @TempDir Path tempDir) {
+        // 修复轮 1 的选择：不把 AiConfig 收紧到 AppConfig 的文件粒度上，而是把两者的口径差异
+        // <b>显式钉住</b>。理由：AppConfig 的下界与粒度来自<b>文件格式</b>（request_timeout 存的是
+        // 整秒，500ms 会被截断成 0 → 「设了 0.5 秒却跑 60 秒」），而 AiConfig 是内存里的传输层
+        // 值对象：亚秒超时是合法的传输配置（也是本测试能快速触发超时的唯一手段），它只需要「为正」。
+        AppConfig appConfig = AppConfig.load(tempDir.resolve("不存在.properties"));
+        for (Duration tooSmall : List.of(Duration.ofMillis(500), Duration.ofNanos(1))) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> appConfig.setRequestTimeout(tooSmall),
+                    "AppConfig 应拒绝亚秒超时（无法无损写进文件）：" + tooSmall);
+            assertEquals(tooSmall,
+                    new AiConfig("https://x.com", API_KEY, MODEL, tooSmall).timeout(),
+                    "AiConfig 按传输层口径接受亚秒超时：" + tooSmall);
+        }
+        for (Duration tooLarge : List.of(Duration.ofHours(100),
+                Duration.ofHours(999_999_999L))) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> appConfig.setRequestTimeout(tooLarge),
+                    "AppConfig 应拒绝超过 24 小时的超时：" + tooLarge);
+            assertEquals(tooLarge,
+                    new AiConfig("https://x.com", API_KEY, MODEL, tooLarge).timeout(),
+                    "AiConfig 按传输层口径接受更大的超时：" + tooLarge);
+        }
     }
 
     // ------------------------------------------------------------------
     // 辅助
     // ------------------------------------------------------------------
 
+    /** 一次调用的结果：是否在期限内结束、抛了什么、耗时多少。 */
+    private record CallOutcome(boolean finished, Throwable thrown, long elapsedMillis) {
+    }
+
+    /** 会抛异常的一次调用（供断言在调用方捕获）。 */
+    @FunctionalInterface
+    private interface ThrowingCall {
+        void run() throws Exception;
+    }
+
+    /**
+     * 在守护线程里执行一次调用，最多等 {@code deadlineMillis}。
+     *
+     * <p>「必须结束」这类性质不能靠「断言抛了异常」来证明：实现挂死时，测试自己也会一起挂死，
+     * 于是 CI 上表现为超时而不是一条清晰的失败。用带期限的等待，把「挂住」变成一条可读的红。
+     */
+    private static CallOutcome runWithDeadline(ThrowingCall call, long deadlineMillis)
+            throws InterruptedException {
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        AtomicBoolean finished = new AtomicBoolean();
+        long startedAt = System.nanoTime();
+        Thread worker = new Thread(() -> {
+            try {
+                call.run();
+            } catch (Throwable t) {
+                thrown.set(t);
+            } finally {
+                finished.set(true);
+            }
+        }, "ai-client-deadline-probe");
+        worker.setDaemon(true);
+        worker.start();
+        worker.join(deadlineMillis);
+        long elapsed = (System.nanoTime() - startedAt) / 1_000_000;
+        return new CallOutcome(finished.get(), thrown.get(), elapsed);
+    }
+
+    /** 断言一次失败的消息、{@code toString()} 与整个 cause 链里都没有 api_key。 */
+    private void assertNoSecretInFailure(String where, ThrowingCall call) {
+        AiFailure failure = assertThrows(AiFailure.class, call::run, where + " 应当抛 AiFailure");
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth < 20; depth++) {
+            assertFalse(current.toString().contains(API_KEY),
+                    where + "：" + current.getClass().getSimpleName() + ".toString() 泄漏了 api_key");
+            assertFalse(String.valueOf(current.getMessage()).contains(API_KEY),
+                    where + "：消息泄漏了 api_key：" + current.getMessage());
+            current = current.getCause();
+        }
+    }
+
+    /** 停掉当前桩（循环里每个用例各起一个桩时必须逐个收掉，否则端口与线程会堆积）。 */
+    private void stopCurrentStub() {
+        if (stub != null) {
+            stub.stop();
+            stub = null;
+        }
+    }
+
+    /** 生产 class 目录：由 {@code AiClient} 自己的 CodeSource 决定，不依赖工作目录。 */
+    private static Path mainClassesDirectory() {
+        URL location = AiClient.class.getProtectionDomain().getCodeSource().getLocation();
+        return Path.of(URI.create(location.toString()));
+    }
+
+    /**
+     * 解析 class 文件的常量池，取出全部 {@code CONSTANT_Utf8} 字符串。
+     *
+     * <p>刻意手写而不是引 ASM：{@code pom.xml} 不该为了「一条架构护栏」多一个第三方依赖，
+     * 而常量池的解析只有几十行。这也是唯一能看到<b>方法体</b>引用了什么的手段——
+     * 反射只看得到签名与字段（评审 M8/M8d 正是从那里漏过去的）。
+     */
+    private static List<String> constantPoolUtf8(byte[] classBytes) throws IOException {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(classBytes))) {
+            assertEquals(0xCAFEBABE, in.readInt(), "class 文件的魔数不符");
+            in.readUnsignedShort(); // minor version
+            in.readUnsignedShort(); // major version
+            int poolCount = in.readUnsignedShort();
+            List<String> constants = new ArrayList<>();
+            for (int index = 1; index < poolCount; index++) {
+                int tag = in.readUnsignedByte();
+                switch (tag) {
+                    case 1 -> constants.add(in.readUTF());
+                    case 7, 8, 16, 19, 20 -> in.skipBytes(2);   // Class/String/MethodType/Module/Package
+                    case 15 -> in.skipBytes(3);                  // MethodHandle
+                    case 3, 4, 9, 10, 11, 12, 17, 18 -> in.skipBytes(4);
+                    case 5, 6 -> {                               // Long/Double 占两个槽位
+                        in.skipBytes(8);
+                        index++;
+                    }
+                    default -> throw new IOException(
+                            "未知的常量池 tag " + tag + "（下标 " + index + "）");
+                }
+            }
+            return constants;
+        }
+    }
+
+    /**
+     * 一条常量池字符串是否指向「写文件 / 执行进程」；命中就返回命中的那一段，否则 {@code null}。
+     *
+     * <p>同时匹配类名常量（{@code java/nio/file/Files}）与描述符/签名里的类型
+     * （{@code Ljava/nio/file/Path;}、{@code ()Ljava/nio/file/Path;}）——
+     * 后者是「签名里没有 Path、方法体里却有」的情形，也是评审 M8d 的形状。
+     *
+     * <p>{@code java/lang/Runtime} 必须<b>精确</b>匹配：{@code java/lang/RuntimeException}
+     * 是普通异常，不是执行进程的能力（评审 §1.8 也点了这一条）。
+     */
+    private static String forbiddenReference(String constant) {
+        for (String prefix : List.of("java/nio/file/", "java/io/File")) {
+            if (constant.startsWith(prefix)
+                    || constant.contains("L" + prefix)
+                    || constant.contains("[" + prefix)) {
+                return prefix;
+            }
+        }
+        for (String exact : List.of("java/lang/Runtime", "java/lang/ProcessBuilder",
+                "java/lang/Process")) {
+            if (constant.equals(exact)
+                    || constant.contains("L" + exact + ";")
+                    || constant.contains(")" + exact)) {
+                return exact;
+            }
+        }
+        return null;
+    }
+
+    /** 一个目录里的条目名集合（用于「调用前后不得出现新文件」这类快照对比）。 */
+    private static Set<String> entryNames(Path directory) throws IOException {
+        try (Stream<Path> entries = Files.list(directory)) {
+            return entries.map(entry -> entry.getFileName().toString())
+                    .collect(Collectors.toCollection(TreeSet::new));
+        }
+    }
+
     /** 断言某状态码/响应体被归类成 {@code kind}，且消息里带上给定的每一段具体内容。 */
     private void assertFailure(AiFailureKind kind, int status, String body, String... mustContain)
             throws Exception {
+        stopCurrentStub();
         stub = Stub.serving(status, "application/json", body);
         AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
 
@@ -614,7 +1259,7 @@ class AiClientTest {
         private final List<String> paths = new ArrayList<>();
         private final List<String> methods = new ArrayList<>();
         private final List<String> bodies = new ArrayList<>();
-        private final List<com.sun.net.httpserver.Headers> headers = new ArrayList<>();
+        private final List<Map<String, List<String>>> headers = new ArrayList<>();
 
         private Stub(HttpServer server, ExecutorService executor) {
             this.server = server;
@@ -630,6 +1275,109 @@ class AiClientTest {
             return start(200, "application/json", GOOD_BODY, delayMillis);
         }
 
+        /**
+         * 修复轮 1：<b>谎报</b> {@code Content-Length}（声明 {@code declaredLength} 字节、只写
+         * {@code body} 的字节），然后<b>保持连接</b> {@code holdMillis} 毫秒不关。
+         *
+         * <p>这是评审 B1 的最小复现：请求级 {@code HttpRequest.timeout} 只管到响应头，
+         * 之后 body 少发且不关连接时，{@code read()} 会一直等下去（实测 180.2s 仍 alive）。
+         */
+        static Stub lyingContentLength(long declaredLength, String body, int holdMillis)
+                throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            Stub stub = new Stub(server, executor);
+            server.createContext("/", exchange -> {
+                stub.record(exchange);
+                byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, declaredLength);
+                OutputStream out = exchange.getResponseBody();
+                out.write(payload);
+                out.flush();
+                try {
+                    Thread.sleep(holdMillis);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    try {
+                        out.close();
+                    } catch (IOException ignored) {
+                        // 客户端先放弃时这里写不回去是预期内的
+                    }
+                }
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
+        }
+
+        /**
+         * 修复轮 1：声明比实发更大的 {@code Content-Length}，写完就<b>正常关闭</b>（评审 B2：
+         * 真实世界里「代理截断响应」就是这个形状）。
+         */
+        static Stub overlongContentLength(long declaredLength, String body) throws IOException {
+            return lyingContentLength(declaredLength, body, 0);
+        }
+
+        /** 修复轮 1：指定状态码 + {@code Location} 头（3xx 分类用），响应体长度为 0。 */
+        static Stub redirecting(int status) throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            Stub stub = new Stub(server, executor);
+            server.createContext("/", exchange -> {
+                stub.record(exchange);
+                exchange.getResponseHeaders().set("Location", "/elsewhere");
+                exchange.sendResponseHeaders(status, -1);
+                exchange.getResponseBody().close();
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
+        }
+
+        /** 修复轮 1：第一次请求回 302 + {@code Location}，之后回 200 + {@code finalBody}。 */
+        static Stub redirectingOnce(String location, String finalBody) throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            Stub stub = new Stub(server, executor);
+            server.createContext("/", exchange -> {
+                boolean first = stub.record(exchange);
+                if (first) {
+                    exchange.getResponseHeaders().set("Location", location);
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.getResponseBody().close();
+                    return;
+                }
+                byte[] payload = finalBody.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, payload.length);
+                try (OutputStream out = exchange.getResponseBody()) {
+                    out.write(payload);
+                } catch (IOException clientGone) {
+                    // 与 Recorder 同一个姿态：客户端先走时不算桩的问题
+                }
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
+        }
+
+        /** 修复轮 1：只回一个中间响应（1xx）就收工，没有最终响应。 */
+        static Stub interimOnly(int status) throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            Stub stub = new Stub(server, executor);
+            server.createContext("/", exchange -> {
+                stub.record(exchange);
+                exchange.sendResponseHeaders(status, -1);
+                exchange.getResponseBody().close();
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
+        }
+
         private static Stub start(int status, String contentType, String body, int delayMillis)
                 throws IOException {
             HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -639,6 +1387,22 @@ class AiClientTest {
             server.setExecutor(executor);
             server.start();
             return stub;
+        }
+
+        /**
+         * 记下一次请求（路径 / 方法 / 请求体 / <b>全部头部</b>）。
+         *
+         * @return 这是不是第一次请求（用于「只重定向一次」的桩）
+         */
+        private synchronized boolean record(HttpExchange exchange) throws IOException {
+            try (InputStream in = exchange.getRequestBody()) {
+                bodies.add(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            }
+            paths.add(exchange.getRequestURI().getPath());
+            methods.add(exchange.getRequestMethod());
+            // 拷贝一份：Headers 是 JDK 复用的对象，断言时不该读一个可能还在被写的活对象
+            headers.add(new LinkedHashMap<>(new Headers(exchange.getRequestHeaders())));
+            return paths.size() == 1;
         }
 
         String baseUrl() {
@@ -658,7 +1422,22 @@ class AiClientTest {
         }
 
         String lastHeader(String name) {
-            return headers.get(headers.size() - 1).getFirst(name);
+            Map<String, List<String>> last = lastHeaders();
+            for (Map.Entry<String, List<String>> entry : last.entrySet()) {
+                if (entry.getKey().equalsIgnoreCase(name)) {
+                    return entry.getValue().isEmpty() ? null : entry.getValue().get(0);
+                }
+            }
+            return null;
+        }
+
+        /** 最后一次请求收到的<b>完整</b>头部集合（修复轮 1：断言「只有允许的那些」）。 */
+        Map<String, List<String>> lastHeaders() {
+            return headers.isEmpty() ? Map.of() : headers.get(headers.size() - 1);
+        }
+
+        int requestCount() {
+            return paths.size();
         }
 
         void stop() {
@@ -683,12 +1462,7 @@ class AiClientTest {
             @Override
             @SuppressWarnings("PMD.EmptyCatchBlock")
             public void handle(HttpExchange exchange) throws IOException {
-                try (InputStream in = exchange.getRequestBody()) {
-                    bodies.add(new String(in.readAllBytes(), StandardCharsets.UTF_8));
-                }
-                paths.add(exchange.getRequestURI().getPath());
-                methods.add(exchange.getRequestMethod());
-                headers.add(exchange.getRequestHeaders());
+                record(exchange);
                 if (delayMillis > 0) {
                     try {
                         Thread.sleep(delayMillis);
