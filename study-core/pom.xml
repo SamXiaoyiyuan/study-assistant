@@ -11,6 +11,20 @@
   <artifactId>study-core</artifactId>
 
   <dependencies>
+    <!--
+      Gson：本模块唯一的运行时第三方依赖（spec §3.1 明确允许，本计划 Global Constraints 只批了这一个）。
+
+      用它而不是自己手写 JSON 解析：AI 返回体是外部输入，形状不受我们控制（网关 HTML 错误页、
+      choices 为空、content 为 null……）。手写解析器在「非法输入」上的行为要自己重新证明一遍，
+      而这里真正要守住的是「任何解析异常都归类为 MALFORMED_RESPONSE」，交给成熟库解析、
+      由 AiClient 在一个地方兜住异常，边界更窄。
+      刻意不引第三方 HTTP 库：java.net.http.HttpClient 是 JDK 自带的。
+    -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.14.0</version>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
