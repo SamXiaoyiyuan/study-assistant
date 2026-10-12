@@ -23,6 +23,7 @@ import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -74,7 +75,58 @@ public final class AiClient {
                 .build());
     }
 
-    /** 测试注入用的构造器：行为与上面完全一致，只是复用调用方给的 client。 */
+    /** 非流式入口（{@link #complete(AiRequest)} 的等价简写，见 {@link #complete(List, boolean)}）。 */
+    public String complete(List<AiMessage> messages) throws AiFailure, InterruptedException {
+        return complete(messages, false);
+    }
+
+    /**
+     * 用本客户端自己配置里的模型名组装请求并发一次（非流式 / 流式）。
+     *
+     * <p><b>为什么需要这个入口</b>：{@link AiRequest} 要求调用方给出模型名，而模型名只有
+     * {@code AiConfig} 里有。逐次确认门（{@link ConfirmingAiSession}）手里只有配置好的
+     * {@code AiClient}，不该为了拿到一个模型名再去暴露配置（那会把 {@code api_key} 一起摊开）。
+     * 让「组装请求」留在这里，模型名就只有这一处来源，
+     * 也顺带保证 {@code stream} 字段与所走的入口<b>不可能对不上</b>
+     * （{@code AiClient} 会拒绝 {@code stream=false} 走流式入口，反之亦然）。
+     *
+     * <p>行为与 {@link #complete(AiRequest)} / {@link #stream(AiRequest, AiStreamListener)}
+     * 完全一致：失败分类、超时、密钥脱敏都在同一段代码里。
+     *
+     * @param messages 对话消息；按顺序下发，至少一条
+     * @param streaming {@code true} 走流式（SSE），{@code false} 走整包回复
+     */
+    public String complete(List<AiMessage> messages, boolean streaming)
+            throws AiFailure, InterruptedException {
+        if (streaming) {
+            throw new IllegalArgumentException(
+                    "流式请求没有单次返回的正文：请用 stream(messages, listener) 逐段接收。");
+        }
+        if (messages == null || messages.isEmpty()) {
+            throw new IllegalArgumentException("messages 不能为空：一次请求至少要带一条消息。");
+        }
+        return complete(new AiRequest(config.model(), List.copyOf(messages), false));
+    }
+
+    /**
+     * 用本客户端自己配置里的模型名组装并发出一次流式请求（SSE）。
+     *
+     * <p>与 {@link #complete(List, boolean)} 同一个理由：模型名只有 {@code AiConfig} 有。
+     *
+     * @param messages 对话消息；按顺序下发，至少一条
+     * @param listener 增量与完成回调；在<b>调用线程</b>上被调用
+     */
+    public void stream(List<AiMessage> messages, AiStreamListener listener)
+            throws AiFailure, InterruptedException {
+        if (messages == null || messages.isEmpty()) {
+            throw new IllegalArgumentException("messages 不能为空：一次请求至少要带一条消息。");
+        }
+        stream(new AiRequest(config.model(), List.copyOf(messages), true), listener);
+    }
+
+    /**
+     * 测试注入用的构造器：行为与上面完全一致，只是复用调用方给的 client。
+     */
     public AiClient(AiConfig config, HttpClient httpClient) {
         if (config == null) {
             throw new IllegalArgumentException("AiConfig 不能为 null。");

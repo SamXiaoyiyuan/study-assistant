@@ -537,11 +537,14 @@ class AiStreamTest {
         stub = StreamStub.scripted(List.of(chunk(sse("[DONE]"), 0)));
         AiClient client = client();
 
+        // 显式转型：计划 2 Task 7 为了确认门加了 stream(List<AiMessage>, listener) 这条重载，
+        // 裸 null 会同时匹配两条重载。这里要验的仍是「AiRequest 入口的参数校验」。
         assertThrows(IllegalArgumentException.class,
-                () -> client.stream(null, new RecordingListener()));
+                () -> client.stream((AiRequest) null, new RecordingListener()));
         assertThrows(IllegalArgumentException.class,
                 () -> client.stream(streamRequest("hi"), null));
-        assertThrows(IllegalArgumentException.class, () -> client.stream(null, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> client.stream((AiRequest) null, null));
         assertTrue(stub.lastPath() == null, "参数不合法时一个请求都不该发出去");
     }
 
