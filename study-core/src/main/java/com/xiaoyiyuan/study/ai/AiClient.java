@@ -294,15 +294,27 @@ public final class AiClient {
             // 已发出去的增量保留（onDelta 不回滚），由界面标记「回复不完整」。
             // 已经收到过正文却断在半路 → 网络问题；一个增量都没有 → 更像是服务端回的不是 SSE，
             // 分类成「响应不是预期形状」对用户更有指向性（该去查 base_url / 模型，而不是查网络）。
+            // 收尾时若还丢掉了凑不出字符的字节，消息里点名（修复轮 2：不完整尾巴是显式丢弃的，
+            // 丢弃这件事必须让用户看得见，否则那段逻辑与死代码没有区别）。
+            String droppedTail = droppedTailNote(reader.droppedTrailingBytes());
             throw reader.sawAnything()
                     ? failure(AiFailureKind.NETWORK,
                             "网络连接在回复过程中断开了，已收到的内容保留在对话里，界面可以标记"
-                                    + "「回复不完整」。请重试以获取完整回复。", null)
+                                    + "「回复不完整」。请重试以获取完整回复。" + droppedTail, null)
                     : failure(AiFailureKind.MALFORMED_RESPONSE,
                             "服务端没有按流式（SSE）格式返回任何内容，也没有结束标记 [DONE]。"
-                                    + "请确认 base_url 指向的是 OpenAI 兼容服务，且模型支持流式输出。",
+                                    + "请确认 base_url 指向的是 OpenAI 兼容服务，且模型支持流式输出。"
+                                    + droppedTail,
                             null);
         }
+    }
+
+    /** 被显式丢弃的不完整尾巴的一句话说明（没有丢就返回空串）。 */
+    private static String droppedTailNote(int droppedBytes) {
+        if (droppedBytes <= 0) {
+            return "";
+        }
+        return "回复末尾有 " + droppedBytes + " 个字节凑不出一个完整字符，已丢弃。";
     }
 
     /** 组装一次请求。流式与非流式只差 {@code Accept} 头与请求体里的 {@code stream} 字段。 */
@@ -758,6 +770,17 @@ public final class AiClient {
         /** 是否已经收到过可用的正文或已经结束：用来区分「断在半路」与「根本什么都没回」。 */
         private boolean sawAnything;
 
+        /**
+         * 收尾时被<b>显式丢弃</b>的不完整 UTF-8 尾巴的字节数（修复轮 2 / 评审 Minor-4）。
+         *
+         * <p>这个计数是「丢弃」这个决定唯一的用户可见出口：失败消息里会点名有几个字节凑不出一个
+         * 完整字符。修前那个分支是往行缓冲里塞一个 {@code U+FFFD}——评审实测它永远到不了
+         * {@code onDelta} / {@code onComplete}（随后被 JSON 解析失败丢掉），也就是一段死代码，
+         * 而报告却把它描述成「显式给出替换字符，不静默吞掉」。现在的语义是：
+         * <b>绝不凭空造一个替换字符当正文，但丢弃这件事必须说出来</b>。
+         */
+        private int droppedTrailingBytes;
+
         /** 一边读一边解码分帧；<b>不做收尾</b>（收尾由 {@link #finish} 在确认流干净结束时做）。 */
         void consume(InputStream body, AiStreamListener listener, Runnable onBytesArrived)
                 throws IOException, AiFailure {
@@ -775,6 +798,18 @@ public final class AiClient {
         /**
          * 流<b>干净结束</b>时的收尾：把缓冲区里最后一个完整字符放出来、处理末尾没跟空行的事件。
          *
+         * <p><b>为什么必须把没换行的尾巴也当成一个事件（修复轮 2 / 评审 Blocker-1）</b>：
+         * 分帧只由零字符空行产生，所以「已经收全、只是没跟空行」的最后一个事件会留在 {@code text}
+         * （行缓冲）里。修前这里只把 {@code event} 交给 {@link #handleEvent}，而 {@code event} 是空的
+         * ——于是那个事件被静默丢掉：{@code data:{…甲…}\n\n} + {@code data:{…乙…}}（乙缺尾空行）
+         * 只投递 {@code 甲}；只有唯一一个事件且缺尾空行时一个都投递不出去，还会被误报成
+         * 「服务端没有按流式（SSE）格式返回任何内容」（它与 {@code sawAnything} 为 false 直接相关）。
+         * 这与本类自己的注释（「末尾没有空行就结束的最后一个事件」）直接矛盾。
+         *
+         * <p>投递进来的可能是<b>半个事件</b>（连接在事件中途被截断）。那种情况下 {@code handleEvent}
+         * 里「JSON 解析失败就跳过」的那条规则会把坏内容丢掉——所以这里不需要另加形状判断，
+         * 但反过来说：{@code text} 里剩的字符必须能凑成一个合法 {@code data:} 载荷才会产生回调。
+         *
          * <p>刻意与 {@link #consume} 分开：连接中途断掉时绝不能走到这里。否则「半个汉字」会被
          * 当成「输入结束」而按替换字符吐出来——用户看到的就不是「少了半个字」，而是一个
          * 不该出现的乱码字符（本条由 {@code stream_utf8CharSplitAcrossChunks_doesNotProduceMojibake}
@@ -786,8 +821,14 @@ public final class AiClient {
             }
             decodePending(true);
             dispatchCompleteLines(listener);
+            if (!done && !text.isEmpty()) {
+                // 末尾没有空行就结束的最后一个事件：行缓冲里剩下的字符就是一个完整事件
+                //（或者是被截断的半个事件，交给 handleEvent 的 JSON 解析去丢）
+                event.append(text);
+                text.setLength(0);
+            }
             if (!done && !event.isEmpty()) {
-                handleEvent(event.toString(), listener); // 末尾没有空行就结束的最后一个事件
+                handleEvent(event.toString(), listener);
                 event.setLength(0);
             }
         }
@@ -798,6 +839,11 @@ public final class AiClient {
 
         boolean sawAnything() {
             return sawAnything || done;
+        }
+
+        /** 收尾时被显式丢弃的不完整 UTF-8 尾巴的字节数（供失败消息点名）。 */
+        int droppedTrailingBytes() {
+            return droppedTrailingBytes;
         }
 
         // 包内可见的诊断口子：只为测试能看见「缓冲区里到底还剩什么」。
@@ -823,7 +869,9 @@ public final class AiClient {
          * 只对那段确认过的字节做真正的解码。剩下的尾巴回到 {@code pending}，等下一个块。
          * 判断依据绝不能是「这个块读完了就解码」——那会把半个汉字变成替换字符 U+FFFD。
          *
-         * <p>{@code endOfInput=true} 时才允许把剩下的字节按替换字符处理（真正的坏字节）。
+         * <p>收尾（{@code endOfInput=true}）时剩下的字节是<b>真正的半截字符</b>：它们凑不出任何字符，
+         * 于是被<b>显式丢弃</b>并记进 {@link #droppedTrailingBytes}（修复轮 2：修前这里塞一个
+         * {@code U+FFFD} 进行缓冲，而那个字符永远到不了用户面前，是一段死代码）。
          * 中途<b>绝不能</b>调 {@code decoder.flush()}：它会把攒着的半个字符强行吐出来。
          */
         private void decodePending(boolean endOfInput) throws AiFailure {
@@ -831,7 +879,7 @@ public final class AiClient {
                 return;
             }
             byte[] raw = pending.toByteArray();
-            int safeBytes = safeBytePrefix(raw, endOfInput);
+            int safeBytes = safeBytePrefix(raw);
             if (safeBytes > 0) {
                 // 必须循环到这段字节被解完为止。解码器在字符缓冲区满时返回 OVERFLOW 并只写进
                 // 一部分字符——只看一次结果就会<b>静默丢掉</b>后半段正文（症状是「前 32 个字符
@@ -857,21 +905,27 @@ public final class AiClient {
                 decoder.reset();
             }
             pending.reset();
-            if (safeBytes < raw.length && !endOfInput) {
-                // 尾巴是「还没凑齐的字符」：留到下一个块。SSE 的语法字符都是 ASCII，
-                // 所以把它留在缓冲里绝不影响分帧。
-                pending.write(raw, safeBytes, raw.length - safeBytes);
-            } else if (safeBytes < raw.length) {
-                text.append('\uFFFD'); // 收尾时剩下的字节确实坏了：显式给出替换字符，不静默吞掉
+            if (safeBytes < raw.length) {
+                if (!endOfInput) {
+                    // 尾巴是「还没凑齐的字符」：留到下一个块。SSE 的语法字符都是 ASCII，
+                    // 所以把它留在缓冲里绝不影响分帧。
+                    pending.write(raw, safeBytes, raw.length - safeBytes);
+                } else {
+                    // 收尾时这几个字节确实凑不出字符：显式丢弃，绝不变成 U+FFFD 混进正文
+                    // （那等于把半截字节当成模型输出显示给用户）。丢弃的字节数会被写进失败消息。
+                    droppedTrailingBytes += raw.length - safeBytes;
+                }
             }
         }
 
         /**
-         * 算出「能独立解码的字节数」：走到末尾时若剩下一个不完整的 UTF-8 序列，就把它排除在外。
+         * 算出「能独立解码的字节数」：末尾那个不完整的 UTF-8 序列不算在内。
          *
-         * <p>{@code endOfInput=true}（收尾）时不做保留，剩下的字节交给解码器按替换字符处理。
+         * <p>两种调用情形共用这一段：读循环中它把没凑齐的尾巴留在 {@code pending} 里等下一个块；
+         * 收尾时同一段尾巴由调用方<b>显式丢弃</b>（{@link #droppedTrailingBytes}）。
+         * 修前收尾这一侧走的是「按替换字符处理」的分支，而那个替换字符到不了用户面前。
          */
-        private int safeBytePrefix(byte[] raw, boolean endOfInput) throws AiFailure {
+        private int safeBytePrefix(byte[] raw) throws AiFailure {
             int index = 0;
             while (index < raw.length) {
                 int lead = raw[index] & 0xFF;
@@ -891,7 +945,7 @@ public final class AiClient {
                                     + "），为避免显示乱码而停止。请重试，或换一个 base_url。");
                 }
                 if (index + length > raw.length) {
-                    return endOfInput ? raw.length : index; // 多字节字符被切断了
+                    return index; // 多字节字符被切断了（两种情况都交给调用方决定：留着等下一块 / 收尾丢弃）
                 }
                 for (int i = 1; i < length; i++) {
                     if ((raw[index + i] & 0xC0) != 0x80) {

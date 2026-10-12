@@ -3,6 +3,7 @@ package com.xiaoyiyuan.study.ai;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -612,6 +613,134 @@ class AiStreamTest {
     }
 
     // ------------------------------------------------------------------
+    // 6.5 修复轮 2（评审 Blocker-1）：干净收尾时，末尾差一个空行的完整事件必须投递
+    // ------------------------------------------------------------------
+
+    @Test
+    void stream_tailEventWithoutTrailingBlankLine_isStillDelivered() throws Exception {
+        // 评审 §5.6 的最小复现 E/F：第一个事件带尾空行、第二个事件<b>缺</b>尾空行，然后干净收尾
+        // （分块传输的终止块）。SSE 规范要求事件以空行结尾，但库/代理截断与非规范实现都会踩到
+        // ——修前这里静默丢掉「乙」，用户看到「回复不完整」而服务端其实把那段发全了。
+        stub = StreamStub.scripted(List.of(chunk(sse(delta("甲")) + "data: " + delta("乙"), 0)));
+        RecordingListener listener = new RecordingListener();
+
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> client().stream(streamRequest("hi"), listener));
+
+        assertEquals(List.of("甲", "乙"), listener.deltas(),
+                "流终止前已经收在行缓冲里的完整事件必须送达 onDelta；实际：" + listener.deltas());
+        assertEquals(0, listener.completeCount(), "没有 [DONE] 就不是正常结束");
+        assertEquals(AiFailureKind.NETWORK, failure.kind(),
+                "没有 [DONE] 的干净收尾仍按「回复不完整」收场，实际：" + failure.kind());
+        assertTrue(failure.getMessage().contains("回复不完整"), "实际：" + failure.getMessage());
+    }
+
+    @Test
+    void stream_onlyEventWithoutTrailingBlankLine_isDelivered_notReportedAsMALFORMED()
+            throws Exception {
+        // 评审 §5.6 的最小复现 G：整条流只有一个事件，且缺尾空行。修前「一个都收不到」，
+        // 而且因为 sawAnything 为 false 被报成 MALFORMED_RESPONSE「服务端没有按流式（SSE）格式
+        // 返回任何内容」——与服务端实际行为<b>相反</b>，界面会引导用户去查 base_url / 模型。
+        stub = StreamStub.scripted(List.of(chunk("data: " + delta("甲"), 0)));
+        RecordingListener listener = new RecordingListener();
+
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> client().stream(streamRequest("hi"), listener));
+
+        assertEquals(List.of("甲"), listener.deltas(),
+                "唯一一个事件缺尾空行时，它仍然是「已经凑齐」的完整事件；实际：" + listener.deltas());
+        assertNotEquals(AiFailureKind.MALFORMED_RESPONSE, failure.kind(),
+                "收到过正文时不得报「服务端没有按流式格式返回任何内容」；实际：" + failure.kind()
+                        + " / " + failure.getMessage());
+        assertEquals(AiFailureKind.NETWORK, failure.kind(), "实际：" + failure.kind());
+    }
+
+    @Test
+    void stream_contentWasReceived_neverReportsMALFORMED_RESPONSE() throws Exception {
+        // 性质 ③：只要真的收到过正文，「服务端没有按流式格式返回任何内容」这句话就与事实相反。
+        // 三种「收到内容、但没等到 [DONE]」的形状各来一遍（含两个缺尾空行的形态）。
+        for (String body : List.of(
+                sse(delta("甲")) + sse(delta("乙")),       // 两个事件都带尾空行
+                sse(delta("甲")) + "data: " + delta("乙"), // 末尾事件缺尾空行
+                "data: " + delta("甲"))) {                 // 唯一事件缺尾空行
+            stub = StreamStub.scripted(List.of(chunk(body, 0)));
+            RecordingListener listener = new RecordingListener();
+            AiFailure failure = assertThrows(AiFailure.class,
+                    () -> client().stream(streamRequest("hi"), listener),
+                    "没有 [DONE] 时必须失败：" + body);
+            assertFalse(listener.deltas().isEmpty(), "这个形状必须有内容送达：" + body);
+            assertNotEquals(AiFailureKind.MALFORMED_RESPONSE, failure.kind(),
+                    "收到过正文时不得报「服务端没有按流式格式返回任何内容」：" + body + " → "
+                            + failure.kind() + " / " + failure.getMessage());
+            stub.stop();
+            stub = null;
+        }
+    }
+
+    @Test
+    void stream_doneWithoutTrailingBlankLine_stillCompletes() throws Exception {
+        // 同一个性质落在 [DONE] 上：末尾是 [DONE]、缺尾空行 + 干净收尾。修前 done 从未置位，
+        // 于是收场 NETWORK「回复不完整」且 onComplete 一次都不回调。
+        stub = StreamStub.scripted(List.of(chunk(sse(delta("甲")) + "data: [DONE]", 0)));
+        RecordingListener listener = new RecordingListener();
+
+        client().stream(streamRequest("hi"), listener); // 已凑齐 [DONE]：正常返回
+
+        assertEquals(List.of("甲"), listener.deltas());
+        assertEquals(1, listener.completeCount(), "末尾的 [DONE] 已经凑齐就必须收尾");
+        assertEquals("甲", listener.full());
+    }
+
+    @Test
+    void stream_incompleteTailEvent_isDropped_notDeliveredAsBadContent() throws Exception {
+        // 「不完整的尾巴怎么办」的决定：修好 Blocker 之后末尾事件同样要送进解析器，但只有能解析成
+        // JSON（或 [DONE]）的内容才会产生回调。<b>半个事件</b>被丢弃，绝不投递出坏内容；
+        // 已收到的增量不回滚。分类仍是「回复不完整」——服务端确实按 SSE 发了东西，只是末尾截断了。
+        stub = StreamStub.scripted(List.of(chunk(sse(delta("甲")) + "data: {\"choices\":[{", 0)));
+        RecordingListener listener = new RecordingListener();
+
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> client().stream(streamRequest("hi"), listener));
+
+        assertEquals(List.of("甲"), listener.deltas(),
+                "半个事件不得变成增量（也不得变成半个 JSON）：" + listener.deltas());
+        assertFalse(listener.deltas().toString().contains("choices"),
+                "半个事件的内容（含 JSON 片段）绝不能被当成正文投递：" + listener.deltas());
+        assertEquals(0, listener.completeCount());
+        assertEquals(AiFailureKind.NETWORK, failure.kind(),
+                "末尾被截断不能说成「服务端没有按 SSE 返回任何内容」；实际：" + failure.kind()
+                        + " / " + failure.getMessage());
+        assertTrue(failure.getMessage().contains("回复不完整"), "实际：" + failure.getMessage());
+    }
+
+    @Test
+    void stream_cleanEofWithIncompleteTrailingBytes_dropsThemExplicitly() throws Exception {
+        // 修复轮 2 的决定（评审 Minor-4）：干净收尾时剩下的<b>不完整</b>字节序列一律显式丢弃，
+        // 绝不变成 U+FFFD 混进正文——那等于把「半个字节」当成模型输出显示给用户，而原先那个
+        // 替换字符只留在行缓冲里、永远到不了 onDelta/onComplete（评审实测：它是死代码）。
+        // 但「丢弃」这件事本身必须让用户看得见：失败消息里点名有几个字节凑不出一个完整字符。
+        byte[] prefix = "data: {\"choices\":[{\"delta\":{\"content\":\""
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] halfChar = {(byte) 0xE5, (byte) 0xA5}; // 「好」的前两个字节，缺最后一个 BD
+        stub = StreamStub.scripted(List.of(raw(concat(prefix, halfChar), 0)));
+        RecordingListener listener = new RecordingListener();
+
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> client().stream(streamRequest("hi"), listener));
+
+        assertEquals(List.of(), listener.deltas(),
+                "凑不出一个完整字符的尾巴不得变成任何增量；实际：" + listener.deltas());
+        assertFalse(listener.deltas().toString().contains("\uFFFD"),
+                "绝不能凭空造一个 U+FFFD 当正文；实际：" + listener.deltas());
+        assertTrue(failure.getMessage().contains("2 个字节"),
+                "被丢弃的不完整尾巴必须显式说出来（否则它与死代码没有区别）；实际："
+                        + failure.getMessage());
+        assertTrue(failure.getMessage().contains("凑不出一个完整字符"),
+                "消息要点明丢弃的原因；实际：" + failure.getMessage());
+        assertEquals(0, listener.completeCount());
+    }
+
+    // ------------------------------------------------------------------
     // 7. 架构护栏复核：加了流式入口之后仍然拿不到文件写入权
     // ------------------------------------------------------------------
 
@@ -699,8 +828,11 @@ class AiStreamTest {
         try (var children = Files.list(tempDir)) {
             assertEquals(List.of(), children.toList(), "stream 前后 tempDir 必须没有新条目");
         }
-        assertEquals(entriesBefore, entryNames(workingDirectory),
-                "stream 前后工作目录（" + workingDirectory + "）不得出现新条目");
+        Set<String> entriesAfter = entryNames(workingDirectory);
+        assertTrue(entriesAfter.equals(entriesBefore),
+                "stream 前后工作目录（" + workingDirectory + "）的<b>递归</b>快照必须一致"
+                        + "（修复轮 2：只查一层时写到 target/ 之类的子目录会漏）；差异："
+                        + snapshotDifference(entriesBefore, entriesAfter));
     }
 
     // ------------------------------------------------------------------
@@ -804,12 +936,31 @@ class AiStreamTest {
                 HttpClient.newHttpClient());
     }
 
-    /** 一个目录里的条目名集合（「调用前后不得出现新文件」的快照对比用）。 */
+    /**
+     * 一个目录的<b>递归</b>快照：相对路径集合（「调用前后不得出现新文件」的对比用）。
+     *
+     * <p>修复轮 2（评审 §4.4）：只查一层条目名时，写到 {@code <cwd>/target/v.tmp} 这种子目录里
+     * 就会漏——评审实测那时字节码护栏与快照双双全绿、而文件真的被写了出来。递归到每一层，
+     * 写哪儿都会在快照里露面。
+     */
     private static Set<String> entryNames(Path directory) throws IOException {
-        try (var entries = Files.list(directory)) {
-            return entries.map(entry -> entry.getFileName().toString())
+        try (var entries = Files.walk(directory)) {
+            return entries.filter(entry -> !entry.equals(directory))
+                    .map(entry -> directory.relativize(entry).toString())
                     .collect(Collectors.toCollection(TreeSet::new));
         }
+    }
+
+    /** 两份快照的差异（只列新增/消失的相对路径，避免失败信息被几千条条目刷屏）。 */
+    private static String snapshotDifference(Set<String> before, Set<String> after) {
+        Set<String> added = new TreeSet<>(after);
+        added.removeAll(before);
+        Set<String> removed = new TreeSet<>(before);
+        removed.removeAll(after);
+        if (added.isEmpty() && removed.isEmpty()) {
+            return "";
+        }
+        return "新增：" + added + "；消失：" + removed;
     }
 
     private static AiRequest streamRequest(String content) {
@@ -861,6 +1012,13 @@ class AiStreamTest {
 
     private static Chunk chunk(String text, int delayMillis) {
         return new Chunk(text.getBytes(StandardCharsets.UTF_8), delayMillis);
+    }
+
+    /** 把两段字节接起来（构造「只发了半个字符」这种输入时必须按字节拼，不能用 String）。 */
+    private static byte[] concat(byte[] first, byte[] second) {
+        byte[] out = Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, out, first.length, second.length);
+        return out;
     }
 
     private static int freeThenClosedPort() {

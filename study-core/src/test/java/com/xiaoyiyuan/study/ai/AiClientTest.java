@@ -527,7 +527,9 @@ class AiClientTest {
 
         // 修复轮 1（Major-4）：只查 @TempDir 抓不到最省事的那种写法——直接把字符串变成 Path 写到
         // 进程工作目录（评审 M8d：`Files.write(Path.of("cwd-write-probe.tmp"))` 当时全绿，文件却真的
-        // 写出来了）。所以同时快照工作目录的条目集合，调用前后必须完全一致。
+        // 写出来了）。所以同时快照工作目录，调用前后必须完全一致。
+        // 修复轮 2（评审 §4.4）：快照必须是<b>递归</b>的——只查一层条目名时，写到 <cwd>/target/v.tmp
+        // 这种子目录里会双双漏过（评审实测：字节码护栏与快照全绿、文件真的被写了出来）。
         // （没有一并快照 java.io.tmpdir：那是多个进程共用的目录，前后对比会引入 flaky；
         //   方法体内的写入由 aiPackageBytecode_hasNoFileWriteOrProcessExecutionReferences 结构性覆盖。）
         Path workingDirectory = Path.of(System.getProperty("user.dir")).toAbsolutePath();
@@ -540,9 +542,10 @@ class AiClientTest {
         try (Stream<Path> children = Files.list(tempDir)) {
             assertEquals(List.of(), children.toList(), "complete 前后 tempDir 必须没有新条目");
         }
-        assertEquals(entriesBefore, entryNames(workingDirectory),
-                "complete 前后工作目录（" + workingDirectory + "）不得出现新条目；"
-                        + "评审 M8d 就是靠这里漏过去的");
+        Set<String> entriesAfter = entryNames(workingDirectory);
+        assertTrue(entriesAfter.equals(entriesBefore),
+                "complete 前后工作目录（" + workingDirectory + "）的<b>递归</b>快照必须一致；差异："
+                        + snapshotDifference(entriesBefore, entriesAfter));
     }
 
     // ------------------------------------------------------------------
@@ -632,6 +635,38 @@ class AiClientTest {
         assertFalse(worker.isAlive(), "中断后 complete() 必须及时返回，不得把调用线程挂住");
         assertInstanceOf(InterruptedException.class, thrown.get(),
                 "取消必须原样表达为 InterruptedException，实际：" + diag.get());
+    }
+
+    @Test
+    void complete_interruptedWhileWaiting_closesTheConnectionToTheServer() throws Exception {
+        // 修复轮 2（评审 M10 / Minor-2）：complete() 的中断路径此前<b>没有任何</b>「连接是否真的被关」
+        // 的断言——去掉 pending.cancel(true) 之后整个 AiClientTest 50/50 全绿，而那条连接与它的读取
+        // 线程会一直留在后台。桩这里不看客户端抛了什么，只看「往这条连接里再写还会不会成功」：
+        // 写失败 = 对端真的把连接关掉了；一直写成功 = 连接还开着。
+        stub = Stub.hangingBody(10_000_000L, GOOD_BODY, 20_000);
+        AiClient client = new AiClient(config(stub.baseUrl()), HttpClient.newHttpClient());
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            try {
+                client.complete(request("hi"));
+                thrown.set(new AssertionError("中断路径不得正常返回"));
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        }, "ai-complete-cancel-test");
+        worker.setDaemon(true);
+        worker.start();
+
+        awaitTrue("桩必须先把响应头与前半段 body 发出去（客户端这时卡在读完 body 上）",
+                stub::responseCommitted, 5_000);
+        Thread.sleep(200); // 让客户端确实进到「等剩余 body」里
+        worker.interrupt();
+        worker.join(3_000);
+
+        assertFalse(worker.isAlive(), "中断后 complete() 必须及时返回");
+        assertInstanceOf(InterruptedException.class, thrown.get(), "实际：" + thrown.get());
+        awaitTrue("中断必须真的关掉这条 TCP 连接（否则连接与读取线程会留在后台累积）；桩观测到："
+                + stub.disconnectFailure(), stub::disconnectObserved, 5_000);
     }
 
     // ------------------------------------------------------------------
@@ -750,10 +785,60 @@ class AiClientTest {
 
     // ------------------------------------------------------------------
     // 修复轮 1（评审 Major-4）：ai 包的<b>字节码</b>里不得有写文件 / 执行进程
+    // 修复轮 2（评审 Major-1）：补上「纯反射 + 拼接类名」那一半
     // ------------------------------------------------------------------
+
+    /**
+     * 禁止清单之一：<b>包前缀</b>（写文件的入口，以及「纯反射」的入口）。
+     *
+     * <p>每条同时按三种形态匹配：斜杠类名（{@code java/nio/file/Files}）、描述符/签名里的类型
+     * （{@code Ljava/nio/file/Path;}）、以及<b>点号</b>形态（{@code java.nio.file.Files}）。
+     * 点号形态是修复轮 2 补的：{@code Class.forName} / {@code Lookup.findClass} 的实参必须是点号，
+     * 而评审实测「只匹配斜杠形式」时连最平凡的 {@code Class.forName("java.nio.file.Files")}
+     * 都抓不住（上一版报告 §2.4 说它会抓住，那句话不成立）。
+     */
+    private static final List<String> FORBIDDEN_PACKAGE_PREFIXES = List.of(
+            "java/nio/file/",      // Files / Path / Paths / …：写文件的入口
+            "java/io/File",        // File / FileOutputStream / FileWriter …（顺带挡住 InputStream 一侧，偏保守）
+            "java/nio/channels/",  // FileChannel（修复轮 2 增补：评审 §4.5 点名的绕过面）
+            "java/lang/reflect/"); // Method / Constructor / Field / Array：纯反射入口
+
+    /** 与 {@link #FORBIDDEN_PACKAGE_PREFIXES} 一一对应的点号形态。 */
+    private static final List<String> FORBIDDEN_DOTTED_PREFIXES = List.of(
+            "java.nio.file.", "java.io.File", "java.nio.channels.", "java.lang.reflect.");
+
+    /** 必须<b>精确</b>匹配的类：{@code java/lang/RuntimeException} 不是执行进程的能力。 */
+    private static final List<String> FORBIDDEN_EXACT_TYPES = List.of(
+            "java/lang/Runtime", "java/lang/ProcessBuilder", "java/lang/Process");
+
+    /**
+     * 「从一个字符串拿到一个 {@code Class}」的<b>全部</b>入口方法名。
+     *
+     * <p>把类名拆开拼（{@code "java.nio." + "file.Fi" + "les"}）能躲过字面量匹配，但躲不过这层：
+     * 无论怎么拼，最后都要调用这三个方法之一才能把名字变成 {@code Class}——而 {@code Class} 到手之后
+     * 想调用任何方法都要经过 {@code java/lang/reflect/}（拿 {@code Method} 的返回值/描述符），
+     * 那一条已在禁止清单里。{@code java/lang/invoke/*} 刻意<b>不</b>禁止：记录类与 lambda 都要用它。
+     */
+    private static final List<String> FORBIDDEN_CLASS_LOOKUP_METHODS = List.of(
+            "forName",    // java.lang.Class.forName(String)
+            "loadClass",  // java.lang.ClassLoader.loadClass(String)
+            "findClass"); // java.lang.invoke.MethodHandles.Lookup.findClass(String)
 
     @Test
     void aiPackageBytecode_hasNoFileWriteOrProcessExecutionReferences() throws Exception {
+        // 禁止清单本身也要被断言（评审 M4a 实测：清单里少一项时，只靠剩下的前缀仍然全绿）。
+        // 下面四条是<b>等值</b>断言：删掉清单里任一项，这里立刻变红。
+        assertEquals(List.of("java/nio/file/", "java/io/File", "java/nio/channels/",
+                        "java/lang/reflect/"), FORBIDDEN_PACKAGE_PREFIXES,
+                "禁止清单被改动：少一项就等于少守一整类能力");
+        assertEquals(List.of("java.nio.file.", "java.io.File", "java.nio.channels.",
+                        "java.lang.reflect."), FORBIDDEN_DOTTED_PREFIXES,
+                "点号形态清单被改动（Class.forName / findClass 用的就是点号）");
+        assertEquals(List.of("java/lang/Runtime", "java/lang/ProcessBuilder", "java/lang/Process"),
+                FORBIDDEN_EXACT_TYPES, "精确匹配清单被改动");
+        assertEquals(List.of("forName", "loadClass", "findClass"), FORBIDDEN_CLASS_LOOKUP_METHODS,
+                "反射入口清单被改动：少一项就等于「拼接类名」可以绕过");
+
         Path aiClasses = mainClassesDirectory().resolve("com/xiaoyiyuan/study/ai");
         assertTrue(Files.isDirectory(aiClasses), "找不到 ai 包的 class 目录：" + aiClasses);
         List<Path> classFiles;
@@ -764,12 +849,23 @@ class AiClientTest {
         Set<String> names = classFiles.stream().map(entry -> entry.getFileName().toString())
                 .collect(Collectors.toCollection(TreeSet::new));
 
-        // 扫描面本身必须够宽：内部类（AiClient$SseReader）也要扫——方法体完全可能长在里面。
-        // 这条同时是「loader/路径写错时不会变成空转的绿灯」的保险。
+        // 扫描面必须<b>逐个等于</b>磁盘上真实存在的 class 集合（含每个内部类）。
+        // 修复轮 2（评审 M4b）：这里原先只断言「≥ 8 个」+「名字里有 AiClient$SseReader.class」，
+        // 把那条断言改成「扫到 AiClient.class 也算数」之后仍然全绿——也就是说它并没有守住
+        // 「内部类被扫到」。现在用一次独立枚举（递归 walk）做集合等值：少一个（例如把 $ 内部类
+        // 过滤掉）立刻变红。
+        Set<String> onDisk = new TreeSet<>();
+        try (Stream<Path> walked = Files.walk(aiClasses)) {
+            walked.filter(Files::isRegularFile)
+                    .map(path -> path.getFileName().toString())
+                    .filter(name -> name.endsWith(".class"))
+                    .forEach(onDisk::add);
+        }
+        assertEquals(onDisk, names,
+                "扫描面必须逐个等于磁盘上实际存在的 class（含每个内部类，例如 AiClient$SseReader.class"
+                        + " 与 AiClient$SilenceWatchdog.class）；少一个就等于那个类的方法体没被扫");
         assertTrue(names.contains("AiClient$SseReader.class"),
                 "必须连内部类的 class 一起扫，否则方法体藏在内部类里就漏了；实际扫到：" + names);
-        assertTrue(classFiles.size() >= 8,
-                "ai 包的 class 个数不对（扫不到东西时不能算通过）：" + names);
 
         Set<String> offenders = new LinkedHashSet<>();
         int scannedConstants = 0;
@@ -789,8 +885,34 @@ class AiClientTest {
         assertTrue(scannedConstants > 100,
                 "常量池里一条字符串都没扫到（解析器坏了会变成空转的绿灯）：" + scannedConstants);
         assertTrue(offenders.isEmpty(),
-                "ai 包的字节码里不得出现「写文件 / 执行进程」的引用（spec §3.3 / §7.5）；命中："
+                "ai 包的字节码里不得出现「写文件 / 执行进程 / 纯反射」的引用（spec §3.3 / §7.5）；命中："
                         + offenders);
+
+        // 阳性对照（修复轮 2 新增的三类绕过形态都必须被这条判定抓住）
+        assertNotEquals(null, forbiddenReference("java/nio/channels/FileChannel"),
+                "FileChannel 必须被挡住");
+        assertNotEquals(null, forbiddenReference("java/lang/reflect/Method"),
+                "反射入口必须被挡住（纯反射写文件的必经之路）");
+        assertNotEquals(null, forbiddenReference("java.nio.file.Files"),
+                "点号形态必须被挡住（Class.forName 的实参就是这个形状）");
+        assertNotEquals(null, forbiddenReference("java.nio.channels.FileChannel"),
+                "点号形态的 FileChannel 必须被挡住");
+        assertNotEquals(null, forbiddenReference("java.lang.reflect.Method"),
+                "点号形态的反射入口必须被挡住");
+        assertNotEquals(null, forbiddenReference("forName"), "Class.forName 必须被挡住");
+        assertNotEquals(null, forbiddenReference("findClass"),
+                "MethodHandles.Lookup.findClass 必须被挡住（拼接类名的另一条路）");
+
+        // 阴性对照：合法引用不得被误伤（记录类与 lambda 都要走 java/lang/invoke）
+        assertEquals(null, forbiddenReference("java/lang/RuntimeException"));
+        assertEquals(null, forbiddenReference("java/io/IOException"));
+        assertEquals(null, forbiddenReference("java/util/List"));
+        assertEquals(null, forbiddenReference("java/lang/invoke/LambdaMetafactory"));
+        assertEquals(null, forbiddenReference("java/lang/invoke/MethodHandles$Lookup"));
+        assertEquals(null, forbiddenReference("java/nio/ByteBuffer"));
+        assertEquals(null, forbiddenReference("java/nio/CharBuffer"));
+        assertEquals(null, forbiddenReference("java/lang/ClassLoader"));
+        assertEquals(null, forbiddenReference("java/lang/Class"));
 
         // 阳性对照：同一个解析器必须能读出 AiClient 真的引用的类（否则「什么都没扫到」也会绿）
         List<String> clientConstants =
@@ -1080,6 +1202,19 @@ class AiClientTest {
         }
     }
 
+    /** 轮询等待一个条件成立（本地桩是异步的）：超时抛 {@link AssertionError}。 */
+    private static void awaitTrue(String what, java.util.function.BooleanSupplier condition,
+            long timeoutMillis) throws Exception {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("等待超时（" + timeoutMillis + "ms）：" + what);
+    }
+
     /** 生产 class 目录：由 {@code AiClient} 自己的 CodeSource 决定，不依赖工作目录。 */
     private static Path mainClassesDirectory() {
         URL location = AiClient.class.getProtectionDomain().getCodeSource().getLocation();
@@ -1120,40 +1255,71 @@ class AiClientTest {
     }
 
     /**
-     * 一条常量池字符串是否指向「写文件 / 执行进程」；命中就返回命中的那一段，否则 {@code null}。
+     * 一条常量池字符串是否指向「写文件 / 执行进程 / 纯反射」；命中就返回命中的那一段，否则 {@code null}。
      *
-     * <p>同时匹配类名常量（{@code java/nio/file/Files}）与描述符/签名里的类型
-     * （{@code Ljava/nio/file/Path;}、{@code ()Ljava/nio/file/Path;}）——
-     * 后者是「签名里没有 Path、方法体里却有」的情形，也是评审 M8d 的形状。
-     *
-     * <p>{@code java/lang/Runtime} 必须<b>精确</b>匹配：{@code java/lang/RuntimeException}
-     * 是普通异常，不是执行进程的能力（评审 §1.8 也点了这一条）。
+     * <p>四类判定，覆盖评审实测过的全部绕过形态：
+     * <ol>
+     *   <li><b>斜杠类名与描述符</b>（修复轮 1）：{@code java/nio/file/Files}、
+     *       {@code Ljava/nio/file/Path;}、{@code ()Ljava/nio/file/Path;}；</li>
+     *   <li><b>点号形态</b>（修复轮 2）：{@code java.nio.file.Files}——{@code Class.forName} /
+     *       {@code Lookup.findClass} 的实参只能是点号，这是最有价值的信号之一；</li>
+     *   <li><b>精确类名</b>（修复轮 1）：{@code Runtime} / {@code ProcessBuilder} / {@code Process}。
+     *       {@code Runtime} 必须精确匹配，否则 {@code RuntimeException} 会被误伤；</li>
+     *   <li><b>反射入口方法名</b>（修复轮 2）：把类名拆开拼也躲不过这几个名字。</li>
+     * </ol>
      */
     private static String forbiddenReference(String constant) {
-        for (String prefix : List.of("java/nio/file/", "java/io/File")) {
+        for (String prefix : FORBIDDEN_PACKAGE_PREFIXES) {
             if (constant.startsWith(prefix)
                     || constant.contains("L" + prefix)
                     || constant.contains("[" + prefix)) {
                 return prefix;
             }
         }
-        for (String exact : List.of("java/lang/Runtime", "java/lang/ProcessBuilder",
-                "java/lang/Process")) {
+        for (String dotted : FORBIDDEN_DOTTED_PREFIXES) {
+            if (constant.contains(dotted)) {
+                return dotted;
+            }
+        }
+        for (String exact : FORBIDDEN_EXACT_TYPES) {
             if (constant.equals(exact)
                     || constant.contains("L" + exact + ";")
                     || constant.contains(")" + exact)) {
                 return exact;
             }
         }
+        for (String lookup : FORBIDDEN_CLASS_LOOKUP_METHODS) {
+            if (constant.equals(lookup)) {
+                return lookup;
+            }
+        }
         return null;
     }
 
-    /** 一个目录里的条目名集合（用于「调用前后不得出现新文件」这类快照对比）。 */
+    /**
+     * {@code user.dir} 的<b>递归</b>快照：相对路径集合。
+     *
+     * <p>修复轮 2（评审 §4.4）：只查一层条目名时，写到 {@code <cwd>/target/v.tmp} 这种子目录里
+     * 就漏了——评审实测那时字节码护栏与快照双双全绿、而文件真的被写了出来。
+     */
     private static Set<String> entryNames(Path directory) throws IOException {
-        try (Stream<Path> entries = Files.list(directory)) {
-            return entries.map(entry -> entry.getFileName().toString())
+        try (Stream<Path> entries = Files.walk(directory)) {
+            return entries.filter(entry -> !entry.equals(directory))
+                    .map(entry -> directory.relativize(entry).toString())
                     .collect(Collectors.toCollection(TreeSet::new));
         }
+    }
+
+    /** 两份快照的差异（只列新增/消失的相对路径，避免失败信息被几千条条目刷屏）。 */
+    private static String snapshotDifference(Set<String> before, Set<String> after) {
+        Set<String> added = new TreeSet<>(after);
+        added.removeAll(before);
+        Set<String> removed = new TreeSet<>(before);
+        removed.removeAll(after);
+        if (added.isEmpty() && removed.isEmpty()) {
+            return "";
+        }
+        return "新增：" + added + "；消失：" + removed;
     }
 
     /** 断言某状态码/响应体被归类成 {@code kind}，且消息里带上给定的每一段具体内容。 */
@@ -1260,6 +1426,9 @@ class AiClientTest {
         private final List<String> methods = new ArrayList<>();
         private final List<String> bodies = new ArrayList<>();
         private final List<Map<String, List<String>>> headers = new ArrayList<>();
+        private final AtomicBoolean responseCommitted = new AtomicBoolean();
+        private final AtomicBoolean disconnected = new AtomicBoolean();
+        private final AtomicReference<String> disconnectFailure = new AtomicReference<>();
 
         private Stub(HttpServer server, ExecutorService executor) {
             this.server = server;
@@ -1318,6 +1487,51 @@ class AiClientTest {
          */
         static Stub overlongContentLength(long declaredLength, String body) throws IOException {
             return lyingContentLength(declaredLength, body, 0);
+        }
+
+        /**
+         * 修复轮 2（评审 M10）：发响应头、写一小段 body，然后<b>持续往响应体里写</b>。
+         *
+         * <p>客户端若真的把这条连接收掉了，下一次写就会以 {@link IOException} 失败——桩以此给出
+         * 「连接真的被关」的证据，而不是只看客户端有没有抛异常。写一直成功则说明连接还活着
+         * （中断路径没关连接时就是这样，然后那条连接的读取会永远留在后台）。
+         */
+        static Stub hangingBody(long declaredLength, String partialBody, int holdMillis)
+                throws IOException {
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            Stub stub = new Stub(server, executor);
+            server.createContext("/", exchange -> {
+                stub.record(exchange);
+                byte[] payload = partialBody.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, declaredLength);
+                OutputStream out = exchange.getResponseBody();
+                out.write(payload);
+                out.flush();
+                stub.responseCommitted.set(true);
+                long deadline = System.nanoTime() + holdMillis * 1_000_000L;
+                try {
+                    while (System.nanoTime() < deadline) {
+                        Thread.sleep(20);
+                        out.write('x');
+                        out.flush();
+                    }
+                } catch (IOException clientGone) {
+                    stub.markDisconnected(clientGone);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    try {
+                        out.close();
+                    } catch (IOException ignored) {
+                        // 客户端已断开时关闭流同样会抛；这不是桩的问题
+                    }
+                }
+            });
+            server.setExecutor(executor);
+            server.start();
+            return stub;
         }
 
         /** 修复轮 1：指定状态码 + {@code Location} 头（3xx 分类用），响应体长度为 0。 */
@@ -1438,6 +1652,27 @@ class AiClientTest {
 
         int requestCount() {
             return paths.size();
+        }
+
+        /** 桩是否已经把响应头与前半段 body 发出去了（客户端此时卡在读完 body 上）。 */
+        boolean responseCommitted() {
+            return responseCommitted.get();
+        }
+
+        /** 桩是否观测到「客户端关掉了这条连接」（继续写响应体时失败）。 */
+        boolean disconnectObserved() {
+            return disconnected.get();
+        }
+
+        String disconnectFailure() {
+            return disconnectFailure.get();
+        }
+
+        private void markDisconnected(Throwable cause) {
+            if (disconnected.compareAndSet(false, true)) {
+                disconnectFailure.set(cause.getClass().getSimpleName()
+                        + (cause.getMessage() == null ? "" : "：" + cause.getMessage()));
+            }
         }
 
         void stop() {
