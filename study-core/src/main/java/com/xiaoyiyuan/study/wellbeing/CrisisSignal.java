@@ -9,15 +9,16 @@ import java.util.Locale;
  *
  * <p><b>只装事实，不装文案。</b>它说的只有两件事：是否命中、命中了哪些词。
  * 面板上的每一句用户可见的话都由<b>界面</b>渲染（计划 3），并且必须中性：无红色、
- * 无「警告」、不追问、不评判。判定层一旦开始生成文案，这句约束就散落成两处实现，
+ * 无告警措辞、不追问、不评判。判定层一旦开始生成文案，这句约束就散落成两处实现，
  * 迟早有一处漂移成「你看起来很糟糕」。
  *
- * <p><b>命中词保持输入原文的字面</b>（只做去空白、按 {@link Locale#ROOT} 折小写）。
- * 界面因此能如实告诉用户「是哪个词触发了这个面板」——透明换来信任，
- * 也换来用户知道「下次怎么写可以不触发」的可能。重写成别的说法就做不到了。
+ * <p><b>命中词是关键词表里的字面</b>（已折小写、已去掉空白与不可见字符），界面上因此能
+ * 如实告诉用户「是哪个词触发了这个面板」——透明换来信任，也换来用户知道「下次怎么写可以
+ * 不触发」的可能。重写成别的说法就做不到了。注意命中词<b>不一定</b>是输入原文的连续子串：
+ * 输入「自 杀」时命中的是词表里的「自杀」，判定正是建立在归一形式上的（见 {@code CrisisDetector}）。
  *
  * <p>{@code null} 列表归一化为空列表，元素里的 {@code null} 与空白项直接丢弃：
- * 「没命中」只有「空列表」一种表示，调用方不必写两处判空。
+ * 「未命中」只有「空列表」一种表示，调用方不必写两处判空。
  *
  * <p><b>刻意没有「阻止继续」这一类字段。</b>spec §6.5 的关键决定是「命中不阻断 AI」：
  * 不锁定、不中断、不强制。若将来有人想加 {@code blocked()}，请先读那一节——
@@ -27,8 +28,9 @@ import java.util.Locale;
  * <p>列表是 {@link List#copyOf} 出来的，不可变、防御性拷贝：判定之后没人能改这次的结果。
  *
  * @param triggered       是否命中任一关键词；命中即为 {@code true}，与命中词的多少无关
- * @param matchedKeywords 命中的关键词，按它们在关键词表里的顺序；
- *                        无命中时为空列表；元素是输入原文里的字面，不是判定层生成的词
+ * @param matchedKeywords 命中的关键词，按它们在关键词表里的顺序；无命中时为空列表；
+ *                        元素是关键词表的字面（已折小写、已去空白与不可见字符），
+ *                        不是判定层生成的词，也不是输入原文的任意片段
  */
 public record CrisisSignal(boolean triggered, List<String> matchedKeywords) {
 
@@ -55,7 +57,7 @@ public record CrisisSignal(boolean triggered, List<String> matchedKeywords) {
         return !triggered;
     }
 
-    /** 便于定位失败：把命中词原样带出来，而不是打印一个对象地址。 */
+    /** 便于定位问题：把命中词原样带出来，而不是打印一个对象地址。 */
     @Override
     public String toString() {
         return "CrisisSignal[triggered=" + triggered + ", matchedKeywords=" + matchedKeywords + "]";
