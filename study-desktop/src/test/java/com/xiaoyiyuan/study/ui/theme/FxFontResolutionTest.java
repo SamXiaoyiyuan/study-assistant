@@ -192,6 +192,39 @@ class FxFontResolutionTest {
     }
 
     @Test
+    void tickLabelFontSize_isALiveFontSubProperty_notDeadCode() {
+        // 评审的 M12：把 app.css 的 `-fx-tick-label-font-size: 0.87em` 改成 0.88em → 56 条全绿，
+        // 据此判定它是「死代码」。实测**相反**：JavaFX 的 `FontCssMetaData("-fx-tick-label-font")`
+        // 会自动派生 `-fx-tick-label-font-size` 等子属性（javafx.css.FontCssMetaData 源码注释：
+        // "includes the font sub-properties: weight, style, family and size"），0.87em 真的生效。
+        // 所以正确的修法不是删掉它，而是把它纳入「字号字面值 == 某个 -fx-fs-* 令牌值」的焊接
+        // （ColorAuditTest.appCssFontSizes_useLiteralEmValuesThatEqualTheirDesignTokens 已扩到所有 -fx-*font-size）。
+        for (ThemeMode mode : ThemeMode.values()) {
+            javafx.scene.chart.NumberAxis axis = new javafx.scene.chart.NumberAxis();
+            javafx.scene.chart.LineChart<Number, Number> chart =
+                    new javafx.scene.chart.LineChart<>(axis, new javafx.scene.chart.NumberAxis());
+            Scene scene = new Scene(new StackPane(chart), 600, 400);
+            scene.getStylesheets().setAll(ThemeTokens.cssFiles(mode).stream()
+                    .map(path -> ThemeTokens.class.getResource(path).toExternalForm())
+                    .toList());
+            chart.applyCss();
+            chart.layout();
+
+            Font tick = axis.getTickLabelFont();
+            double captionEm = Double.parseDouble(
+                    ThemeTokens.nonColorValue("-fx-fs-caption", mode).replace("em", ""));
+            double expected = captionEm * JavaFontResolver.rootFontSizePx();
+            System.out.println("[evidence] " + mode + " 坐标轴刻度字体 = " + tick
+                    + "（-fx-fs-caption=" + captionEm + "em × 根字号 " + JavaFontResolver.rootFontSizePx() + "px = " + expected + "）");
+
+            assertEquals(expected, tick.getSize(), 0.1,
+                    mode + " 主题：-fx-tick-label-font-size 必须按 -fx-fs-caption × 根字号生效，实测 " + tick.getSize());
+            assertNotEquals(8.0, tick.getSize(),
+                    "若等于 8.0，说明刻度退回了 JavaFX 的默认 Font(\"System\",8)——那才是「死代码」的样子");
+        }
+    }
+
+    @Test
     void safeFamilyName_rejectsInlineStyleInjection() {
         assertEquals("Microsoft YaHei", JavaFontResolver.safeFamilyName("Microsoft YaHei"));
         for (String bad : List.of("Bad\"Name", "Bad;Name", "Bad{Name", "Bad}Name", "Bad'Name")) {

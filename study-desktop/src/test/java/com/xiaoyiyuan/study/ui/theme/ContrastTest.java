@@ -129,15 +129,151 @@ class ContrastTest {
         }
     }
 
+    // ---------------------------------------------------------------- 图表序列色 vs 绘图区
+
+    @Test
+    void chartSeriesColors_reach3To1AgainstThePlotArea_inBothThemes() {
+        // 指南 §6.1 要求「图表数据线 vs 绘图区 ≥ 3:1」；绘图区底是 app.css 的
+        // .chart-plot-background { -fx-background-color: -fx-c-surface; }。
+        // 评审指出这条以前从未被断言（实测 3.27 / 3.80 达标，但属碰巧）。
+        record Lowest(String chart, String value, String ratio) {
+        }
+        for (ThemeMode mode : ThemeMode.values()) {
+            String plot = value(mode, ThemeTokens.SURFACE);
+            Lowest lowest = null;
+            for (int i = 1; i <= 8; i++) {
+                String key = "CHART_COLOR_" + i;
+                // 注意：不能用 tokens(mode)（那是 projectColors，只含 -fx-c-*）
+                String v = CssTokens.byProperty("/css/tokens-"
+                        + mode.name().toLowerCase(java.util.Locale.ROOT) + ".css").get(key);
+                assertTrue(v != null, mode + " 主题的令牌文件里缺少 " + key);
+                v = v.toUpperCase(java.util.Locale.ROOT);
+                double ratio = WcagContrast.ratio(v, plot);
+                assertTrue(ratio >= 3.0,
+                        mode + " 主题：" + key + " (" + v + ") 对绘图区 " + ThemeTokens.SURFACE.key() + " (" + plot
+                                + ") 必须 ≥ 3:1（指南 §6.1），实算 " + WcagContrast.fmt(ratio) + ":1");
+                if (lowest == null || WcagContrast.fmt(ratio).compareTo(lowest.ratio()) < 0) {
+                    lowest = new Lowest(key, v, WcagContrast.fmt(ratio));
+                }
+            }
+            System.out.println("[evidence] " + mode + " 图表序列色对绘图区最低者 = " + lowest.chart()
+                    + " " + lowest.value() + " = " + lowest.ratio() + ":1");
+            // 评审独立重算的两个最低值（明 CHART_COLOR_7 #8F8CA0 = 3.27、暗 CHART_COLOR_7 #737A8E = 3.80）
+            assertEquals(mode == ThemeMode.LIGHT ? "3.27" : "3.80", lowest.ratio(),
+                    mode + " 主题：图表序列色对绘图区的最低值（评审独立重算的实测值）");
+        }
+    }
+
+    // ---------------------------------------------------------------- 危机面板：正文必须落在 crisis-bg 上
+
+    /** app.css 里某个选择器的某个属性值；解析不到就直接失败，不允许静默跳过。 */
+    static String appCssValue(String selector, String property) {
+        for (CssTokens.Decl d : CssTokens.parse("/css/app.css")) {
+            if (d.selector().equals(selector) && d.property().equals(property)) {
+                return d.rawValue();
+            }
+        }
+        throw new AssertionError("app.css 的 " + selector + " 里找不到 " + property + " 声明");
+    }
+
+    /** 逗号分隔的层列表（{@code -fx-background-color} / {@code -fx-background-insets}）。 */
+    static List<String> commaSeparated(String value) {
+        return java.util.Arrays.stream(value.split(",")).map(String::trim).toList();
+    }
+
+    /** {@code "0 0 0 0.2em"} → {top,right,bottom,left}；1 值简写复制成 4 份，2 值按 CSS 规则展开。 */
+    static List<String> fourSides(String value) {
+        List<String> parts = java.util.Arrays.stream(value.trim().split("\\s+")).toList();
+        return switch (parts.size()) {
+            case 1 -> List.of(parts.get(0), parts.get(0), parts.get(0), parts.get(0));
+            case 2 -> List.of(parts.get(0), parts.get(1), parts.get(0), parts.get(1));
+            case 3 -> List.of(parts.get(0), parts.get(1), parts.get(2), parts.get(1));
+            case 4 -> parts;
+            default -> throw new AssertionError("不是合法的 CSS 四边值：" + value);
+        };
+    }
+
+    static double em(String value) {
+        assertTrue(value.endsWith("em"), "只接受 em 值，实际：" + value);
+        return Double.parseDouble(value.substring(0, value.length() - 2));
+    }
+
+    @Test
+    void crisisPanelTextIsAlwaysOnCrisisBg_andTheAccentBarIsOnlyANarrowLeftStrip() {
+        // 这份 CSS 的两层背景：第 1 层（更底层）= 色条，第 2 层（更上层）= 面板底。
+        // 本机实测（task-1-fix1-report.md 的探针输出）：**后声明的那层画在上面**，
+        // 所以「正文落在哪层背景上」由第 2 层决定；两层 insets 相同时第 1 层会被完全盖住。
+        assertEquals(List.of("-fx-c-crisis-bar", "-fx-c-crisis-bg"),
+                commaSeparated(appCssValue(".crisis-panel", "-fx-background-color")),
+                "app.css 的 .crisis-panel 必须把色条放在更底层、暖砂底放在更上层");
+
+        List<String> insets = commaSeparated(appCssValue(".crisis-panel", "-fx-background-insets"));
+        assertEquals(2, insets.size(), "两层背景必须各给一组 insets，实际 " + insets);
+        assertEquals(List.of("0", "0", "0", "0"), fourSides(insets.get(0)),
+                "色条层必须铺满整块面板（上层再把它裁成窄条），实际 " + insets.get(0));
+        List<String> bodyInsets = fourSides(insets.get(1));
+        assertEquals(List.of("0", "0", "0", "0.2em"), bodyInsets,
+                "面板底层必须只从左内缩 0.2em（= 根字号 15px 下的 3 逻辑像素色条），其余三边铺满，实际 "
+                        + insets.get(1));
+        assertTrue(em(bodyInsets.get(3)) > 0,
+                "面板底的左内缩必须 > 0，否则色条被完全盖住（实测色条消失、面板失去唯一可识别边界）");
+
+        // 正文的左边距必须大于色条宽度：-fx-padding 必须写字面 em
+        // （实测：`-fx-padding: -fx-sp-4 ...` 在 JavaFX 25 下抛 ClassCastException 后被忽略，见报告 N1）
+        List<String> padding = fourSides(appCssValue(".crisis-panel", "-fx-padding"));
+        assertTrue(padding.stream().noneMatch(v -> v.startsWith("-fx-")),
+                ".crisis-panel 的 -fx-padding 必须写字面 em（-fx-sp-* 查找值对 -fx-padding 无效），实际 " + padding);
+        assertEquals(List.of(ThemeTokens.nonColorValue("-fx-sp-4", ThemeMode.LIGHT),
+                        ThemeTokens.nonColorValue("-fx-sp-4", ThemeMode.LIGHT),
+                        ThemeTokens.nonColorValue("-fx-sp-4", ThemeMode.LIGHT),
+                        ThemeTokens.nonColorValue("-fx-sp-5", ThemeMode.LIGHT)),
+                padding,
+                ".crisis-panel 的字面 em 内边距必须等于 -fx-sp-4 / -fx-sp-5（上右下 = sp-4，左 = sp-5），实际 " + padding);
+        assertTrue(em(padding.get(3)) > em(bodyInsets.get(3)),
+                "正文左内边距必须大于色条宽度，实际 padding-left=" + padding.get(3)
+                        + " 色条=" + bodyInsets.get(3));
+
+        // 正文只能落在 crisis-bg 上；色条若铺满，正文会掉到远低于 4.5:1
+        for (ThemeMode mode : ThemeMode.values()) {
+            String text = value(mode, ThemeTokens.CRISIS_TEXT);
+            String meta = value(mode, ThemeTokens.CRISIS_META);
+            String bg = value(mode, ThemeTokens.CRISIS_BG);
+            String bar = value(mode, ThemeTokens.CRISIS_BAR);
+            double textOnBg = WcagContrast.ratio(text, bg);
+            double metaOnBg = WcagContrast.ratio(meta, bg);
+            double textOnBar = WcagContrast.ratio(text, bar);
+            double metaOnBar = WcagContrast.ratio(meta, bar);
+            System.out.println("[evidence] " + mode + " 危机面板：text on bg=" + WcagContrast.fmt(textOnBg)
+                    + " meta on bg=" + WcagContrast.fmt(metaOnBg)
+                    + " | 若色条铺满：text on bar=" + WcagContrast.fmt(textOnBar)
+                    + " meta on bar=" + WcagContrast.fmt(metaOnBar));
+
+            assertTrue(textOnBg >= 4.5,
+                    mode + " 主题：正文 " + text + " 于面板底 " + bg + " 必须 ≥ 4.5:1，实算 "
+                            + WcagContrast.fmt(textOnBg) + ":1");
+            assertTrue(metaOnBg >= 4.5,
+                    mode + " 主题：元信息 " + meta + " 于面板底 " + bg + " 必须 ≥ 4.5:1，实算 "
+                            + WcagContrast.fmt(metaOnBg) + ":1");
+            assertTrue(textOnBar < 4.5 && metaOnBar < 4.5,
+                    mode + " 主题：色条色本身绝不能当正文底（实测 text=" + WcagContrast.fmt(textOnBar)
+                            + ":1 meta=" + WcagContrast.fmt(metaOnBar) + ":1，都远低于 4.5）——"
+                            + "所以上面两条 insets/padding 断言不是形式主义，它们正是这条红线的唯一守卫");
+        }
+    }
+
     // ---------------------------------------------------------------- 指南的转述数字：自算值与它不一致的地方如实记录
 
     @Test
     void guidelineTranscribedNumbers_thatDisagreeWithMyOwnComputation_areExactlyThese() {
         // 这条断言的含义是「自算值与指南一致的部分，必须逐位一致」：将来任何颜色被改动，就会红。
-        // 指南里有三行的转述数字与本机实算**不符**，它们不进这张表，而是单独列在下面：
-        //   ① 指南 §6.1 说暗色 border-subtle 1.25:1，本机实算 1.38:1
-        //   ② 指南未给暗色 text-tertiary 于次级面的数字，本机实算 4.74:1（仍 ≥ 4.5:1）
-        //   ③ 指南 §1.1 说暗色 notice-text 于提示底 9.83:1 —— 这条本机实算**就是 9.83**，
+        // 指南里有几行的转述数字与本机实算**不符**，它们不进这张表，而是单独列在下面：
+        //   ① 指南 §6.1 说暗色 border-subtle 1.25:1，本机实算 1.38:1（指南的 1.25 是对 surface #1E2027）
+        //   ② 指南 §6.1 说明色 border-subtle 1.29:1，本机实算 1.20:1（指南的 1.29 是对 surface #FFFFFF）
+        //      —— 2026-10-14 fix round 1 已把指南这两处改成「对页底」的数字，并把这两个自算值钉在这里
+        //   ③ 指南 §6.1 说「图表线 vs 绘图区 暗 8.33:1」，本机实算 7.57:1（指南的 8.33 是对**页底** #16171C；
+        //      绘图区是 -fx-c-surface，所以正确值是 7.57）—— 指南已改正，这里钉自算值
+        //   ④ 指南未给暗色 text-tertiary 于次级面的数字，本机实算 4.74:1（仍 ≥ 4.5:1）
+        //   ⑤ 指南 §1.1 说暗色 notice-text 于提示底 9.83:1 —— 这条本机实算**就是 9.83**，
         //      与 §6.1 里 accent-hover 的 9.83 重复只是同一个巧合，不是抄写错误
         //      （第一版测试里把期望写成 11.42 是我自己的笔误，已被这次实跑纠正）
         record Sample(String label, ThemeMode mode, String fgKey, String bgKey, String computed) {
@@ -154,7 +290,11 @@ class ContrastTest {
                 new Sample("crisis-text on crisis-bg", ThemeMode.DARK, "-fx-c-crisis-text", "-fx-c-crisis-bg", "11.08"),
                 new Sample("crisis-bar on crisis-bg", ThemeMode.LIGHT, "-fx-c-crisis-bar", "-fx-c-crisis-bg", "4.79"),
                 new Sample("border-control on surface", ThemeMode.LIGHT, "-fx-c-border-control", "-fx-c-surface", "3.27"),
-                new Sample("border-control on surface", ThemeMode.DARK, "-fx-c-border-control", "-fx-c-surface", "3.80"));
+                new Sample("border-control on surface", ThemeMode.DARK, "-fx-c-border-control", "-fx-c-surface", "3.80"),
+                // 2026-10-14 fix round 1 修正后的指南 §6.1 两条（对页底 / 对绘图区）
+                new Sample("state-active on surface（绘图区）", ThemeMode.DARK, "-fx-c-state-active", "-fx-c-surface", "7.57"),
+                new Sample("border-subtle on bg（指南已把 1.29 改为对页底的 1.20）", ThemeMode.LIGHT,
+                        "-fx-c-border-subtle", "-fx-c-bg", "1.20"));
         for (Sample s : samples) {
             String fg = tokens(s.mode()).get(s.fgKey());
             String bg = tokens(s.mode()).get(s.bgKey());
@@ -164,10 +304,22 @@ class ContrastTest {
                             + WcagContrast.fmt(actual) + ":1");
         }
 
-        // 与指南不符的两条，明确钉住「本机自算值是多少」，免得被误当成抄写错误改回去
+        // 与指南**修正前**不符的条目，明确钉住「本机自算值是多少」，免得被误当成抄写错误改回去。
+        // ① 暗色 border-subtle 对页底 = 1.38（指南修正前写 1.25，那个数字是对 surface）
+        // ② 明色 border-subtle 对页底 = 1.20（指南修正前写 1.29，那个数字是对 surface）
         assertEquals("1.38", WcagContrast.fmt(WcagContrast.ratio(
                 tokens(ThemeMode.DARK).get("-fx-c-border-subtle"), tokens(ThemeMode.DARK).get("-fx-c-bg"))),
-                "指南 §6.1 说暗色 border-subtle 1.25:1，本机实算是这个数（装饰性元素，无对比度要求）");
+                "暗色 border-subtle 对页底的实算值（装饰性元素，无对比度要求）");
+        assertEquals("1.20", WcagContrast.fmt(WcagContrast.ratio(
+                tokens(ThemeMode.LIGHT).get("-fx-c-border-subtle"), tokens(ThemeMode.LIGHT).get("-fx-c-bg"))),
+                "明色 border-subtle 对页底的实算值（1.29 是对 surface #FFFFFF，不是对页底）");
+        // ③ 暗色图表线对**绘图区** = 7.57（指南修正前写 8.33，那个数字是对页底 #16171C）
+        assertEquals("7.57", WcagContrast.fmt(WcagContrast.ratio(
+                tokens(ThemeMode.DARK).get("-fx-c-state-active"), tokens(ThemeMode.DARK).get("-fx-c-surface"))),
+                "暗色图表数据线对绘图区（-fx-c-surface）的实算值（8.33 是对页底 -fx-c-bg）");
+        assertEquals("8.33", WcagContrast.fmt(WcagContrast.ratio(
+                tokens(ThemeMode.DARK).get("-fx-c-state-active"), tokens(ThemeMode.DARK).get("-fx-c-bg"))),
+                "同一个暗色图表线对**页底**才是 8.33——这两个数字必须分开记，混用就是这次 fix 的根因");
         assertEquals("4.74", WcagContrast.fmt(WcagContrast.ratio(
                 tokens(ThemeMode.DARK).get("-fx-c-text-tertiary"), tokens(ThemeMode.DARK).get("-fx-c-surface-muted"))),
                 "暗色 text-tertiary 于次级面：指南未给数字，本机实算是这个（仍 ≥ 4.5:1）");

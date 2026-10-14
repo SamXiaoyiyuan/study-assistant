@@ -1,6 +1,7 @@
 package com.xiaoyiyuan.study.ui.theme;
 
 import java.lang.ref.WeakReference;
+import java.util.Map;
 import java.util.Objects;
 
 import javafx.scene.Scene;
@@ -102,22 +103,44 @@ public final class ThemeManager {
     }
 
     /**
-     * 自检：每个 {@link ThemeTokens} 在<b>两个模式</b>下都能解析到合法 {@code #RRGGBB}。
+     * 自检：每个 {@link ThemeTokens} 在<b>两个模式</b>下的解析结果都是合法 {@code #RRGGBB}。
      *
      * <p>后续任务（外壳启动、打包验收）用它把「样式表键集合是否完整」变成一个可断言的布尔值。</p>
      *
      * @return 全部解析成功为 {@code true}
      */
     public boolean verifyAllTokensResolve() {
+        return verify(ThemeTokens::values);
+    }
+
+    /** 合法令牌值的形态：井号 + 六位十六进制（与 {@code ThemeTokensTest} 逐条断言的格式一致）。 */
+    private static final java.util.regex.Pattern TOKEN_VALUE =
+            java.util.regex.Pattern.compile("#[0-9A-Fa-f]{6}");
+
+    /**
+     * {@link #verifyAllTokensResolve()} 的<b>可注入</b>形式：给定「主题模式 → 令牌表」的取数函数，
+     * 逐项检查两个模式下的每个 {@link ThemeTokens}。
+     *
+     * <p>抽成这个方法是为了让<b>失败分支真的能被测到</b>：评审的 M15 证明旧版实现里
+     * 「令牌缺失就返回 false」这条路径没有任何测试（把 {@code catch} 改成 {@code return true}
+     * 之后 56 条全绿）。测试现在可以注入三份故意坏掉的取数函数——缺键、值不是 {@code #RRGGBB}、
+     * 取数本身抛异常——让三条失败分支各自承重。</p>
+     *
+     * @param loader 主题模式 → 令牌表（生产路径是 {@link ThemeTokens#values(ThemeMode)}）
+     * @return 两个模式下全部令牌都取到合法值为 {@code true}；缺键、值非法、取数失败都为 {@code false}
+     */
+    static boolean verify(java.util.function.Function<ThemeMode, Map<String, String>> loader) {
         for (ThemeMode mode : ThemeMode.values()) {
+            Map<String, String> parsed;
+            try {
+                parsed = loader.apply(mode);
+            } catch (RuntimeException e) {
+                // 资源缺失 / 解析失败也算「没能解析」，不把异常漏给调用方
+                return false;
+            }
             for (ThemeTokens token : ThemeTokens.values()) {
-                String value;
-                try {
-                    value = ThemeTokens.valueOf(token, mode);
-                } catch (RuntimeException e) {
-                    return false;
-                }
-                if (value == null || !value.matches("#[0-9A-Fa-f]{6}")) {
+                String value = parsed.get(token.key());
+                if (value == null || !TOKEN_VALUE.matcher(value).matches()) {
                     return false;
                 }
             }

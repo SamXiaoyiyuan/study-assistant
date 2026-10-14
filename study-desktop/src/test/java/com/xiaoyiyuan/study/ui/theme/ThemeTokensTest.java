@@ -143,9 +143,40 @@ class ThemeTokensTest {
     }
 
     @Test
-    void verifyAllTokensResolve_isTrue_andWouldBeFalseIfATokenWereMissing() {
+    void verifyAllTokensResolve_isTrueForTheRealTokenFiles() {
         assertTrue(new ThemeManager(ThemeMode.LIGHT).verifyAllTokensResolve(),
                 "每个令牌都必须在两个模式下解析到合法 #RRGGBB");
+    }
+
+    @Test
+    void verifyAllTokensResolve_isFalse_whenATokenIsMissingOrMalformed_orTheTableCannotBeRead() {
+        // 评审的 M15：旧版测试只断言了 happy path，把 verifyAllTokensResolve 的失败分支
+        // 短路成 `return true` 之后 56 条**全绿**——方法名承诺的反例根本没实现。
+        // 这里用 ThemeManager.verify(loader) 注入三份**故意坏掉**的解析表，把三条失败分支都钉住。
+        java.util.Map<String, String> light = new java.util.LinkedHashMap<>(ThemeTokens.values(ThemeMode.LIGHT));
+        java.util.Map<String, String> dark = new java.util.LinkedHashMap<>(ThemeTokens.values(ThemeMode.DARK));
+        assertTrue(ThemeManager.verify(mode -> mode == ThemeMode.DARK ? dark : light),
+                "完整的两份表必须先判 true，否则下面的反例没有意义");
+
+        // ① 令牌引用不存在（缺键）——方法名承诺的那条反例
+        java.util.Map<String, String> missingKey = new java.util.LinkedHashMap<>(light);
+        missingKey.remove(ThemeTokens.CRISIS_META.key());
+        assertFalse(ThemeManager.verify(mode -> mode == ThemeMode.DARK ? dark : missingKey),
+                "LIGHT 表缺 " + ThemeTokens.CRISIS_META.key() + " 时必须判 false");
+
+        // ② 值不是 #RRGGBB（JavaFX 会静默回退成默认色，所以必须判 false）
+        java.util.Map<String, String> malformed = new java.util.LinkedHashMap<>(dark);
+        malformed.put(ThemeTokens.BG.key(), "red");
+        assertFalse(ThemeManager.verify(mode -> mode == ThemeMode.DARK ? malformed : light),
+                "DARK 的 " + ThemeTokens.BG.key() + " = red 时必须判 false");
+
+        // ③ 令牌表本身取不到（资源缺失 / 解析抛异常）——不得把异常漏给调用方
+        assertFalse(ThemeManager.verify(mode -> {
+            if (mode == ThemeMode.DARK) {
+                throw new IllegalStateException("模拟 tokens-dark.css 读不到");
+            }
+            return light;
+        }), "任一模式的令牌表取不到时必须判 false，而不是把异常漏给调用方");
     }
 
     @Test

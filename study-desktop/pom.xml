@@ -62,9 +62,16 @@
           <!--
             ui/theme 的字体测试要起 JavaFX 工具包（必须看真实行为，这是本任务的悬置项之一）。
             JavaFX 在 classpath 方式下会警告「Unsupported JavaFX configuration: classes were loaded
-            from 'unnamed module'」，但功能正常；native-access 警告用下面这个参数消掉。
+            from 'unnamed module'」，但功能正常——那条警告无法用参数消除（XML 注释里不能写两个连字符，
+            下面用全角破折号代替参数名前的两个连字符）。
+            原生访问警告用 ALL UNNAMED 那一档（**不是** javafx.graphics）：classpath 模式下 JavaFX
+            处在 unnamed module，写 javafx.graphics 会让 JVM 打
+            「Unknown module: javafx.graphics specified to enable native access」，
+            然后照样打「Restricted methods will be blocked in a future release」，等于没消掉
+            （2026-10-14 fix round 1 实测；jpackage 的 java options 用 javafx.graphics 是对的，
+             因为打包产物走 module path，那是另一套配置）。
           -->
-          <argLine>-Dfile.encoding=UTF-8 --enable-native-access=javafx.graphics</argLine>
+          <argLine>-Dfile.encoding=UTF-8 --enable-native-access=ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
     </plugins>

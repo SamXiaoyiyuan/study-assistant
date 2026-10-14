@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -216,6 +217,36 @@ class TokenValueSourceTest {
         return out;
     }
 
+    /**
+     * 指南 §2.3 样例块里的 <b>Modena 重着色 9 条</b>（含 8 位十六进制的 {@code -fx-faint-focus-color}）。
+     *
+     * <p>2026-10-14 fix round 1 补：{@code CssTokens.projectColors} 只看 {@code -fx-c-*}，
+     * 所以指南 §2.3 里明/暗都给了的 {@code -fx-faint-focus-color (#3D4AA822 / #9AA6F522)}
+     * 从来没有任何断言守着——这正是它被整份实现漏掉的原因。这里改用
+     * {@code byProperty} 读全量声明，并把「键集合 = 指南的 9 条」也钉住。</p>
+     */
+    static final List<String> MODENA_RECOLOR_KEYS = List.of(
+            "-fx-base", "-fx-background", "-fx-control-inner-background", "-fx-text-background-color",
+            "-fx-accent", "-fx-focus-color", "-fx-faint-focus-color",
+            "-fx-selection-bar", "-fx-selection-bar-non-focused");
+
+    static Map<String, String> specimenRecolorBlock(boolean dark) {
+        String text = repoFile(GUIDELINES);
+        int a = text.indexOf(dark ? "**`tokens-dark.css`**（暗色）" : "**`tokens-light.css`**（明色）");
+        int b = text.indexOf(dark ? "### 2.4" : "**`tokens-dark.css`**（暗色）");
+        assertTrue(a >= 0 && b > a, "指南里找不到 2.3 的 tokens-" + (dark ? "dark" : "light") + ".css 粘贴块");
+        Map<String, String> out = new LinkedHashMap<>();
+        // 长名字在前，避免 -fx-background 抢先匹配 -fx-text-background-color 的前缀
+        Matcher m = Pattern.compile("^\\s*(-fx-(?:selection-bar-non-focused|control-inner-background"
+                        + "|text-background-color|faint-focus-color|selection-bar|focus-color|background|base|accent))"
+                        + "\\s*:\\s*(#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?)\\s*;", Pattern.MULTILINE)
+                .matcher(text.substring(a, b));
+        while (m.find()) {
+            out.put(m.group(1), m.group(2).toUpperCase(Locale.ROOT));
+        }
+        return out;
+    }
+
     /** 把指南的四处来源合成「明/暗 期望表」，并把指南内部的矛盾当失败。 */
     private static Map<String, String> expected(boolean dark) {
         Map<String, String> table = dark ? darkTable() : lightTable();
@@ -341,6 +372,29 @@ class TokenValueSourceTest {
         }
         // MASTER.md 的明色表覆盖 20 个令牌里的 18 个（-fx-c-accent-hover 与 -fx-c-text-disabled 缺席）
         assertTrue(compared >= 17, "真正比对上的令牌太少，护栏形同虚设：" + compared);
+    }
+
+    @Test
+    void modenaRecolorBlock_matchesTheGuidelineSpecimenBlock_includingTheFaintFocusColor() {
+        for (boolean dark : List.of(false, true)) {
+            String css = dark ? "/css/tokens-dark.css" : "/css/tokens-light.css";
+            Map<String, String> fromGuideline = specimenRecolorBlock(dark);
+            assertEquals(new TreeSet<>(MODENA_RECOLOR_KEYS), new TreeSet<>(fromGuideline.keySet()),
+                    "指南 §2.3 的" + (dark ? "暗色" : "明色") + "样例块必须给出全部 9 条 Modena 重着色键，实际 "
+                            + fromGuideline.keySet());
+            Map<String, String> actual = new TreeMap<>(CssTokens.byProperty(css));
+            for (String key : MODENA_RECOLOR_KEYS) {
+                assertEquals(fromGuideline.get(key), upperValue(actual.get(key)),
+                        css + " 的 " + key + " 必须与指南 §2.3 逐字一致");
+            }
+            // 8 位十六进制（带 alpha）的淡焦点晕：明 #3D4AA822 / 暗 #9AA6F522
+            assertEquals(dark ? "#9AA6F522" : "#3D4AA822", upperValue(actual.get("-fx-faint-focus-color")),
+                    css + " 的 -fx-faint-focus-color 必须按指南 §2.3 给足 8 位（否则 Modena 的淡蓝焦点晕与项目色不一致）");
+        }
+    }
+
+    private static String upperValue(String value) {
+        return value == null ? null : value.toUpperCase(Locale.ROOT);
     }
 
     @Test

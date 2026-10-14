@@ -794,7 +794,7 @@ BorderPane (root)
 | 语义令牌名 | `-fx-c-danger` / `-fx-c-error` / `-fx-c-warning` / `-fx-c-success` / `-fx-c-critical` | 令牌名会诱导后续开发者填入红/绿 |
 
 **具体被否决的库默认值**（已记录在 MASTER 覆盖层）：
-`#DC2626`（destructive 红）、`#DC2626` 于明色底 4.49:1 且语义错、`#059669`（accent 绿，于明色底仅 3.50:1，既不达标又语义错）、`#EF4444` / `#22C55E`（暗色红/绿）。
+`#DC2626`（destructive 红，实测 H=0.00° S=82.73%）、`#DC2626` 于明色底 4.49:1 且语义错、`#059669`（accent 绿，实测 **H=161.38°**、S=96.67%，于明色底仅 3.50:1，既不达标又语义错——注意它的色相落在本表「高饱和绿 90°–160°」的**边界外 1.38°**，所以色相规则本身**抓不住**它，否决理由是「明色底对比度不足 + 语义错」）、`#EF4444` / `#22C55E`（暗色红/绿）。
 `[技能库命中: "calm wellness muted" --domain color]` 返回的三套调色板**都带 `Destructive: #DC2626`**——这部分**明确不采纳**；采纳的只是它们的"低刺激底色 + 中性 muted + 单一强调色"结构。
 
 **深一层的理由**：本应用里"没做"和"做得少"是常态。任何红色/绿色都会把"今天没记录"变成一次隐性指责。四态与条目态的视觉权重刻意做到接近，正是为了让"暂缓考研"在视觉上和"本周在推进课程"一样正当中性。
@@ -1036,8 +1036,8 @@ HBox
 | 大号文本（≥18.66px 常规 / ≥24px） | ≥ 3:1 | 全部达 4.5:1 以上，超额 |
 | 控件可识别边界 | ≥ 3:1 | `-fx-c-border-control`：明 3.27:1 / 暗 3.80:1 |
 | 焦点指示 | ≥ 3:1 且面积 ≥ 2px 周长 | `-fx-c-focus`：明 7.11:1 / 暗 7.80:1，2 逻辑像素全周长描边 |
-| 图表数据线 vs 绘图区 | ≥ 3:1 | `-fx-c-state-active` 于 `-fx-c-surface`：明 5.51:1 / 暗 8.33:1 |
-| 装饰性分隔线 | 无要求 | `-fx-c-border-subtle` 明 1.29:1 / 暗 1.25:1（刻意极轻） |
+| 图表数据线 vs 绘图区 | ≥ 3:1 | `-fx-c-state-active` 于 `-fx-c-surface`（绘图区底，`app.css` 的 `.chart-plot-background`）：明 5.51:1 / 暗 7.57:1 |
+| 装饰性分隔线 | 无要求 | `-fx-c-border-subtle` 对**页底** `-fx-c-bg`：明 1.20:1 / 暗 1.38:1（对**面板底** `-fx-c-surface` 才是 1.29:1 / 1.25:1；刻意极轻） |
 
 来源：`[技能库命中: "calm low stimulation color" --domain ux]`、`[技能库命中: "neutral status color semantics" --domain ux]`、`[技能库命中: "dark mode contrast" --domain ux]` → 均返回 `color-contrast`（4.5:1 / 3:1）；`[技能库命中: "clean readable ui sans" --domain typography]` → `color-accessible-pairs`。
 

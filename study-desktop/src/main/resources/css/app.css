@@ -181,15 +181,25 @@
     -fx-line-spacing: -fx-ls-body;
 }
 
-/* ---------- 危机资源面板（暖砂中性；唯一强调是左侧色条，用渐变实现，不写死 px） ---------- */
+/* ---------- 危机资源面板（暖砂中性；唯一强调是左侧色条，不写死 px） ---------- */
 .crisis-panel {
+    /* 两层背景：第 1 层 = 左侧色条，第 2 层 = 暖砂底。**后声明的那层画在上面**（本机实测）。
+       两层 insets 不能相同：相同时上面那层会把下面那层完全盖住，色条会整条消失
+       （2026-10-14 fix round 1 之前的 `0 0 0 0, 0 0 0 0` 就是这个后果：色条宽度 0，
+       而面板底与页底只有 1.07:1，面板失去唯一的可识别边界——指南 §1.3）。
+       这里让暖砂底只从**左**内缩 0.2em（根字号 15px → 3 逻辑像素），色条只在最左 3px 露出来。 */
     -fx-background-color: -fx-c-crisis-bar, -fx-c-crisis-bg;
-    -fx-background-insets: 0 0 0 0, 0 0 0 0;
+    -fx-background-insets: 0 0 0 0, 0 0 0 0.2em;
     -fx-background-radius: -fx-r-card, -fx-r-card;
     -fx-border-color: -fx-c-crisis-border;
     -fx-border-radius: -fx-r-card;
     -fx-border-width: 1;
-    -fx-padding: -fx-sp-4 -fx-sp-4 -fx-sp-4 -fx-sp-5;
+    /* 正文的左内边距必须**大于**色条宽度（0.2em），否则正文压在色条上（text on bar 只有 1.80/1.65:1）。
+       这里写字面 em：实测 `-fx-padding: -fx-sp-4 ...` 在 JavaFX 25 下抛 ClassCastException 后被忽略
+       （Double 不能转 javafx.css.Size），等于没有内边距（见 task-1-fix1-report.md 的新增发现 N1），
+       而本面板的内边距是 Blocker 的关键路径。字面值与 -fx-sp-4 / -fx-sp-5 的耦合由
+       ContrastTest.crisisPanelTextIsAlwaysOnCrisisBg_andTheAccentBarIsOnlyANarrowLeftStrip 焊住。 */
+    -fx-padding: 1.07em 1.07em 1.07em 1.60em;
 }
 .crisis-panel .crisis-title {
     -fx-text-fill: -fx-c-crisis-text;

@@ -199,18 +199,22 @@ class ColorAuditTest {
     void forbiddenHueRule_scoresKnownViolationsAndKnownGoodValues_honestly() {
         // 反例：指南 §4.1 点名或被否决的默认值。
         // 注意：本条断言的是「规则本身诚实」——命中的理由必须与指南给出的理由一致。
-        assertNotNull(forbiddenHueReason("#DC2626"), "#DC2626（destructive 红，实测 H=0.0 S=81.9%）必须命中");
-        assertNotNull(forbiddenHueReason("#EF4444"), "#EF4444（暗色红，实测 H=0.0 S=80.4%）必须命中");
-        assertNotNull(forbiddenHueReason("#22C55E"), "#22C55E（暗色绿，实测 H=142.1 S=69.4%）必须命中");
-        assertNotNull(forbiddenHueReason(MODENA_CHART_1), "Modena 默认图表橙红（实测 H=21.9 S=81.4%）必须命中");
+        // 注释里的 H/S 都是**实测值**（2026-10-14 fix round 1 逐条重算；旧注释里的 81.9/80.4/69.4/21.9 都不对）。
+        assertNotNull(forbiddenHueReason("#DC2626"), "#DC2626（destructive 红，实测 H=0.00° S=82.73%）必须命中");
+        assertNotNull(forbiddenHueReason("#EF4444"), "#EF4444（暗色红，实测 H=0.00° S=71.55%）必须命中");
+        assertNotNull(forbiddenHueReason("#22C55E"), "#22C55E（暗色绿，实测 H=142.09° S=82.74%）必须命中");
+        assertNotNull(forbiddenHueReason(MODENA_CHART_1), "Modena 默认图表橙红（实测 H=16.06° S=81.48%）必须命中");
 
-        // 如实记录一个被指南<b>误归类</b>的值：#059669 的 H=160.1°、S=94.6%，
-        // 恰好落在指南 §4.1「高饱和绿 90°–160°」的边界外 0.1°，
+        // 如实记录一个被指南<b>误归类</b>的值：#059669 的 H=161.38°、S=96.67%，
+        // 恰好落在指南 §4.1「高饱和绿 90°–160°」的边界外 1.38°，
         // 且并不落在蓝紫主色相区（230°）里，所以按 §4.1 的色相规则本身<b>抓不住</b>它。
         // 指南对它的否决理由其实是「于明色底仅 3.50:1，既不达标又语义错」（§4.1 正文），
         // 因此这里改用那两条真实理由来断言，而不是把色相阈值偷偷放宽到 165° 去凑绿。
+        assertEquals("161.38", WcagContrast.fmt(hsv("#059669")[0]),
+                "#059669 的实测色相（报告旧版写 160.1°、评审写 161.36°，精确值是 161.3793° → 161.38°）");
+        assertEquals("96.67", WcagContrast.fmt(hsv("#059669")[1] * 100), "#059669 的实测饱和度");
         assertTrue(forbiddenHueReason("#059669") == null,
-                "#059669 按 §4.1 的色相阈值本不该命中（H=160.1° 超出 160° 边界）；若这里命中说明阈值被改了");
+                "#059669 按 §4.1 的色相阈值本不该命中（H=161.38° 超出 160° 边界）；若这里命中说明阈值被改了");
         assertTrue(WcagContrast.ratio("#059669", "#F7F6FA") < 4.5,
                 "指南否决 #059669 的真实理由之一是明色底对比度不足；实测 "
                         + WcagContrast.fmt(WcagContrast.ratio("#059669", "#F7F6FA")) + ":1");
@@ -263,6 +267,39 @@ class ColorAuditTest {
         }
     }
 
+    @Test
+    void appCss_lookedUpColorNames_allExistInTheTokenFiles() {
+        // 这条是评审点名的「本任务最有价值的缺口」：app.css 里把 -fx-c-surface 拼成
+        // -fx-c-surface-typo，JavaFX 遇到未定义的查找色只会**静默回退**（不抛异常、不打日志、
+        // CssParser 也不报错），表现是「这条样式没生效」，而以前没有任何测试会红。
+        // Java 侧也不会有反应：ui/view 与 ui/chart 按 Global Constraints 不写单元测试。
+        Set<String> defined = new TreeSet<>();
+        for (ThemeTokens t : ThemeTokens.values()) {
+            defined.add(t.key());
+        }
+        defined.addAll(CssTokens.byProperty("/css/tokens-light.css").keySet());
+        defined.addAll(CssTokens.byProperty("/css/tokens-dark.css").keySet());
+
+        Pattern reference = Pattern.compile("-fx-c-[a-z-]+|CHART_COLOR_[1-8]");
+        List<String> checked = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        for (CssTokens.Decl d : CssTokens.parse("/css/app.css")) {
+            Matcher m = reference.matcher(d.rawValue());
+            while (m.find()) {
+                checked.add(m.group());
+                if (!defined.contains(m.group())) {
+                    missing.add(d.selector() + " { " + d.property() + ": " + d.rawValue() + " } → " + m.group());
+                }
+            }
+        }
+        assertTrue(checked.size() >= 90, "app.css 里扫到的查找色引用太少，护栏形同虚设：" + checked.size());
+        assertEquals(List.of(), missing,
+                "app.css 引用了 tokens-*.css / ThemeTokens 里不存在的查找色（JavaFX 会静默回退，样式只是「没生效」）："
+                        + missing);
+        System.out.println("[evidence] app.css 查找色引用数 = " + checked.size()
+                + "，全部存在于 " + defined.size() + " 个已定义名字里");
+    }
+
     // ================================================================ ⑤ DPI 安全
 
     @Test
@@ -308,6 +345,11 @@ class ColorAuditTest {
         // （样例与实测见 task-1-report.md；指南 §2.4 的 `-fx-font-size: -fx-fs-h1;` 写法在本机不生效）
         // 因此 app.css 写**字面 em**，而这条断言把它与 §1.4 的令牌表钉在一起：
         // 字面值必须是某个 -fx-fs-* 令牌的值，改令牌不改 app.css 就会红。
+        //
+        // 2026-10-14 fix round 1：扫描范围从「只认 -fx-font-size」扩到**所有** `-fx-*font-size` 属性。
+        // 覆盖 `-fx-tick-label-font-size`（JavaFX 的 FontCssMetaData 会自动派生
+        // `-fx-<font属性>-size` 子属性，实测 0.87em 真的生效——评审的「死代码」判定不对，
+        // 但评审「它逃过了字号焊接」这一半是对的：改 0.87em → 0.88em 曾让 56 条全绿）。
         Map<String, String> tokens = new LinkedHashMap<>();
         for (String key : List.of("-fx-fs-micro", "-fx-fs-caption", "-fx-fs-small", "-fx-fs-body",
                 "-fx-fs-h3", "-fx-fs-h2", "-fx-fs-h1", "-fx-fs-display")) {
@@ -315,16 +357,18 @@ class ColorAuditTest {
         }
         List<String> checked = new ArrayList<>();
         for (CssTokens.Decl d : CssTokens.parse("/css/app.css")) {
-            if (!"-fx-font-size".equals(d.property())) {
+            if (!d.property().matches("-fx-[a-z-]*font-size")) {
                 continue;
             }
             String value = d.rawValue();
             assertTrue(tokens.containsKey(value),
-                    "app.css 的 " + d.selector() + " { -fx-font-size: " + value
+                    "app.css 的 " + d.selector() + " { " + d.property() + ": " + value
                             + " } 必须等于某个 -fx-fs-* 令牌的值，允许集合=" + tokens.keySet());
-            checked.add(value + "=" + tokens.get(value));
+            checked.add(d.property() + "@" + d.selector() + "=" + value + "=" + tokens.get(value));
         }
-        assertEquals(20, checked.size(), "app.css 里的字号声明数（实测 20 处）：" + checked);
+        assertEquals(21, checked.size(), "app.css 里的字号声明数（20 处 -fx-font-size + 1 处 -fx-tick-label-font-size）：" + checked);
+        assertTrue(checked.stream().anyMatch(s -> s.startsWith("-fx-tick-label-font-size")),
+                "app.css 必须显式声明 -fx-tick-label-font-size（否则坐标轴刻度退回 JavaFX 默认 8px）：" + checked);
         assertFalse(checked.contains("15px"), "app.css 不得再声明根字号（根字号只在 tokens-*.css）");
         // 不止 -fx-font-size：任何把 -fx-fs-* 当值直接引用的写法在 JavaFX 25 上都解析失败
         List<String> bareRefs = CssTokens.parse("/css/app.css").stream()

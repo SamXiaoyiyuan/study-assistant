@@ -16,6 +16,7 @@
     -fx-text-background-color:    #1E2130;
     -fx-accent:                   #4A55A2;
     -fx-focus-color:              #3D4AA8;
+    -fx-faint-focus-color:        #3D4AA822; /* 8 位十六进制，Modena 同款写法（指南 §2.3） */
     -fx-selection-bar:            #E3E1F2;
     -fx-selection-bar-non-focused: #EBEAF2;
 
