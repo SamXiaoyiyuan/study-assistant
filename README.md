@@ -38,8 +38,8 @@ function calling / agent 循环 / 本地模型推理、情绪数据加密、用 
 ## 快速开始
 
 ```bash
-git clone <this-repo>
-cd Study
+git clone https://github.com/SamXiaoyiyuan/study-assistant.git
+cd study-assistant
 
 # 全量测试
 mvn -B clean test                     # study-core 480 通过 / study-desktop 147 通过
