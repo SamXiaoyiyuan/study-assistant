@@ -28,12 +28,18 @@ import java.util.Objects;
  *   <li>{@link #apply(MigrationPlan, Path)}：<b>唯一会写文件的方法</b>，顺序固定：
  *       <ol>
  *         <li>目标已存在且非空 → 抛 {@link TargetExistsException}（<b>在任何写入之前</b>）；</li>
+ *         <li>源文件内容与方案不符 → 拒绝；</li>
+ *         <li>归档已存在且内容不同 → 拒绝（只读预检查）；</li>
  *         <li>备份源文件到 {@code .backup\}&lt;原文件名&gt;.&lt;时间戳&gt;.bak；</li>
- *         <li>归档源文件到 {@code .archive\&lt;原文件名&gt;}（逐字节副本，不可变）；</li>
+ *         <li>归档源文件到 {@code .archive\&lt;原文件名&gt;}（逐字节副本，不可变）——写之前<b>再查一次</b>：
+ *             第 3 步与这里之间隔着一次备份，别的程序可能已经动过归档；</li>
  *         <li>写目标文件；</li>
  *         <li>返回三个路径。</li>
  *       </ol>
- *       全程<b>不修改、不删除、不重命名源文件</b>（spec §4.6 第 5 条：「原文件保留不动」）。</li>
+ *       全程<b>不修改、不删除、不重命名源文件</b>（spec §4.6 第 5 条：「原文件保留不动」）。
+ *       <p>第 4 步与第 5 步之间有一个只给测试用的观测点 {@link WritePhaseHook}（默认
+ *       {@link #NO_HOOK}，什么也不做），用来<b>确定性</b>地复现「复查时归档已被改」这条 TOCTOU 分支；
+ *       它不改变上面任何一步的顺序与判据。</p></li>
  * </ul>
  *
  * <h2>为什么用字符串装配，而不是 {@code PlanDocument}</h2>
@@ -54,7 +60,33 @@ import java.util.Objects;
  * 「绝不静默覆盖」这条规格就被一个无关的检查遮住了。内容闸门两条都解掉，且不放松任何安全性质：
  * 归档写的字节、目标文本、备份的源文件仍然是同一份内容。
  */
-public final class Migrator {
+    public final class Migrator {
+
+    /**
+     * 写入阶段的一个观测点，<b>只为让「预检查与复查之间被别的程序改了归档」这件事可确定性复现</b>。
+     *
+     * <p>为什么需要它：{@code apply} 的第 ③ 步（归档冲突只读预检查）与第 ⑤ 步（写入前最后一瞬的
+     * 复查）之间隔着一次备份，别的程序可能恰好在这时改动归档（TOCTOU）。这条路径的拒绝消息
+     * 必须如实报告「备份已经建立」——它是用户找回内容的唯一线索。
+     *
+     * <p>原先的测试靠「另起线程轮询 {@code .backup\} 目录出现、再用超大文件的 {@code Files.copy}
+     * 把窗口拉长」来抢这个时机，于是它 5/18 次全量跑会红（{@code Files.copy} 够快时干扰线程根本
+     * 来不及替换）。钩子把「谁在什么时候动归档」变成调用方自己写的一行同步代码：预检查<b>必然</b>
+     * 看到旧归档，复查<b>必然</b>看到新归档，不依赖任何 sleep 或「通常更快」的假设。
+     *
+     * <p>它不是给生产用的扩展点（默认{@link #NO_HOOK}什么也不做，也不持有任何状态），
+     * 因此不改变任何安全性质：钩子跑完之后，备份、归档、写目标的顺序与判据一字未变。
+     */
+    @FunctionalInterface
+    public interface WritePhaseHook {
+
+        /** 在备份<b>已经</b>落地、归档复查<b>还没</b>读盘的那一刻被调用。 */
+        void afterBackupBeforeArchiveRecheck() throws IOException;
+    }
+
+    /** 默认钩子：什么也不做。生产路径走的就是它。 */
+    public static final WritePhaseHook NO_HOOK = () -> {
+    };
 
     /** 备份目录名（全局约束钉死）；备份的命名与保留份数由 {@link BackupRotation} 负责。 */
     private static final String BACKUP_DIR = ".backup";
@@ -157,8 +189,20 @@ public final class Migrator {
      * @throws IOException 源文件内容与方案不符、归档冲突、或读写失败
      */
     public MigrationResult apply(MigrationPlan plan, Path targetFile) throws IOException {
+        return apply(plan, targetFile, NO_HOOK);
+    }
+
+    /**
+     * 与 {@link #apply(MigrationPlan, Path)} 完全同一条写入路径，只多一个
+     * {@link WritePhaseHook 写入期观测点}（默认{@link #NO_HOOK}）。
+     *
+     * <p>存在的唯一理由是让「预检查通过、复查发现归档被改」这条 TOCTOU 分支可以被<b>确定性</b>
+     * 地覆盖（见 {@link WritePhaseHook} 的说明）。生产代码只调用两条参数的那个重载。
+     */
+    public MigrationResult apply(MigrationPlan plan, Path targetFile, WritePhaseHook hook) throws IOException {
         Objects.requireNonNull(plan, "plan");
         Objects.requireNonNull(targetFile, "targetFile");
+        Objects.requireNonNull(hook, "hook");
         // 源路径来自方案本身。apply 因此不依赖任何实例现场信息，也就没有「哪个实例产的」这回事。
         Path source = plan.sourceFile();
 
@@ -181,6 +225,9 @@ public final class Migrator {
 
         // ④ 备份（命名、保留 10 份由 BackupRotation 按规格执行）。
         Path backup = new BackupRotation(studyDir.resolve(BACKUP_DIR), BACKUP_KEEP).backup(source);
+
+        // ④′ 写入期观测点：备份已落地、归档还没复查。生产路径上这里是空的（NO_HOOK）。
+        hook.afterBackupBeforeArchiveRecheck();
 
         // ⑤ 归档：写的是 ② 里核对过的那份字节，而不是「再去读一次文件」——后者给别的程序留了
         //    一个把两边改得不一致的窗口。

@@ -10,6 +10,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -333,56 +335,62 @@ class MigrationSafetyTest {
      * {@code archiveSource} 内）在磁盘状态上正相反。早先两个调用点共用一句写死的话，于是在这条路上
      * 消息会假称没有备份——用户读完那句话本该去 {@code .backup\} 找内容，却会以为内容无从找回。
      *
-     * <p><b>怎么确定性地制造这个窗口</b>：预检查与复查之间隔着一次备份，而备份是
-     * {@code Files.copy}。用一份足够大的源文件把这次复制拉长到可观测，另起一个线程轮询
-     * {@code .backup\}（{@code BackupRotation.backup} 一进来就建目录），看到目录出现就立刻把归档
-     * 改成别的内容。于是预检查过、复查红——正是真实世界里另一个程序的动作。
+     * <p><b>怎么确定性地制造这个窗口（2026-10-14 修复轮 2 重写）</b>：不再靠「另起线程轮询
+     * {@code .backup\} 出现、再用超大文件把 {@code Files.copy} 拉长」去抢时机——那种写法在
+     * {@code Files.copy} 够快时干扰线程根本来不及替换，实测全量跑 5/18 次红
+     * （{@code Expected java.io.IOException to be thrown, but nothing was thrown}），
+     * 而隔离跑 0/8 红，也就是说它守的性质<b>没有</b>被稳定守住。
+     *
+     * <p>现在把「谁在什么时候动归档」变成一行同步代码：用
+     * {@link Migrator#apply(MigrationPlan, Path, Migrator.WritePhaseHook)} 的写入期观测点，
+     * 在<b>备份已经落地、归档复查还没读盘</b>的那一刻，由<b>调用线程自己</b>把归档换成别的内容
+     * （与真实世界里另一个程序的动作逐字同形）。于是：
+     * <ul>
+     *   <li>只读预检查<b>必然</b>看到那份与源文件一致的归档 → 必然通过；</li>
+     *   <li>写入期复查<b>必然</b>看到被换过的归档 → 必然抛异常；</li>
+     * </ul>
+     * 全程没有 sleep、没有第二个线程、没有「通常更快」的假设。大文件也不再需要：本测试与体积无关。
      */
     @Test
     void apply_writePhaseRecheck_reportsTheBackupItAlreadyMade(@TempDir Path dir) throws Exception {
-        Path legacy = writeLargeLegacy(dir);
+        Path legacy = legacyFile(dir);
         Path target = dir.resolve("学习与生活计划.md");
         Migrator m = new Migrator(dir);
         MigrationPlan plan = m.plan(legacy);
 
-        // 预置一份与源文件一致的归档：只读预检查因此通过（差异由测试线程在备份之后制造）。
+        // 预置一份与源文件一致的归档：只读预检查因此通过（差异由钩子在备份之后制造）。
         Path archiveDir = Files.createDirectories(dir.resolve(".archive"));
         Path archive = archiveDir.resolve("408-进度.md");
-        Files.write(archive, plan.sourceText().getBytes(StandardCharsets.UTF_8));
+        byte[] plannedBytes = plan.sourceText().getBytes(StandardCharsets.UTF_8);
+        Files.write(archive, plannedBytes);
 
-        // 备份一进来就建 .backup\（BackupRotation.backup 的第一句），而这个目录只可能在只读
-        // 预检查<b>之后</b>出现——所以「目录出现」是「预检查已经通过」的证据，不是靠时序赌的。
-        //
-        // 线程用 createTempFile + Files.move(REPLACE_EXISTING, ATOMIC_MOVE) 换掉归档：replace 让
-        // 归档永远「存在且内容不同」，不存在「先删掉、预检查看见不存在而放行」的窗口；atomic 让替换
-        // 要么在预检查前、要么在预检查后，不会半个状态。大文件把 Files.copy 拉长到足以让替换落进
-        // 「预检查已过、复查未读」之间。
-        Thread intruder = new Thread(() -> {
-            Path backupDir = dir.resolve(".backup");
-            for (int i = 0; i < 20_000; i++) {
-                if (Files.isDirectory(backupDir)) {
-                    try {
-                        Path replacement = Files.createTempFile(archiveDir, "intruder", ".md");
-                        Files.writeString(replacement, "被别的程序改掉了\n", StandardCharsets.UTF_8);
-                        Files.move(replacement, archive, StandardCopyOption.REPLACE_EXISTING,
-                                StandardCopyOption.ATOMIC_MOVE);
-                    } catch (IOException ignored) {
-                        // 迁移的写入与本线程撞上时无需处理：断言只看消息
-                    }
-                    return;
-                }
-                try {
-                    Thread.sleep(1);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+        // 钩子精确跑在「备份已建好」与「归档复查」之间。这里断言的是钩子自己的前置条件，
+        // 它们同时也是「窗口真的被打开了」的证据：没有备份 → 这条测试就没有意义。
+        AtomicInteger hookCalls = new AtomicInteger();
+        AtomicReference<Path> backupAtHook = new AtomicReference<>();
+        Migrator.WritePhaseHook intruder = () -> {
+            hookCalls.incrementAndGet();
+            try (var backups = Files.list(dir.resolve(".backup"))) {
+                List<Path> made = backups.toList();
+                assertEquals(1, made.size(),
+                        "钩子被调用时备份必须已经恰好落地一份（这正是「写入期复查」这个调用点的定义）："
+                                + made);
+                assertEquals(plannedBytes.length, Files.size(made.get(0)),
+                        "钩子看到的备份必须已经是源文件的完整副本：" + made.get(0));
+                backupAtHook.set(made.get(0));
             }
-        }, "archive-intruder");
-        intruder.start();
-        IOException e = assertThrows(IOException.class, () -> m.apply(plan, target));
-        intruder.join();
+            // 与真实世界里另一个程序的动作同形：replace 让归档**永远存在且内容不同**
+            // （不存在「先删掉、预检查看见不存在而放行」的窗口），atomic 让替换不是半个状态。
+            Path replacement = Files.createTempFile(archiveDir, "intruder", ".md");
+            Files.writeString(replacement, "被别的程序改掉了\n", StandardCharsets.UTF_8);
+            Files.move(replacement, archive, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        };
 
+        IOException e = assertThrows(IOException.class, () -> m.apply(plan, target, intruder),
+                "归档在预检查之后、写入之前被改掉时，apply 必须拒绝（写入期复查）");
+
+        assertEquals(1, hookCalls.get(), "写入期观测点必须恰好被调用一次，实际 " + hookCalls.get() + " 次");
         assertTrue(e.getMessage().contains("不可变归档"),
                 "这条路径必须是归档冲突，实际消息：" + e.getMessage());
         // 判据刻意用「目标文件未写入；备份已建立：」这个只有复查分支才会产出的整串：
@@ -397,26 +405,11 @@ class MigrationSafetyTest {
             assertTrue(e.getMessage().contains(made.get(0).getFileName().toString()),
                     "消息必须给出那份备份的真实文件名，实际消息：" + e.getMessage());
         }
+        assertNotNull(backupAtHook.get(), "钩子里必须已经观测到备份");
         assertFalse(Files.exists(target), "归档冲突时不得写出目标文件");
-    }
-
-    /**
-     * 一份大到足以让 {@code Files.copy} 花上可观测时间的源文件。
-     *
-     * <p><b>体积靠「行很长」而不是「行很多」</b>：迁移的兜底对每条原样行做一次
-     * {@code rendered.contains(line)}，行数一多就是行数 × 全文长度的量级。几十行超长散文
-     * （非空、非表格、非标题）换来同样的字节数，却让兜底与映射的代价保持在可忽略的量级。
-     * 内容仍是合法的旧档案形状，本测试只关心拒绝路径的消息，不关心映射结果。
-     */
-    private static Path writeLargeLegacy(Path dir) throws IOException {
-        StringBuilder text = new StringBuilder(LEGACY);
-        String filler = "填".repeat(4_000_000);
-        for (int i = 0; i < 4; i++) {
-            text.append("- 填充行 ").append(i).append(' ').append(filler).append('\n');
-        }
-        Path p = dir.resolve("408-进度.md");
-        Files.writeString(p, text.toString(), StandardCharsets.UTF_8);
-        return p;
+        assertEquals("被别的程序改掉了\n", Files.readString(archive),
+                "归档已被别的程序改掉；migrator 绝不许把它改回去或覆盖它");
+        assertArrayEquals(plannedBytes, Files.readAllBytes(legacy), "源文件必须一个字节都没动");
     }
 
     /** 归档内容一致时（源文件没变，用户只是删了目标）允许重跑：归档保持原样，不重复写。 */

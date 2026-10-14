@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -35,8 +36,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -425,36 +428,77 @@ class AiStreamTest {
     // 4. 形态：不能把整包响应缓冲到内存里再回调
     // ------------------------------------------------------------------
 
+    /**
+     * 性质：{@code stream()} 必须<b>边收边回调</b>，不能把整包响应缓冲完再一次性交给调用方。
+     *
+     * <p><b>判据是因果的，不是时间的（2026-10-14 修复轮 2 重写）</b>。旧版拿「首个增量早于
+     * 桩睡满 300ms」当判据（阈值先写死 150ms，后改成 {@code min(250, 300*3/4)} = 225ms），
+     * 那是个<b>绝对毫秒阈值</b>，落在实测分布内部：安静窗口实测 168–183ms（6/6 绿），
+     * 有负载时实测 227/238/244/303/423ms（<b>5/8 红</b>）——红的是阈值，不是实现。
+     *
+     * <p>现在改成让桩<b>自己等</b>：桩写完第 1 个分片后阻塞在一个门上，只有
+     * 「listener 已经收到第 1 个增量」才会把门打开，然后才去写第 2 个分片。于是
+     * 「第 1 个增量早于第 2 个分片」这句话在<b>正确实现下是构造上成立</b>的（不是调度上的大概率），
+     * 而在「整包缓冲」的实现下<b>必然不成立</b>：那种实现要等整条响应读完（含第 2 个分片与
+     * {@code [DONE]}）才会回调，所以它连门都打不开，第 2 个分片只能等门超时后才被写出去。
+     *
+     * <p>机器再慢也不会红：慢只会让两条时间戳都变大，先后关系不变。
+     */
     @Test
     void stream_doesNotBufferWholeResponseInMemory() throws Exception {
-        // 桩在 [DONE] 之前睡 300ms。若实现是「读完整个响应再回调」，第一个增量这时都还没到。
-        final int stubSleepBeforeDoneMillis = 300;
-        // 判据是「首个增量远早于桩睡完」——但要留出调度/JIT/杀毒扫描的抖动余量。
-        // 修前用的是写死的 150ms：桩睡 300ms，阈值的余量只有 150ms，负载一高就偶发红，
-        // 而红的不是实现（实现确实是流式），是阈值太紧。改成「桩睡眠的 3/4、且不超过 250ms」：
-        //   · 与桩睡眠成比例 → 桩若睡 300ms，阈值 225ms；桩哪天改成 2s，阈值也不会跟着变成 1.5s 那种
-        //     与实现无关的巨值（上限 250ms 把绝对余量钉住）；
-        //   · 区分力没丢：整包缓冲的实现要等桩睡完（≥300ms）才会回调，225/250ms 的阈值照样能判死它。
-        int firstDeltaBudgetMillis = Math.min(250, stubSleepBeforeDoneMillis * 3 / 4);
+        // 「listener 收到了第 1 个增量」这个事件的信号量；桩写第 2 个分片之前会等它。
+        CountDownLatch firstDeltaSeen = new CountDownLatch(1);
+        // 门超时只会在**实现坏了**的时候被用满（正确实现下毫秒级就打开），
+        // 所以 5 秒既不会拖慢正常用例，又足够让坏实现在有界时间内走完并给出可读的红。
         stub = StreamStub.scripted(List.of(
                 chunk(sse(delta("早")), 0),
-                chunk(sse(delta("晚")), stubSleepBeforeDoneMillis),
+                gated(chunk(sse(delta("晚")), 0), firstDeltaSeen),
                 chunk(sse("[DONE]"), 0)));
-        RecordingListener listener = new RecordingListener();
+        RecordingListener listener = new RecordingListener() {
+            @Override
+            public synchronized void onDelta(String text) {
+                super.onDelta(text);
+                firstDeltaSeen.countDown();
+            }
+        };
 
         long startedAt = System.nanoTime();
         client().stream(streamRequest("hi"), listener);
         long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
 
-        assertEquals(2, listener.deltaCount(), "两个增量都必须到达");
-        assertTrue(listener.firstDeltaAtMillis() >= 0
-                        && listener.firstDeltaAtMillis() < firstDeltaBudgetMillis,
-                "第一个增量必须在桩睡眠期间（<" + firstDeltaBudgetMillis + "ms，桩睡 "
-                        + stubSleepBeforeDoneMillis + "ms）就到达客户端，说明是流式而非整包缓冲；"
-                        + "实际首个增量在 " + listener.firstDeltaAtMillis()
-                        + "ms，整个调用 " + elapsedMillis + "ms");
-        assertTrue(elapsedMillis >= 250,
-                "桩确实睡了 300ms；整次调用时长应覆盖它，实际 " + elapsedMillis + "ms");
+        assertEquals(2, listener.deltaCount(), "两个增量都必须到达：" + listener.deltas());
+        Long gateClosed = stub.gateClosedAtNanos();
+        Long gatedSent = stub.gatedChunkSentAtNanos();
+        Long firstDelta = listener.firstDeltaAtNanos();
+        Long secondDelta = listener.secondDeltaAtNanos();
+        assertNotNull(gateClosed, "桩必须走完第 2 个门（记录门关闭时刻）");
+        assertNotNull(gatedSent, "桩必须写出第 2 个分片（记录写出时刻）");
+        assertNotNull(firstDelta, "必须收到过第 1 个增量");
+        assertNotNull(secondDelta, "第 2 个增量也必须到达（否则分不出「先到」与「只有它」）");
+        System.out.println("[evidence] firstDelta=+" + (firstDelta - gateClosed) + "ns(相对门关闭) "
+                + "secondDelta=+" + (secondDelta - gateClosed) + "ns(相对门关闭) "
+                + "gatedChunkSent=+" + (gatedSent - gateClosed) + "ns(相对门关闭) "
+                + "gateTimedOut=" + stub.gateTimedOut()
+                + " 整个调用 " + elapsedMillis + "ms");
+
+        // ① 因果判据本体：首个增量早于「第 2 个分片被写出去」。
+        //    正确实现下这一条由信号量保证（门就是 listener 打开的）；整包缓冲的实现必然违反它，
+        //    因为那种实现要等整条响应读完才会回调，连门都打不开。
+        assertTrue(firstDelta < gatedSent,
+                "第一个增量必须在桩写出第 2 个分片**之前**就到达客户端——这才是「边收边回调、"
+                        + "不是整包缓冲」的真实性质；实测首个增量比第 2 个分片的写出早 "
+                        + (gatedSent - firstDelta) + "ns（为负即违反）");
+        // ② 门是被 listener 打开的，不是被超时打开的（门超时 = 整包缓冲实现的形状）。
+        assertFalse(stub.gateTimedOut(),
+                "门必须由「listener 收到首个增量」打开，而不是被 " + StreamStub.GATE_TIMEOUT_SECONDS
+                        + " 秒超时放开");
+        // ③ 门序自洽：门先关闭、然后分片才写出、第二个增量才到达。
+        assertTrue(gateClosed <= gatedSent,
+                "第 2 个分片必须在门关闭之后才写出（closed=+" + (gateClosed - gateClosed)
+                        + "ns sent=+" + (gatedSent - gateClosed) + "ns）");
+        assertTrue(secondDelta >= gatedSent,
+                "第 2 个增量只可能在第 2 个分片写出去之后到达（sent=+" + (gatedSent - gateClosed)
+                        + "ns secondDelta=+" + (secondDelta - gateClosed) + "ns）");
     }
 
     // ------------------------------------------------------------------
@@ -1138,11 +1182,22 @@ class AiStreamTest {
     }
 
     private static Chunk raw(byte[] bytes, int delayMillis) {
-        return new Chunk(bytes, delayMillis);
+        return new Chunk(bytes, delayMillis, null);
     }
 
     private static Chunk chunk(String text, int delayMillis) {
-        return new Chunk(text.getBytes(StandardCharsets.UTF_8), delayMillis);
+        return new Chunk(text.getBytes(StandardCharsets.UTF_8), delayMillis, null);
+    }
+
+    /**
+     * 把一段字节挂在一个「门」后面：桩在写它之前会阻塞，直到 {@code gate} 被倒计数。
+     *
+     * <p>这是「不是整包缓冲」那条性质的因果判据载体（见
+     * {@code stream_doesNotBufferWholeResponseInMemory}）：门由 listener 收到首个增量时打开，
+     * 于是「首个增量早于这段字节写出」不是调度上的大概率，而是构造上的必然。
+     */
+    private static Chunk gated(Chunk chunk, CountDownLatch gate) {
+        return new Chunk(chunk.bytes(), chunk.delayMillis(), gate);
     }
 
     /** 把两段字节接起来（构造「只发了半个字符」这种输入时必须按字节拼，不能用 String）。 */
@@ -1251,10 +1306,17 @@ class AiStreamTest {
     // 辅助：记录回调的 listener
     // ------------------------------------------------------------------
 
-    /** 记录回调序列的 listener；每个用例一个实例，不用静态状态（用例之间不得互相污染）。 */
-    private static final class RecordingListener implements AiStreamListener {
+    /**
+     * 记录回调序列的 listener；每个用例一个实例，不用静态状态（用例之间不得互相污染）。
+     *
+     * <p>不声明 {@code final}：{@code stream_doesNotBufferWholeResponseInMemory} 需要一个
+     * 「收到首个增量就打开桩上的门」的子类（因果判据的载体），而 {@code onDelta} 本身是
+     * {@code synchronized} 的，子类重写时先调 {@code super} 再倒计数，语义不变。
+     */
+    private static class RecordingListener implements AiStreamListener {
 
         private final List<String> deltas = new ArrayList<>();
+        private final List<Long> deltaAtNanos = new ArrayList<>();
         private final AtomicInteger completions = new AtomicInteger();
         private final AtomicReference<String> full = new AtomicReference<>();
         private final AtomicReference<Long> firstDeltaAt = new AtomicReference<>();
@@ -1266,6 +1328,7 @@ class AiStreamTest {
                 firstDeltaAt.set((System.nanoTime() - startedAt) / 1_000_000);
             }
             deltas.add(text);
+            deltaAtNanos.add(System.nanoTime());
         }
 
         @Override
@@ -1298,14 +1361,24 @@ class AiStreamTest {
             Long at = firstDeltaAt.get();
             return at == null ? -1 : at;
         }
+
+        /** 第 1 个增量到达时的纳秒时刻；没有增量时返回 {@code null}。 */
+        synchronized Long firstDeltaAtNanos() {
+            return deltaAtNanos.isEmpty() ? null : deltaAtNanos.get(0);
+        }
+
+        /** 第 2 个增量到达时的纳秒时刻；不足 2 个返回 {@code null}。 */
+        synchronized Long secondDeltaAtNanos() {
+            return deltaAtNanos.size() < 2 ? null : deltaAtNanos.get(1);
+        }
     }
 
     // ------------------------------------------------------------------
     // 辅助：能逐字节控制发送节奏的桩
     // ------------------------------------------------------------------
 
-    /** 一段要发出去的字节 + 发送前的等待毫秒数。 */
-    private record Chunk(byte[] bytes, int delayMillis) {
+    /** 一段要发出去的字节 + 发送前的等待毫秒数 + 可选的「门」（见 {@link #gated}）。 */
+    private record Chunk(byte[] bytes, int delayMillis, CountDownLatch gate) {
     }
 
     /**
@@ -1331,6 +1404,16 @@ class AiStreamTest {
         private final AtomicBoolean disconnected = new AtomicBoolean();
         private final AtomicReference<String> disconnectFailure = new AtomicReference<>();
         private final AtomicInteger deltasSeen = new AtomicInteger();
+
+        /**
+         * 「门」机制的两个观测值 + 桩自身的起点（{@code stream_doesNotBufferWholeResponseInMemory}
+         * 的因果判据用）：门关闭时刻、带门的分片写出时刻——都与 listener 的时间戳同一个时基
+         * （{@code System.nanoTime()}），于是两条时间戳可以直接比较大小。
+         */
+        private static final long GATE_TIMEOUT_SECONDS = 5;
+        private final AtomicReference<Long> gateClosedAtNanos = new AtomicReference<>();
+        private final AtomicReference<Long> gatedChunkSentAtNanos = new AtomicReference<>();
+        private final AtomicBoolean gateTimedOut = new AtomicBoolean();
 
         private final List<String> paths = new ArrayList<>();
         private final List<String> methods = new ArrayList<>();
@@ -1503,6 +1586,21 @@ class AiStreamTest {
             return requestArrived.get();
         }
 
+        /** 门被关闭的时刻（纳秒，时基 = {@code System.nanoTime()}）；从未关闭过返回 {@code null}。 */
+        Long gateClosedAtNanos() {
+            return gateClosedAtNanos.get();
+        }
+
+        /** 带门的那一段分片被写出去的时刻（纳秒，同一时基）；从未写出返回 {@code null}。 */
+        Long gatedChunkSentAtNanos() {
+            return gatedChunkSentAtNanos.get();
+        }
+
+        /** 门是否是被<b>超时</b>放开的（正确实现下必须是 {@code false}）。 */
+        boolean gateTimedOut() {
+            return gateTimedOut.get();
+        }
+
         int deltasSeen() {
             return deltasSeen.get();
         }
@@ -1582,8 +1680,22 @@ class AiStreamTest {
                         if (next.delayMillis() > 0) {
                             Thread.sleep(next.delayMillis());
                         }
+                        if (next.gate() != null) {
+                            // 因果判据的载体：写这一段之前必须等到「listener 已收到第 1 个增量」。
+                            // 超时只会在实现把整条响应缓冲完才回调时发生（那就是要判死的形状），
+                            // 正常实现是毫秒级打开，所以这个上界不参与「流式与否」的判定。
+                            //
+                            // 中选用的判据是**纳秒**时间戳：毫秒在本地桩上几乎总是同值（实测 8ms vs 8ms），
+                            // 用它比大小会把「先到」与「同时到」混为一谈。
+                            boolean opened = next.gate().await(GATE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                            gateClosedAtNanos.set(System.nanoTime());   // 先落时刻，再放行分片
+                            gateTimedOut.set(!opened);
+                        }
                         out.write(next.bytes());
                         out.flush();
+                        if (next.gate() != null) {
+                            gatedChunkSentAtNanos.set(System.nanoTime());
+                        }
                         deltasSeen.incrementAndGet();
                     }
                 } catch (InterruptedException interrupted) {
