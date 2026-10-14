@@ -29,6 +29,48 @@ final class CssTokens {
     /** 任意「数字 + 单位」：px / em / % / pt。 */
     private static final Pattern LENGTH = Pattern.compile("(\\d+(?:\\.\\d+)?)(px|em|%)");
 
+    /**
+     * <b>长度类</b> JavaFX CSS 属性名（不含单位后缀）。
+     *
+     * <p>N1（2026-10-14 fix round 2）的教训：这类属性的转换器要的是 {@code javafx.css.Size} 或
+     * {@code Number}，而查找值（{@code -fx-sp-*} / {@code -fx-r-*} 这类被定义成 {@code 0.27em} 的
+     * 自定义令牌）在运行时被解析成 {@code Double}，于是 JavaFX 25 抛
+     * {@code ClassCastException: Double cannot be cast to Size} 并<b>忽略该声明</b>——
+     * 全站内边距与圆角实际为 0，而 {@code CssParser.errorsProperty()} 一声不响。
+     *
+     * <p>因此凡是出现在这里的属性，值一律只能是<b>字面数值</b>（可带 {@code em} / {@code px} 单位）。
+     * 名单是<b>显式白名单</b>：上游新增一个长度属性而这里没有收录，护栏不会因此变松——
+     * {@link #lengthClassDeclarationsWithLookupValue} 只对名单内的属性判红，误报只会出现在名单外。
+     */
+    static final List<String> LENGTH_CLASS_PROPERTIES = List.of(
+            "-fx-padding",
+            "-fx-background-radius", "-fx-border-radius",
+            "-fx-background-insets", "-fx-border-insets",
+            "-fx-border-width",
+            "-fx-spacing",
+            "-fx-min-width", "-fx-max-width", "-fx-pref-width",
+            "-fx-min-height", "-fx-max-height", "-fx-pref-height");
+
+    /**
+     * 找出「长度类属性被赋了查找值（值里出现 {@code -fx-*}）」的声明，按文件顺序返回。
+     *
+     * @return 每条描述成 {@code selector { property: value } (line N)}，便于直接写进断言消息
+     */
+    static List<String> lengthClassDeclarationsWithLookupValue(String resourcePath) {
+        List<String> offenders = new ArrayList<>();
+        for (Decl d : parse(resourcePath)) {
+            if (!LENGTH_CLASS_PROPERTIES.contains(d.property())) {
+                continue;
+            }
+            Matcher m = Pattern.compile("-fx-[a-z][a-z0-9-]*").matcher(d.rawValue());
+            if (m.find()) {
+                offenders.add(d.selector() + " { " + d.property() + ": " + d.rawValue() + " } (line "
+                        + d.line() + "，引用 " + m.group() + ")");
+            }
+        }
+        return offenders;
+    }
+
     private CssTokens() {
     }
 

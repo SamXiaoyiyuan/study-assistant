@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * <b>护栏 2（禁用色审计）</b>与<b>护栏 5（DPI 安全）</b>。
@@ -301,6 +302,103 @@ class ColorAuditTest {
     }
 
     // ================================================================ ⑤ DPI 安全
+
+    /**
+     * N1 护栏（2026-10-14 fix round 2，Blocker 级）：
+     * <b>长度类属性一律不得引用 {@code -fx-*} 查找值</b>。
+     *
+     * <p>为什么这条护栏是承重的，而不是风格偏好：JavaFX 25 的长度转换器要的是
+     * {@code javafx.css.Size} / {@code Number}，而查找值在运行时被解析成 {@code Double}，
+     * 于是每渲染一次就抛
+     * {@code ClassCastException: class java.lang.Double cannot be cast to class javafx.css.Size}
+     * 并<b>静默忽略该声明</b>。{@code CssParser.errorsProperty()} 只报语法错，这条完全看不见——
+     * 修复前 31 处声明全被忽略，全站 padding 与圆角实际为 0。
+     *
+     * <p>本机实测（2026-10-14，探针在 {@code %TEMP%\p3t1fix2\}）：
+     * 修复前 {@code .card} 的 {@code getPadding()} = {@code top=0 right=0 bottom=0 left=0}、
+     * {@code getBackground().getRadii()} = {@code tl=0 tr=0 br=0 bl=0}；修复后分别是
+     * {@code 16.05} 四边与 {@code 10} 四角。
+     *
+     * <p>合法取值只有两种：字面数值（可带 {@code em} / {@code px}）。{@code px} 仍只允许
+     * {@code .root} 的 {@code -fx-font-size} 那一处（由 {@link #allOtherLengths_useEmOnly} 守着），
+     * 所以这条断言只可能被判红的写法就是查找值本身。
+     */
+    @Test
+    void appCss_lengthProperties_neverReferenceLookupValues() {
+        List<String> offenders = CssTokens.lengthClassDeclarationsWithLookupValue("/css/app.css");
+        assertEquals(List.of(), offenders,
+                "app.css 里长度类属性（" + CssTokens.LENGTH_CLASS_PROPERTIES + "）不得引用 -fx-* 查找值："
+                        + "JavaFX 25 会抛 ClassCastException 并静默忽略整条声明（N1：修复前 31 处，"
+                        + "全站 padding/圆角实际为 0）。必须写成字面数值（em / 裸数值）或改到 Java 侧设定。"
+                        + "违规声明：" + offenders);
+        // 反向证据：护栏必须真的扫到了那些属性，否则「0 违规」可能只是「0 命中」
+        long scanned = CssTokens.parse("/css/app.css").stream()
+                .filter(d -> CssTokens.LENGTH_CLASS_PROPERTIES.contains(d.property()))
+                .count();
+        assertTrue(scanned >= 40,
+                "app.css 里被扫描的长度类声明太少（" + scanned + "），护栏形同虚设");
+        System.out.println("[evidence] app.css 长度类声明共 " + scanned
+                + " 条，其中引用查找值的 0 条（N1 修复前是 31 条）");
+    }
+
+    @Test
+    void appCss_lengthLiterals_areNumericallyEqualOrEquivalentToTheirDesignTokens() {
+        // 上面那条只保证「不再引用查找值」，这条保证「换成字面值之后仍然等于原来的设计令牌」。
+        // 判据对**所有长度类属性**一致：把这些长度声明按空白/逗号拆成一个个分量，
+        //   · 每个分量要么是某个令牌的字面值（间距族 em 值 / 圆角族裸数值），
+        //   · 要么是 `0`（清零：.table-view / .list-view / .scroll-pane / .chart / .crisis-bar 的角）；
+        // 否则就是「手写了一个既不是令牌值、也不是清零」的数——那正是漂移。
+        //
+        // 于是「改令牌不改 app.css」会红，「把 1.07em 手写成 1.08em」也会红，
+        // 而 `.chip` 的 0.2em 0.6em / `.table-cell` 的 0.4em 0.7em /
+        // `.chart-line-symbol` 的 0.36em（指南未给令牌的细调）被显式记为**豁免**，
+        // 豁免条数被钉死——将来谁把它们也换成令牌值，这条会红着提醒同步更新这份清单。
+        Set<String> allowedLengths = new LinkedHashSet<>();
+        for (int i = 1; i <= 7; i++) {
+            allowedLengths.add(ThemeTokens.nonColorValue("-fx-sp-" + i, ThemeMode.LIGHT));
+        }
+        for (String key : List.of("-fx-r-control", "-fx-r-card", "-fx-r-dialog", "-fx-r-pill")) {
+            allowedLengths.add(ThemeTokens.nonColorValue(key, ThemeMode.LIGHT));
+        }
+        // 豁免清单：指南未给长度令牌的字面值。**逐个写死**，不是「凡是认不出来就放过」——
+        // 实际用量的值集合与它必须完全相等（下面断言），所以多一个少一个都会红。
+        Set<String> declaredExempt = new LinkedHashSet<>(List.of(
+                "0.2em", "0.6em",           // .chip 内边距（细调）
+                "0.4em", "0.7em",           // .table-view .table-cell 内边距（细调）
+                "0.36em",                   // .default-color0.chart-line-symbol 尺寸
+                "0.7em",                    // .scroll-bar 的 pref-width / pref-height
+                "2.9em", "2.4em", "6em",    // .button / .text-field / .text-area 的 min-height
+                "46em",                     // .reading 的 max-width（指南 §3.2 的可读行宽）
+                "1", "2", "-2"));           // 描边宽度与焦点 insets（guides §2.3）
+
+        List<String> checked = new ArrayList<>();
+        Set<String> actualExempt = new LinkedHashSet<>();
+        for (CssTokens.Decl d : CssTokens.parse("/css/app.css")) {
+            if (!CssTokens.LENGTH_CLASS_PROPERTIES.contains(d.property())) {
+                continue;
+            }
+            for (String part : d.rawValue().replace(",", " ").split("\\s+")) {
+                if (part.startsWith("-fx-")) {
+                    continue; // 查找值由上面那条断言负责，这里只看「已经换成字面值之后对不对」
+                }
+                if (allowedLengths.contains(part) || "0".equals(part)) {
+                    checked.add(d.property() + "@" + d.selector() + "=" + part);
+                } else if (declaredExempt.contains(part)) {
+                    actualExempt.add(part);
+                } else {
+                    fail(d.selector() + " { " + d.property() + ": " + d.rawValue() + " } 的 " + part
+                            + " 既不是任何令牌值（" + allowedLengths + "），也不是清零 0，"
+                            + "也不在豁免清单 " + declaredExempt + " 里");
+                }
+            }
+        }
+        assertTrue(checked.size() >= 40,
+                "被核对「字面值 = 令牌值」的分量太少（" + checked.size() + "），护栏形同虚设：" + checked);
+        assertEquals(declaredExempt, actualExempt,
+                "豁免清单必须与实际用量逐值相等（写死的目的就是让「新加一个字面长度」必须显式登记）");
+        System.out.println("[evidence] 与令牌逐字核对的字面长度分量共 " + checked.size()
+                + " 个；豁免（指南未给令牌的字面值）实际用到 " + actualExempt.size() + " 个：" + actualExempt);
+    }
 
     @Test
     void tokenFiles_containExactlyOnePxOccurrence_andItIsTheRootFontSize() {

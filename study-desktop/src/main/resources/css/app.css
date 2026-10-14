@@ -3,6 +3,12 @@
    规则：
      - 只用 -fx-c-* / CHART_COLOR_* 查找色与 -fx-* 非颜色令牌；**不含任何字面色值**
      - 不含任何 px：尺寸一律 em 或裸倍率（本机 200% 缩放，写死 px 必然破版）
+     - **长度类属性一律写字面值**（`-fx-padding` / `-fx-*-radius` / `-fx-min-height` …）：
+       JavaFX 25 的长度转换器要 `javafx.css.Size`，而 tokens-*.css 里那些自定义长度令牌
+       （间距族 / 圆角族）在运行时被解析成 `Double` → 抛 `ClassCastException` 并**静默忽略整条声明**
+       （`CssParser` 只报语法错）。修复前 31 处声明（内边距 11 / 圆角 19 / 最小高度 1）全部失效，
+       全站 padding 与圆角实际为 0。字面值必须与令牌逐字一致：两条长度护栏（在色值审计测试类里）
+       焊住这一点——一条禁止长度属性引用查找值，一条把字面值与令牌逐值对齐。
      - 必须最后加载（guides §2.2）：tokens-*.css → app.css，否则组件样式被基线覆盖
      - 不用 ProgressBar 表达计划完成度（隐含「落后」语义，见 guides §4.2）
      - 状态永远「文字 + 形状 + 中性色」三重编码，绝不只靠颜色
@@ -30,11 +36,11 @@
 /* ---------- 面 / 卡片 ---------- */
 .card {
     -fx-background-color: -fx-c-surface;
-    -fx-background-radius: -fx-r-card;
+    -fx-background-radius: 10;   /* = -fx-r-card（字面值，见文件头「长度类属性一律写字面值」） */
     -fx-border-color: -fx-c-border-subtle;
-    -fx-border-radius: -fx-r-card;
+    -fx-border-radius: 10;       /* = -fx-r-card */
     -fx-border-width: 1;
-    -fx-padding: -fx-sp-4;
+    -fx-padding: 1.07em;         /* = -fx-sp-4 */
     -fx-effect: -fx-sh-card;
 }
 
@@ -82,13 +88,13 @@
 /* ---------- 按钮（主按钮高度 ≈ 44 逻辑像素，随 em 缩放） ---------- */
 .button {
     -fx-font-size: 1.00em;
-    -fx-padding: -fx-sp-3 -fx-sp-5;
+    -fx-padding: 0.80em 1.60em;  /* = -fx-sp-3 / -fx-sp-5 */
     -fx-min-height: 2.9em;
-    -fx-background-radius: -fx-r-control;
+    -fx-background-radius: 6;    /* = -fx-r-control */
     -fx-background-color: -fx-c-surface;
     -fx-text-fill: -fx-c-text;
     -fx-border-color: -fx-c-border-control;
-    -fx-border-radius: -fx-r-control;
+    -fx-border-radius: 6;        /* = -fx-r-control */
     -fx-border-width: 1;
     -fx-border-insets: 0;
 }
@@ -134,14 +140,14 @@
 /* ---------- 输入控件 ---------- */
 .text-field, .text-area, .combo-box, .choice-box, .spinner {
     -fx-background-color: -fx-c-surface;
-    -fx-background-radius: -fx-r-control;
+    -fx-background-radius: 6;    /* = -fx-r-control */
     -fx-border-color: -fx-c-border-control;
-    -fx-border-radius: -fx-r-control;
+    -fx-border-radius: 6;        /* = -fx-r-control */
     -fx-border-width: 1;
     -fx-text-fill: -fx-c-text;
     -fx-prompt-text-fill: -fx-c-text-tertiary;
     -fx-font-size: 1.00em;
-    -fx-padding: -fx-sp-2 -fx-sp-3;
+    -fx-padding: 0.53em 0.80em;  /* = -fx-sp-2 / -fx-sp-3 */
 }
 .text-field {
     -fx-min-height: 2.4em;
@@ -170,11 +176,11 @@
 /* ---------- 中性提示条（替代 Alert.WARNING / ERROR） ---------- */
 .notice {
     -fx-background-color: -fx-c-notice-bg;
-    -fx-background-radius: -fx-r-control;
+    -fx-background-radius: 6;    /* = -fx-r-control */
     -fx-border-color: -fx-c-notice-border;
-    -fx-border-radius: -fx-r-control;
+    -fx-border-radius: 6;        /* = -fx-r-control */
     -fx-border-width: 1;
-    -fx-padding: -fx-sp-3 -fx-sp-4;
+    -fx-padding: 0.80em 1.07em;  /* = -fx-sp-3 / -fx-sp-4 */
 }
 .notice .label {
     -fx-text-fill: -fx-c-notice-text;
@@ -190,15 +196,15 @@
        这里让暖砂底只从**左**内缩 0.2em（根字号 15px → 3 逻辑像素），色条只在最左 3px 露出来。 */
     -fx-background-color: -fx-c-crisis-bar, -fx-c-crisis-bg;
     -fx-background-insets: 0 0 0 0, 0 0 0 0.2em;
-    -fx-background-radius: -fx-r-card, -fx-r-card;
+    -fx-background-radius: 10, 10;  /* 两层各一个圆角 = -fx-r-card */
     -fx-border-color: -fx-c-crisis-border;
-    -fx-border-radius: -fx-r-card;
+    -fx-border-radius: 10;          /* = -fx-r-card */
     -fx-border-width: 1;
     /* 正文的左内边距必须**大于**色条宽度（0.2em），否则正文压在色条上（text on bar 只有 1.80/1.65:1）。
-       这里写字面 em：实测 `-fx-padding: -fx-sp-4 ...` 在 JavaFX 25 下抛 ClassCastException 后被忽略
-       （Double 不能转 javafx.css.Size），等于没有内边距（见 task-1-fix1-report.md 的新增发现 N1），
-       而本面板的内边距是 Blocker 的关键路径。字面值与 -fx-sp-4 / -fx-sp-5 的耦合由
-       ContrastTest.crisisPanelTextIsAlwaysOnCrisisBg_andTheAccentBarIsOnlyANarrowLeftStrip 焊住。 */
+       字面 em 的含义与全站一致（见文件头「长度类属性一律写字面值」）：`-fx-padding: -fx-sp-4 ...`
+       在 JavaFX 25 下抛 ClassCastException 后被忽略（Double 不能转 javafx.css.Size），
+       等于没有内边距。字面值与 -fx-sp-4 / -fx-sp-5 的耦合由两条断言焊住：
+       色值审计测试类里的长度护栏，以及 ContrastTest 里危机面板那一条（两层 insets + padding + 对比度）。 */
     -fx-padding: 1.07em 1.07em 1.07em 1.60em;
 }
 .crisis-panel .crisis-title {
@@ -216,12 +222,12 @@
 }
 .crisis-bar {
     -fx-background-color: -fx-c-crisis-bar;
-    -fx-background-radius: -fx-r-card 0 0 -fx-r-card;
+    -fx-background-radius: 10 0 0 10;  /* 左上/右下 = -fx-r-card，右上/左下 = 0 */
 }
 
 /* ---------- 状态 chip（文字 + 形状 + 中性色三重编码） ---------- */
 .chip {
-    -fx-background-radius: -fx-r-pill;
+    -fx-background-radius: 999;  /* = -fx-r-pill */
     -fx-padding: 0.2em 0.6em;
     -fx-font-size: 0.87em;
     -fx-background-color: -fx-c-surface-muted;
@@ -231,28 +237,28 @@
     -fx-text-fill: -fx-c-state-active;
     -fx-background-color: -fx-c-surface-muted;
     -fx-border-color: -fx-c-state-active;
-    -fx-border-radius: -fx-r-pill;
+    -fx-border-radius: 999;      /* = -fx-r-pill */
     -fx-border-width: 1;
 }
 .chip.state-done {
     -fx-text-fill: -fx-c-state-done;
     -fx-background-color: -fx-c-surface-muted;
     -fx-border-color: -fx-c-state-done;
-    -fx-border-radius: -fx-r-pill;
+    -fx-border-radius: 999;      /* = -fx-r-pill */
     -fx-border-width: 1;
 }
 .chip.state-paused {
     -fx-text-fill: -fx-c-state-paused;
     -fx-background-color: -fx-c-surface-muted;
     -fx-border-color: -fx-c-state-paused;
-    -fx-border-radius: -fx-r-pill;
+    -fx-border-radius: 999;      /* = -fx-r-pill */
     -fx-border-width: 1;
 }
 .chip.state-cancelled {
     -fx-text-fill: -fx-c-state-cancelled;
     -fx-background-color: -fx-c-surface-muted;
     -fx-border-color: -fx-c-state-cancelled;
-    -fx-border-radius: -fx-r-pill;
+    -fx-border-radius: 999;      /* = -fx-r-pill */
     -fx-border-width: 1;
 }
 /* 待回报：无独立色相，靠虚线形状区分 */
@@ -260,7 +266,7 @@
     -fx-text-fill: -fx-c-state-await;
     -fx-background-color: transparent;
     -fx-border-color: -fx-c-state-await-line;
-    -fx-border-radius: -fx-r-pill;
+    -fx-border-radius: 999;      /* = -fx-r-pill */
     -fx-border-width: 1;
     -fx-border-style: segments(2, 2);
 }
@@ -268,9 +274,9 @@
 /* ---------- 表格 ---------- */
 .table-view {
     -fx-background-color: -fx-c-surface;
-    -fx-background-radius: -fx-r-card;
+    -fx-background-radius: 10;   /* = -fx-r-card */
     -fx-border-color: -fx-c-border-subtle;
-    -fx-border-radius: -fx-r-card;
+    -fx-border-radius: 10;       /* = -fx-r-card */
     -fx-border-width: 1;
     -fx-padding: 0;
     -fx-table-cell-border-color: transparent;
@@ -331,7 +337,7 @@
 }
 .list-cell {
     -fx-background-color: transparent;
-    -fx-padding: -fx-sp-2 -fx-sp-3;
+    -fx-padding: 0.53em 0.80em;  /* = -fx-sp-2 / -fx-sp-3 */
     -fx-text-fill: -fx-c-text;
     -fx-font-size: 1.00em;
     -fx-cell-size: 2.6em;
@@ -354,7 +360,7 @@
 }
 .scroll-bar:vertical .thumb, .scroll-bar:horizontal .thumb {
     -fx-background-color: -fx-c-border-control;
-    -fx-background-radius: -fx-r-pill;
+    -fx-background-radius: 999;  /* = -fx-r-pill */
 }
 .scroll-bar:vertical {
     -fx-pref-width: 0.7em;
@@ -366,7 +372,7 @@
 /* ---------- 对话框 ---------- */
 .dialog-pane {
     -fx-background-color: -fx-c-surface;
-    -fx-padding: -fx-sp-4;
+    -fx-padding: 1.07em;         /* = -fx-sp-4 */
 }
 .dialog-pane > .header-panel {
     -fx-background-color: -fx-c-surface-muted;
@@ -386,12 +392,12 @@
     -fx-background-color: -fx-c-surface;
     -fx-border-color: transparent -fx-c-border-subtle transparent transparent;
     -fx-border-width: 0 1 0 0;
-    -fx-padding: -fx-sp-3;
+    -fx-padding: 0.80em;         /* = -fx-sp-3 */
 }
 .nav-item {
     -fx-background-color: transparent;
-    -fx-background-radius: -fx-r-control;
-    -fx-padding: -fx-sp-2 -fx-sp-3;
+    -fx-background-radius: 6;    /* = -fx-r-control */
+    -fx-padding: 0.53em 0.80em;  /* = -fx-sp-2 / -fx-sp-3 */
     -fx-text-fill: -fx-c-text-secondary;
     -fx-font-size: 0.93em;
 }
@@ -410,13 +416,13 @@
     -fx-background-color: -fx-c-surface;
     -fx-border-color: transparent transparent -fx-c-border-subtle transparent;
     -fx-border-width: 0 0 1 0;
-    -fx-padding: -fx-sp-3 -fx-sp-4;
+    -fx-padding: 0.80em 1.07em;  /* = -fx-sp-3 / -fx-sp-4 */
 }
 .status-bar {
     -fx-background-color: -fx-c-surface-muted;
     -fx-border-color: -fx-c-border-subtle transparent transparent transparent;
     -fx-border-width: 1 0 0 0;
-    -fx-padding: -fx-sp-2 -fx-sp-4;
+    -fx-padding: 0.53em 1.07em;  /* = -fx-sp-2 / -fx-sp-4 */
 }
 .status-bar .label {
     -fx-text-fill: -fx-c-text-tertiary;
