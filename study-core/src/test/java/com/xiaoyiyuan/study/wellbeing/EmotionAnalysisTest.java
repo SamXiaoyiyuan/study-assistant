@@ -231,6 +231,34 @@ class EmotionAnalysisTest {
         assertEquals(1, window(TODAY, TODAY).select(sampleLog()).size());
     }
 
+    /**
+     * {@code dayCount()} 的算术：含两端、跨月跨年、以及 {@code LocalDate} 全域都不溢出。
+     *
+     * <p><b>为什么这条用例必须存在</b>：本方法此前是全仓库零调用的公开 API，而账本与
+     * {@code task-9-review.md} 都声称「{@code (MIN,MAX).dayCount()=730484999634} 不溢出由评审补测」——
+     * 那条断言在测试树里<b>根本不存在</b>。终审探针实跑确认值本身是对的（溢出担忧不成立），
+     * 但「由测试钉住」这一说法当时并不属实。这条用例就是让它名副其实：断言是真的、数是钉死的。
+     *
+     * <p>刻意钉<b>具体数字</b>而不是「大于 0」：{@code dayCount} 的唯一风险就是把
+     * {@code +1}（含两端）写成 {@code -1} 或漏掉——那种错误在「大于 0」的口径下全绿。
+     * 两个端点的差是 {@code to.toEpochDay() - from.toEpochDay() + 1}，全域共 730484999634 天。
+     */
+    @Test
+    void dayCount_isInclusiveOfBothEnds_andDoesNotOverflowAcrossTheWholeRange() throws Exception {
+        assertEquals(7, window(LocalDate.of(2026, 10, 4), LocalDate.of(2026, 10, 10)).dayCount(),
+                "「近 7 天」必须报 7 天：含两端，写成 6 或 8 都会让确认页与实际发送的条数对不上");
+        assertEquals(1, window(TODAY, TODAY).dayCount(), "单日窗口是 1 天，不是 0 天");
+        assertEquals(32, window(LocalDate.of(2026, 3, 1), LocalDate.of(2026, 4, 1)).dayCount(),
+                "跨月要按真实天数算：3 月 1 日到 4 月 1 日含两端是 32 天");
+        assertEquals(730484999634L,
+                new AnalysisWindow(LocalDate.MIN, LocalDate.MAX).dayCount(),
+                "LocalDate 全域的天数必须落在 long 里、且带 +1（含两端）——这条正是账本声称"
+                        + "「由评审补测」而实际缺失的那条断言");
+        assertEquals("long",
+                AnalysisWindow.class.getMethod("dayCount").getReturnType().getName(),
+                "返回类型必须是 long：退化成 int 时上面那个千亿级的数字会被截断成一个完全不同的值");
+    }
+
     // =====================================================================
     // 2. 时间窗选取：一条不少、一条不进
     // =====================================================================

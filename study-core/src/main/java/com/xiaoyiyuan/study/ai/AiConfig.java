@@ -50,7 +50,7 @@ public record AiConfig(String baseUrl, String apiKey, String model, Duration tim
         }
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException(
-                    "请求超时必须为正数；收到：" + timeout + "。零或负超时会让每次请求直接失败。");
+                    "请求超时必须为正数；收到：" + timeout + "。零或负超时会让每次请求无法发出。");
         }
     }
 

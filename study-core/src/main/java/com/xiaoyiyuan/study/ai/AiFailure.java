@@ -19,8 +19,15 @@ public final class AiFailure extends Exception {
 
     private static final long serialVersionUID = 1L;
 
-    /** 禁止出现在用户可见消息里的界面禁用词（spec §8.2）。 */
-    private static final String[] BANNED_WORDS = {
+    /**
+     * 禁止出现在用户可见消息里的界面禁用词（spec §8.2）。
+     *
+     * <p><b>包内可见而不是 private</b>：它是本条款的<b>唯一一份</b>词表。除了本类的构造器，
+     * {@link AiClient} 在拼接「底层异常的文案」时也要用同一份清单过滤——两份清单迟早会漂移，
+     * 而漂移的代价正好是本条款要避免的那件事（禁用词被显示给用户）。保持包内可见，
+     * 既让复用成为可能，又不把它变成对外公开面。
+     */
+    static final String[] BANNED_WORDS = {
         "未完成", "逾期", "落后", "断签", "失败", "警告", "已放弃", "未坚持"
     };
 
@@ -66,4 +73,47 @@ public final class AiFailure extends Exception {
         }
         return message;
     }
+
+    /**
+     * 消息里第一个命中的界面禁用词；一个都没有时返回 {@code null}。
+     *
+     * <p>与 {@link #validate} 用同一份 {@link #BANNED_WORDS}：这里回答的是「有没有」，
+     * 构造器回答的是「有就拒绝」。两者分开是为了让「拼接消息的调用方」（{@link AiClient}）
+     * 能在<b>交给构造器之前</b>先处理掉禁用词——等到构造器抛异常时，那次请求的
+     * {@link AiFailure} 契约就已经破了。
+     */
+    static String firstBannedWord(String message) {
+        if (message == null) {
+            return null;
+        }
+        for (String banned : BANNED_WORDS) {
+            if (message.contains(banned)) {
+                return banned;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 把消息里出现的界面禁用词换成中性占位符 {@value #REDACTION_PLACEHOLDER}；没有命中就原样返回。
+     *
+     * <p><b>为什么是「替换」而不是「拒绝」</b>：这里是消息<b>出口</b>，不是编码现场。
+     * 消息里那段文字的分母不归 {@code ai} 包控制（JDK 的 {@code IOException}／Gson 的解析异常／
+     * 用户填的 base_url 都可能带出任何字），所以不能因为其中恰好出现一个禁用词就把整次失败
+     * 变成 {@link IllegalArgumentException}——那会让调用方拿不到 {@link AiFailure}，
+     * 界面也就无法区分「网络不通」与「程序出错」。替换既守住条款，又保住契约。
+     */
+    static String redactBannedWords(String message) {
+        if (message == null) {
+            return null;
+        }
+        String redacted = message;
+        for (String banned : BANNED_WORDS) {
+            redacted = redacted.replace(banned, REDACTION_PLACEHOLDER);
+        }
+        return redacted;
+    }
+
+    /** 被过滤掉的禁用词的替身：本身中性、且在界面上看得出「此处原本有一处不对劲的措辞」。 */
+    static final String REDACTION_PLACEHOLDER = "［措辞已中性化］";
 }

@@ -721,6 +721,23 @@ assertEquals(new AnalysisWindow(LocalDate.of(2026,10,4), LocalDate.of(2026,10,10
 | §9 测试 #13 `DisabledWordTest` | 它扫描的是**界面文案** | 计划 3 |
 | §8 的 8 个页面、CSS、jpackage | 全是界面与打包 | 计划 3 |
 
+## 计划 2 的全部 opt-in 属性
+
+下列属性**默认都不存在**。缺省时相关用例必须 `skipped`（不是 error）：一条真实档案守卫若在
+`Path.of(null)` 上抛 NPE，整轮 `clean test` 就会变成 BUILD FAILURE，而整轮红会掩盖真正失败的那条用例。
+`MVN` 会把 `-D` 原样转给 surefire，所以这些值从命令行直达测试里的 `System.getProperty(...)`。
+
+| 属性 | 作用 | 唯一的使用者 | 缺省时 |
+|---|---|---|---|
+| `study.realFile` | 只读地用真实档案跑一轮：`RealFileRoundTripTest`（逐字节往返）、`EncodingTest.realFile_hasNoBomAndNoCrlf`（无 BOM / 纯 LF / 13377 字节）、`RealMigrationPreviewTest` 的两条用例（迁移预览与「散文一行都不许缺席」断言） | 3 个测试类 | 整类 / 单条用例 `skipped`（类级 `@EnabledIfSystemProperty` + 用例内 `assumeTrue` 双保险） |
+| `study.previewOut` | 把迁移结果写到哪里，供人工逐节通读（spec §4.6 第 3 步「展示完整 diff」） | `RealMigrationPreviewTest.writePreviewForHumanReview` | 该条 `skipped`（预览是给人看的产物，不是回归网） |
+| `study.previewAllowedAbsentFile` | **负向验证钩子**：指向一份「允许缺席」清单文件（一行一条）。给定时，只有清单里的行算允许缺席 | `RealMigrationPreviewTest.noProseLineFromTheRealArchiveIsAbsentFromTheTarget` | 走内置的三类判据（`---` / `#` 标题 / `|` 表格行），断言行为完全不受影响 |
+| `study.previewDropLine` | **负向验证钩子**：给出一条**真实存在**的源行原文，断言用的目标文本会先删掉该行，于是断言必须红 | 同上 | 不删任何行；正常断言 |
+
+两个负向钩子只影响断言、不碰档案也不碰迁移：它们的用途是证明「散文缺席」那条断言**真的会亮红**，
+而不是一条空转的绿灯。`study.previewAllowedAbsentFile` 用**文件**而不是逗号分隔的 `-D` 值，
+因为真实档案的行里有中文、空格与全角符号，从命令行传一串行文本会被 shell 拆散（实测 exit 255）。
+
 ## 计划 2 验收标准
 
 全部满足才算完成：

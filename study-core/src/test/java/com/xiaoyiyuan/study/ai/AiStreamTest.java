@@ -428,9 +428,17 @@ class AiStreamTest {
     @Test
     void stream_doesNotBufferWholeResponseInMemory() throws Exception {
         // 桩在 [DONE] 之前睡 300ms。若实现是「读完整个响应再回调」，第一个增量这时都还没到。
+        final int stubSleepBeforeDoneMillis = 300;
+        // 判据是「首个增量远早于桩睡完」——但要留出调度/JIT/杀毒扫描的抖动余量。
+        // 修前用的是写死的 150ms：桩睡 300ms，阈值的余量只有 150ms，负载一高就偶发红，
+        // 而红的不是实现（实现确实是流式），是阈值太紧。改成「桩睡眠的 3/4、且不超过 250ms」：
+        //   · 与桩睡眠成比例 → 桩若睡 300ms，阈值 225ms；桩哪天改成 2s，阈值也不会跟着变成 1.5s 那种
+        //     与实现无关的巨值（上限 250ms 把绝对余量钉住）；
+        //   · 区分力没丢：整包缓冲的实现要等桩睡完（≥300ms）才会回调，225/250ms 的阈值照样能判死它。
+        int firstDeltaBudgetMillis = Math.min(250, stubSleepBeforeDoneMillis * 3 / 4);
         stub = StreamStub.scripted(List.of(
                 chunk(sse(delta("早")), 0),
-                chunk(sse(delta("晚")), 300),
+                chunk(sse(delta("晚")), stubSleepBeforeDoneMillis),
                 chunk(sse("[DONE]"), 0)));
         RecordingListener listener = new RecordingListener();
 
@@ -439,8 +447,10 @@ class AiStreamTest {
         long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000;
 
         assertEquals(2, listener.deltaCount(), "两个增量都必须到达");
-        assertTrue(listener.firstDeltaAtMillis() >= 0 && listener.firstDeltaAtMillis() < 150,
-                "第一个增量必须在桩睡眠期间（<150ms）就到达客户端，说明是流式而非整包缓冲；"
+        assertTrue(listener.firstDeltaAtMillis() >= 0
+                        && listener.firstDeltaAtMillis() < firstDeltaBudgetMillis,
+                "第一个增量必须在桩睡眠期间（<" + firstDeltaBudgetMillis + "ms，桩睡 "
+                        + stubSleepBeforeDoneMillis + "ms）就到达客户端，说明是流式而非整包缓冲；"
                         + "实际首个增量在 " + listener.firstDeltaAtMillis()
                         + "ms，整个调用 " + elapsedMillis + "ms");
         assertTrue(elapsedMillis >= 250,
@@ -787,6 +797,59 @@ class AiStreamTest {
         assertTrue(failure.getMessage().contains("凑不出一个完整字符"),
                 "消息要点明丢弃的原因；实际：" + failure.getMessage());
         assertEquals(0, listener.completeCount());
+    }
+
+    /**
+     * 收尾修复波（Minor-5）：流式入口的失败也走同一个出口（{@code failure()}），所以
+     * 「不归本包控制的文字里带界面禁用词」这件事对流式同样成立——出口必须<b>把它换掉</b>，
+     * 而不是让 {@link AiFailure} 的构造器抛 {@link IllegalArgumentException}。
+     *
+     * <p><b>为什么载体是 base_url 的路径而不是 Gson 的解析片段</b>：本用例最初写的是
+     * 「让 Gson 把出错处的 JSON 片段写进 message」，但实测 Gson 2.14.0 的解析异常<b>只报位置</b>
+     * （截断的 {@code {"choices":[{"delta":{"content":"x失败y"}}]} 得到
+     * {@code java.io.EOFException: End of input at line 1 column 42 path $.choices}），
+     * 一个禁用词都不带；而流式分片解析失败在 {@code handleEvent} 里是<b>被跳过</b>的（不算失败），
+     * 所以那条路连 {@code describe(e)} 都不会走到。真正会把任意文字拼进消息的是
+     * {@code networkFailure} 里的 {@code config.baseUrl()}——它完全由用户决定。
+     *
+     * <p><b>红在哪（修前）</b>：{@code failure()} 只做 {@code redactSecret}，
+     * 带「失败」的 base_url 原样进了 {@code new AiFailure(...)} → 构造器抛 IAE。
+     * 调用方拿不到 {@link AiFailure}，界面也就分不出「连不上」（可重试）与「程序写错了」。
+     */
+    @Test
+    void failure_stripsInterfaceBannedWordsOutOfWrappedExceptionText_insteadOfBlowingUp()
+            throws Exception {
+        String bannedWord = "失败";
+        // 绑一个端口再关掉：127.0.0.1 上确实没人监听 → 稳定的 NETWORK 失败，
+        // 而失败消息的模板里会拼进这段带「失败」的 base_url。
+        String baseUrl;
+        try (ServerSocket closedPort = new ServerSocket(0)) {
+            baseUrl = "http://127.0.0.1:" + closedPort.getLocalPort() + "/" + bannedWord;
+        }
+        assertTrue(AiClient.endpoint(baseUrl).toString().contains(bannedWord),
+                "前置条件：这段 base_url 能通过规范化、且禁用词保留在最终地址里；实际："
+                        + AiClient.endpoint(baseUrl));
+        AiClient bannedUrlClient = new AiClient(
+                new AiConfig(baseUrl, API_KEY, MODEL, Duration.ofSeconds(5)),
+                HttpClient.newHttpClient());
+        RecordingListener listener = new RecordingListener();
+
+        // 修前这里抛 IllegalArgumentException（而不是 AiFailure），本行直接红。
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> bannedUrlClient.stream(streamRequest("hi"), listener),
+                "含禁用词的失败消息必须仍然以 AiFailure 表达；修前是 IAE（禁用词来自 base_url）");
+        assertEquals(AiFailureKind.NETWORK, failure.kind(),
+                "分类必须照常给出，界面才能照 spec §7.6 决定「重试」的含义；实际："
+                        + failure.kind() + " / " + failure.getMessage());
+        for (String banned : AiFailure.BANNED_WORDS) {
+            assertFalse(failure.getMessage().contains(banned),
+                    "出口必须过滤掉禁用词「" + banned + "」，实际：" + failure.getMessage());
+        }
+        assertTrue(failure.getMessage().contains("措辞已中性化"),
+                "被过滤的位置要留下可见的痕迹，别让界面以为原文本来就是这样；实际："
+                        + failure.getMessage());
+        assertTrue(failure.getMessage().contains("没有拿到任何回复内容"),
+                "既有措辞不受影响：过滤只动禁用词那一段；实际：" + failure.getMessage());
     }
 
     // ------------------------------------------------------------------

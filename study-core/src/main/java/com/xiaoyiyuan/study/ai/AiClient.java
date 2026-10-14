@@ -361,14 +361,23 @@ public final class AiClient {
     }
 
     /**
-     * 用户可见失败的唯一出口（修复轮 1 / 评审 Major-2）。
+     * 用户可见失败的唯一出口（修复轮 1 / 评审 Major-2；收尾修复波补上禁用词这一半）。
      *
      * <p>消息里会拼进底层异常的文案（{@link #describe}）、Gson 解析异常的文案、以及 base_url——
-     * 这些文本的分母不归本类控制。模板本身「碰巧」不带 api_key，但碰巧不是一条性质；
-     * 唯一的出口做一次替换，才能让「密钥不出现在任何用户可见消息里」由代码保证。
+     * 这些文本的分母不归本类控制。模板本身「碰巧」不带 api_key、也「碰巧」不带界面禁用词，
+     * 但碰巧不是一条性质；唯一的出口做两道替换，才能让「密钥与禁用词都不出现在任何用户可见消息里」
+     * 由代码保证。
+     *
+     * <p><b>为什么第 2 道用替换而不是让 {@link AiFailure} 去拒绝</b>：本方法是消息出口，
+     * 不是编码现场（理由见 {@link AiFailure#redactBannedWords}）。若把只做过脱敏的消息直接交给
+     * {@code AiFailure}，一段带禁用词的分母（实测：用户填的 {@code base_url} 会原样进
+     * {@link #networkFailure} 的消息模板）会让本方法抛 {@link IllegalArgumentException}——调用方拿不到
+     * {@code AiFailure}，界面无法把这次请求归类成「网络/超时/格式」中的任何一种，
+     * 也没法照 spec §7.6 给「重试」按钮。所以这里先过滤，再交给构造器；
+     * 构造器那层校验仍然守着「代码里写死的文案不许带禁用词」。
      */
     private AiFailure failure(AiFailureKind kind, String message, Throwable cause) {
-        return new AiFailure(kind, redactSecret(message), cause);
+        return new AiFailure(kind, AiFailure.redactBannedWords(redactSecret(message)), cause);
     }
 
     /** 把消息里出现的 api_key 换成占位符（没出现就原样返回，保持消息可读）。 */

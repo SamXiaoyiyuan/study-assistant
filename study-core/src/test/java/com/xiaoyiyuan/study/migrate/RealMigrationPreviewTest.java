@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * 把<b>真实档案</b>的迁移结果写到指定位置，供人工逐节通读（spec §4.6 第 3 步「展示完整 diff」）。
@@ -28,6 +29,13 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p><b>它只读真实档案</b>：{@code plan()} 不写源文件、不建备份、不建归档，Preview 也写在别处。
  * 通读完成后删掉预览文件即可。
+ *
+ * <h2>每个用例各自守自己的 opt-in 属性（缺了就是 skipped，不是 error）</h2>
+ * 类上的 {@link EnabledIfSystemProperty} 只开启<b>整个类</b>，而本类有两条用例分别需要不同的属性。
+ * 因此每条用例在碰任何属性之前先用 {@link #requireProperty} 把「自己依赖的属性」钉住：
+ * 只给了 {@code study.realFile} 时，需要 {@code study.previewOut} 的那条会<b>跳过</b>，
+ * 而不是在 {@code Path.of(null)} 上抛 NPE 把整轮 {@code clean test} 变成 BUILD FAILURE
+ * （整轮红会掩盖真正失败的用例）。口径与另外三条真实档案守卫完全一致。
  *
  * <h2>为什么除了「写预览」还要有一条断言</h2>
  * 人工通读是权威，但它不是回归网：今天的结论「121 非空行里只有 24 行没进目标，且那 24 行全是
@@ -52,6 +60,18 @@ import static org.junit.jupiter.api.Assertions.*;
 class RealMigrationPreviewTest {
 
     /**
+     * 真实档案的路径。类级守卫已经确认它非空，但用例内部再钉一次：这条属性是<b>每一条</b>用例的
+     * 前置条件，把「依赖」写在依赖发生的地方，才不会被将来的一次重构悄悄绕开。
+     */
+    private static final String REAL_FILE_PROPERTY = "study.realFile";
+
+    /**
+     * 人工通读用的预览输出位置。这是<b>写</b>入口唯一的 opt-in：没给就没人要看预览，
+     * 用例必须跳过而不是失败——预览是给人看的产物，不是回归网（回归网是下面那条断言）。
+     */
+    private static final String PREVIEW_OUT_PROPERTY = "study.previewOut";
+
+    /**
      * 负向验证钩子之一：指向一个 UTF-8 文本文件（一行一条，空行忽略）时，只有文件里列出的行算
      * 「允许缺席」，其余缺席一律违规。
      *
@@ -73,12 +93,21 @@ class RealMigrationPreviewTest {
      */
     private static final String DROP_LINE_PROPERTY = "study.previewDropLine";
 
+    /** 取一个 opt-in 属性；缺失或只由空白组成时<b>跳过</b>本条用例（记为 skipped，与其它守卫同口径）。 */
+    private static String requireProperty(String name, String why) {
+        String value = System.getProperty(name);
+        assumeTrue(value != null && !value.isBlank(),
+                "未指定 -D" + name + "：" + why + "（本用例跳过，与其它真实档案守卫同口径）");
+        return value;
+    }
+
     @Test
     void writePreviewForHumanReview(@TempDir Path dir) throws IOException {
-        Path legacy = Path.of(System.getProperty("study.realFile"));
+        // 先钉属性，再碰任何可能在 null 上炸的东西：顺序错了就退化成「缺属性 → NPE → 整轮红」。
+        Path legacy = Path.of(requireProperty(REAL_FILE_PROPERTY, "没有真实档案就没有可迁移的内容"));
         MigrationPlan plan = new Migrator(dir).plan(legacy);   // 只读
 
-        Path out = Path.of(System.getProperty("study.previewOut"));
+        Path out = Path.of(requireProperty(PREVIEW_OUT_PROPERTY, "预览是给人通读的产物，没指定写到哪就不写"));
         Files.writeString(out, plan.targetText(), StandardCharsets.UTF_8);
 
         assertTrue(Files.size(out) > 0, "预览文件不能是空的");
@@ -90,7 +119,7 @@ class RealMigrationPreviewTest {
      */
     @Test
     void noProseLineFromTheRealArchiveIsAbsentFromTheTarget(@TempDir Path dir) throws IOException {
-        Path legacy = Path.of(System.getProperty("study.realFile"));
+        Path legacy = Path.of(requireProperty(REAL_FILE_PROPERTY, "没有真实档案就没有可核对的散文"));
         MigrationPlan plan = new Migrator(dir).plan(legacy);   // 只读
 
         String targetText = plan.targetText();

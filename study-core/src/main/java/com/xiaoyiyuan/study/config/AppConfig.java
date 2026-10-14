@@ -271,7 +271,7 @@ public final class AppConfig {
     public void setRequestTimeout(Duration requestTimeout) {
         if (requestTimeout == null || requestTimeout.isZero() || requestTimeout.isNegative()) {
             throw new IllegalArgumentException("请求超时必须为正数；收到：" + requestTimeout
-                    + "。零或负超时会让每次请求直接失败，这里拒绝比写进文件后再排查好。");
+                    + "。零或负超时会让每次请求无法发出，这里拒绝比写进文件后再排查好。");
         }
         if (requestTimeout.compareTo(MAX_REQUEST_TIMEOUT) > 0) {
             throw new IllegalArgumentException("请求超时不得超过 " + MAX_REQUEST_TIMEOUT.toHours()

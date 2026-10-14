@@ -168,7 +168,7 @@ public final class PlanDocument {
             if (count == 0) {
                 throw new SectionMissingException(section, "文档里找不到这一节的标题。"
                         + "标题要同时匹配中文序号与标题名（本节的完整标题是 `" + SECTION_HEADINGS.get(section)
-                        + "`），只改序号或只改名字都会定位失败——这是刻意的：宁可不改，也不能改错节。");
+                        + "`），只改序号或只改名字都会无法定位——这是刻意的：宁可不改，也不能改错节。");
             }
             if (count > 1) {
                 throw new SectionMissingException(section, "这一节的标题出现了 " + count

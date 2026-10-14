@@ -466,6 +466,89 @@ class AiClientTest {
                 new AiFailure(AiFailureKind.NETWORK, "连接不上。").kind());
     }
 
+    /**
+     * 收尾修复波（Minor-5）：{@code AiClient} 与 {@code AiFailure} 共用<b>同一份</b>禁用词清单。
+     *
+     * <p><b>为什么这条必须有</b>：修前 {@code failure()} 只做 {@code redactSecret}，
+     * {@code AiFailure} 的 {@code BANNED_WORDS} 是 private 的——两份口径各自演化，
+     * 而漂移的代价正好是本条款要避免的那件事。这里同时钉住「是一份」与「这一份真的在过滤」。
+     */
+    @Test
+    void bannedWordListIsTheSingleSource_ofTruth_forBothAiFailureAndAiClient() {
+        // 1) 词表就是 spec §8.2 那 8 个，一个不多一个不少
+        assertEquals(List.of("未完成", "逾期", "落后", "断签", "失败", "警告", "已放弃", "未坚持"),
+                List.of(AiFailure.BANNED_WORDS),
+                "禁用词清单必须与 spec §8.2 逐字一致（顺序也钉住，方便比对）");
+
+        // 2) 出口用的过滤器就是这份清单：每个词都必须被换掉
+        for (String banned : AiFailure.BANNED_WORDS) {
+            String filtered = AiFailure.redactBannedWords("前半" + banned + "后半");
+            assertFalse(filtered.contains(banned),
+                    "redactBannedWords 漏掉了「" + banned + "」；实际：" + filtered);
+            assertEquals("前半" + AiFailure.REDACTION_PLACEHOLDER + "后半", filtered,
+                    "「" + banned + "」必须被换成占位符，而不是整段丢掉");
+        }
+
+        // 3) 干净消息与非字符串入参都不许被改坏
+        assertEquals("连接不上服务，请检查 base_url。",
+                AiFailure.redactBannedWords("连接不上服务，请检查 base_url。"), "没命中就必须原样返回");
+        assertEquals(null, AiFailure.redactBannedWords(null), "null 进 null 出");
+        assertEquals(null, AiFailure.firstBannedWord(null), "null 里没有禁用词");
+        assertEquals("失败", AiFailure.firstBannedWord("这条消息里有失败两个字"));
+        assertEquals(null, AiFailure.firstBannedWord("这条消息很干净"));
+    }
+
+    /**
+     * 收尾修复波（Minor-5）：{@code AiClient} 会把「不归本包控制」的文字拼进用户可见消息——
+     * 底层异常的文案（{@code describe(e)}）与用户填的 {@code base_url}。这段文字里出现界面禁用词时，
+     * 出口必须把它换掉，而不是让 {@link AiFailure} 的构造器抛 {@link IllegalArgumentException}。
+     *
+     * <p><b>为什么载体是 base_url 的路径而不是解析异常</b>：实测 Gson 2.14.0 的解析异常
+     * <b>不会</b>把出错处的原文写进 message——截断的 {@code ["甲失败乙"} 得到的是
+     * {@code java.io.EOFException: End of input at line 1 column 8 path $[1]}，一个禁用词都没有
+     * （2026-10-11 实测，见终审修复报告）。而 {@code networkFailure} 的模板里拼着
+     * {@code config.baseUrl()}，这个字串完全由用户决定；一段带「失败」的路径是线上真能出现的形状
+     * （用户把网关路径填成中文），也是本包<b>唯一</b>能自证禁用词过滤的入口。
+     *
+     * <p><b>红在哪（修前）</b>：{@code failure()} 只做 {@code redactSecret}，于是
+     * {@code "http://127.0.0.1:<port>/失败"} 原样进了 {@code new AiFailure(...)} → 构造器抛 IAE。
+     * 调用方拿到的是一次运行时异常而不是一次 {@link AiFailure}：既没有 {@link AiFailureKind}，
+     * 界面也无法归类成「连不上」并给「重试」按钮（spec §7.6）。
+     *
+     * <p>流式入口那半边（同一出口）在
+     * {@code AiStreamTest#failure_stripsInterfaceBannedWordsOutOfWrappedExceptionText_insteadOfBlowingUp}。
+     */
+    @Test
+    void failure_returnsAiFailure_evenWhenParsedFragmentTextCarriesABannedWord() throws Exception {
+        stopCurrentStub();
+        // 绑一个端口再关掉：127.0.0.1 上确实没人监听 → 稳定的 NETWORK 失败，
+        // 而失败消息的模板里会拼进这段带「失败」的 base_url。
+        String bannedWord = "失败";
+        String baseUrl;
+        try (ServerSocket closedPort = new ServerSocket(0)) {
+            baseUrl = "http://127.0.0.1:" + closedPort.getLocalPort() + "/" + bannedWord;
+        }
+        assertTrue(AiClient.endpoint(baseUrl).toString().contains(bannedWord),
+                "前置条件：这段 base_url 能通过规范化、且禁用词保留在最终地址里；实际："
+                        + AiClient.endpoint(baseUrl));
+        AiClient client = new AiClient(
+                new AiConfig(baseUrl, API_KEY, MODEL, SHORT_TIMEOUT), HttpClient.newHttpClient());
+
+        AiFailure failure = assertThrows(AiFailure.class,
+                () -> client.complete(request("hi")),
+                "含禁用词的失败消息必须以 AiFailure 表达；修前这里抛 IAE（禁用词来自 base_url）");
+        assertEquals(AiFailureKind.NETWORK, failure.kind(),
+                "分类必须照常给出；实际：" + failure.kind() + " / " + failure.getMessage());
+        for (String banned : AiFailure.BANNED_WORDS) {
+            assertFalse(failure.getMessage().contains(banned),
+                    "出口必须过滤掉禁用词「" + banned + "」，实际：" + failure.getMessage());
+        }
+        assertTrue(failure.getMessage().contains("措辞已中性化"),
+                "被过滤的位置要留下可见痕迹；实际：" + failure.getMessage());
+        assertTrue(failure.getMessage().contains("连接不上服务"),
+                "既有措辞不受影响：过滤只动禁用词那一段；实际：" + failure.getMessage());
+    }
+
     // ------------------------------------------------------------------
     // 架构护栏：ai 包拿不到文件写入权
     // ------------------------------------------------------------------

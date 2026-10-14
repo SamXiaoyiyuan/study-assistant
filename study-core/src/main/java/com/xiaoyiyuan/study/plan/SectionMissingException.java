@@ -28,15 +28,15 @@ public final class SectionMissingException extends RuntimeException {
     private final PlanSection section;
 
     /**
-     * @param section 定位失败的章节
+     * @param section 未能定位的章节
      * @param reason  人能读懂的原因（例如「标题出现了 2 次」）；前缀由本类补，调用方不必重复章节名
      */
     public SectionMissingException(PlanSection section, String reason) {
-        super("章节「" + Objects.requireNonNull(section, "section").label() + "」定位失败：" + reason);
+        super("章节「" + Objects.requireNonNull(section, "section").label() + "」无法定位：" + reason);
         this.section = section;
     }
 
-    /** 定位失败的章节。 */
+    /** 未能定位的章节。 */
     public PlanSection section() {
         return section;
     }
