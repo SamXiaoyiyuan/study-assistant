@@ -18,7 +18,7 @@ class AppConfigTest {
     @Test
     void defaults_whenFileMissing(@TempDir Path dir) {
         AppConfig c = AppConfig.load(dir.resolve("不存在.properties"));
-        assertEquals(Path.of("%USERPROFILE%\\study"), c.studyDir());
+        assertEquals(AppPaths.defaultStudyDir(), c.studyDir());
         assertEquals(DeferredVisibility.COLLAPSED, c.deferredVisibility(), "默认折叠");
         assertEquals(List.of("平静", "有劲", "疲惫", "烦躁", "低落", "焦虑", "开心", "麻木"),
                 c.moodOptions());
@@ -96,15 +96,15 @@ class AppConfigTest {
     void valueWithWindowsPathBackslash_survivesRoundTrip(@TempDir Path dir) throws IOException {
         // 值里的反斜杠必须按字面往返。用 java.util.Properties 读写时（本机 JDK 25 实测）：
         //   E:\new\my-dir  → "E:" + 换行 + "ew" + 制表符 + "abs" 之类，
-        //   %USERPROFILE%\study → "D:示例 目录study"（反斜杠被吞掉）。
+        //   %USERPROFILE%\study → "%USERPROFILE%study"（反斜杠被吞掉）。
         // 后者仍然是个「合法路径」，Path.of 不报错，App 会安静地去一个不存在的目录找计划文件。
-        // 所以这里刻意用带空格、带反斜杠的真实形状，而不是一个只有一段的目录名。
+        // 所以这里刻意用带中文、带反斜杠的真实形状，而不是一个只有一段的目录名。
         Path f = dir.resolve("backslash.properties");
         AppConfig c = AppConfig.load(f);
-        c.setStudyDir(Path.of("%USERPROFILE%\\study"));
+        c.setStudyDir(Path.of("C:", "示例", "study"));
         c.save();
 
-        assertEquals(Path.of("%USERPROFILE%\\study"), AppConfig.load(f).studyDir());
+        assertEquals(Path.of("C:", "示例", "study"), AppConfig.load(f).studyDir());
 
         AppConfig c2 = AppConfig.load(f);
         c2.setStudyDir(Path.of("E:\\new\\tabs"));

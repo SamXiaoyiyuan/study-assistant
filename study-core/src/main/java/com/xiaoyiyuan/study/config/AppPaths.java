@@ -6,7 +6,7 @@ import java.nio.file.Path;
  * 应用的固定路径与「由学习目录派生出来的路径」。
  *
  * <p>为什么单独一个类：路径一旦散落在界面代码里，就会出现「界面 A 写
- * {@code %USERPROFILE%\study}、界面 B 写 {@code %USERPROFILE%\study}」这种
+ * {@code %USERPROFILE%\study}、界面 B 写 {@code ~/study}」这种
  * 谁也说不清哪份才是用户数据的情况。计划文件里装的是用户真实的档案，
  * 路径猜错的代价是「打开了一个空文件」。所以全部收在这一处，任何地方要路径都从这里取。
  *
@@ -18,8 +18,8 @@ public final class AppPaths {
     /** 应用数据目录名（位于 {@code %APPDATA%} 之下）。 */
     private static final String APP_DIR_NAME = "xiaoyiyuan-study";
 
-    /** 默认学习目录：用户既有的数据目录（见全局约束「路径」一节）。 */
-    private static final Path DEFAULT_STUDY_DIR = Path.of("%USERPROFILE%\\study");
+    /** 默认学习目录：用户主目录下的 {@code study}（见全局约束「路径」一节）。 */
+    private static final Path DEFAULT_STUDY_DIR = Path.of(System.getProperty("user.home"), "study");
 
     /** 主计划文件名；由旧档案 {@code 408-进度.md} 迁移改名而来。 */
     private static final String PLAN_FILE_NAME = "学习与生活计划.md";

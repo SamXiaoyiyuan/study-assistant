@@ -21,12 +21,12 @@ class StatusModelTest {
 
     @Test
     void statusLine_namesAllThreeFacts_ofTheShell() {
-        StatusModel model = new StatusModel(Path.of("%USERPROFILE%\\study"), false);
+        StatusModel model = new StatusModel(Path.of("C:\\示例\\study"), false);
 
-        assertEquals("%USERPROFILE%\\study", model.studyDirText(), "第一件事：当前 studyDir 原文");
+        assertEquals("C:\\示例\\study", model.studyDirText(), "第一件事：当前 studyDir 原文");
         assertEquals("离线可用", model.modeText(), "第二件事：未配置 AI 时的中性说法");
         assertEquals("尚未保存", model.lastSaveText(), "第三件事：Task 3 之前固定是「尚未保存」");
-        assertEquals("%USERPROFILE%\\study · 离线可用 · 尚未保存", model.statusLine(),
+        assertEquals("C:\\示例\\study · 离线可用 · 尚未保存", model.statusLine(),
                 "状态栏三段用「 · 」分隔，顺序 = studyDir / 工作模式 / 最后保存");
     }
 

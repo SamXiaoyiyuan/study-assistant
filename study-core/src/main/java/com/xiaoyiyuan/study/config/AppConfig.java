@@ -410,7 +410,7 @@ public final class AppConfig {
      *       E:\new               → E:&lt;换行&gt;ew          （值里真的多了换行）
      *       E:\tabs              → E:&lt;制表符&gt;abs
      *       E:\我的目录 + 尾随空格 → 解析后 Path.of 直接抛 InvalidPathException
-     *       %USERPROFILE%\study → D:示例 目录study   ← 本项目自己的默认目录
+     *       %USERPROFILE%\study → %USERPROFILE%study   ← 本项目自己的默认目录
      *       </pre>
      *       最后一条最要命：默认学习目录 {@code %USERPROFILE%\study} 被吞掉一个反斜杠后
      *       仍然是个「合法路径」，{@code Path.of} 不报错也不抛异常，于是 App 会安安静静地
