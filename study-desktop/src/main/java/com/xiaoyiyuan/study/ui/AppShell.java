@@ -90,8 +90,8 @@ public final class AppShell {
      * 「学习目录可写否」可注入的构造器（minor 清算批 Minor-1）。
      *
      * <p>生产路径恒为 {@link StartupCheck#isWritable(Path)}；注入是为了让「不可写 → 提示条」
-     * 这条失败分支在测试里<b>可控且恒定承重</b>，不再依赖 {@code C:\\Windows} 那种本机权限
-     * （旧测试被 {@code assumeFalse} 永久跳过）。</p>
+     * 这条失败分支在测试里<b>可控且恒定承重</b>，不再依赖 {@code C:\Windows} 那种本机权限——
+     * 旧测试拿它当不可写点，覆盖会随机器的提权状态在「跳过」与「照跑」之间漂移。</p>
      *
      * @param writableProbe 「该目录可写吗」的判定
      */

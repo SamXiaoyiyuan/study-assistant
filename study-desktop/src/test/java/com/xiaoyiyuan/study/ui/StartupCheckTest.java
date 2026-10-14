@@ -131,9 +131,11 @@ class StartupCheckTest {
     /**
      * 指向一个<b>可控的</b>不可写点：注入「不可写」判定（minor 清算批 Minor-1）。
      *
-     * <p>旧用例拿 {@code C:\Windows\…} 当不可写点，在本机被 {@code assumeFalse} 永久跳过，
-     * 变异证明这半没被守住（task-2-review.md 的 M4b：把判据改成 {@code if (false)} 仍然全绿）。
-     * 现在判定由测试注入，这条分支恒定承重、也不再依赖任何本机权限。</p>
+     * <p>旧用例拿 {@code C:\Windows\…} 当不可写点，而这条路能不能触发假设<b>取决于机器的提权状态</b>：
+     * 提权机器上该目录可写 → {@code assumeFalse(isWritable)} 成立 → 用例被跳过；非提权机器上不可写 →
+     * 假设不成立 → 用例照跑并通过（本机就是后者）。所以旧写法的覆盖<b>随环境漂移</b>——
+     * 它在非提权机器上是守住这条分支的，只是换个环境就静默不跑。现在判定由测试注入，
+     * 这条分支与环境无关、恒定承重。</p>
      *
      * <p>注意「目录还没建」本身<b>不算</b>不可写——那是全新安装的常态（见
      * {@link #notYetExistingDirUnderWritableAncestor_isWritable}）。</p>
@@ -295,7 +297,11 @@ class StartupCheckTest {
         outcomes.add(StartupCheck.inspect(studyDir, dir -> false));                    // 不可写
         outcomes.add(StartupCheck.inspect(studyDir.resolve("更深一层"), dir -> false)); // 还不存在 + 不可写
 
-        assertEquals(6, outcomes.size(), "必须覆盖 inspect 的全部出口");
+        assertEquals(6, outcomes.size(),
+                "覆盖 inspect 的 6 条可稳定复现的出口读数：两份都没有 / 只有旧档案 / 两份都在（正常）/ "
+                        + "计划位置是目录（走「不是普通文件」那支）/ 不可写 / 目录不存在且不可写。"
+                        + "注意：catch (IOException | RuntimeException) 那条出口（文件在、但 readAllBytes 读不出来）"
+                        + "无法跨平台确定性地制造，不在本用例覆盖范围内——此处不声称覆盖「全部出口」。");
         for (StartupCheck.Result r : outcomes) {
             assertEquals(r.notices().isEmpty(), r.ready(),
                     "ready 必须与 notices().isEmpty() 等价：ready=" + r.ready() + " notices=" + r.notices());

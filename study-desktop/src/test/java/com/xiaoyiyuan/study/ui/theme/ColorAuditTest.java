@@ -404,8 +404,7 @@ class ColorAuditTest {
      */
     @Test
     void appCss_parsedLineNumbers_pointAtTheRealDeclarationLines() throws IOException {
-        List<String> sourceLines = Files.readAllLines(
-                Path.of("src", "main", "resources", "css", "app.css"), StandardCharsets.UTF_8);
+        List<String> sourceLines = Files.readAllLines(appCssSourcePath(), StandardCharsets.UTF_8);
         List<CssTokens.Decl> decls = CssTokens.parse("/css/app.css");
         assertTrue(decls.size() >= 50,
                 "app.css 解析出的声明太少（" + decls.size() + "），这条行号护栏形同虚设");
@@ -753,5 +752,26 @@ class ColorAuditTest {
         Set<String> d = new TreeSet<>(a);
         d.removeAll(b);
         return d.toString();
+    }
+
+    /**
+     * 定位 {@code app.css} 的<b>源文件</b>（不是 classpath 资源）——行号护栏要读它的原始行。
+     *
+     * <p>路径兼容两种跑法：surefire/IDEA 以模块目录为工作目录（{@code src/...}），
+     * 以及在仓库根跑（{@code study-desktop/src/...}）；都找不到时给出清晰断言失败，
+     * 而不是让 {@code Files.readAllLines} 抛 {@code NoSuchFileException} 这种读不出信息的 error
+     * （与 {@code CrisisKeywordTest#shippedKeywordTablePath} 同一手法）。</p>
+     */
+    private static Path appCssSourcePath() {
+        List<Path> candidates = List.of(
+                Path.of("src", "main", "resources", "css", "app.css"),
+                Path.of("study-desktop", "src", "main", "resources", "css", "app.css"));
+        for (Path candidate : candidates) {
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        throw new AssertionError("找不到 app.css 源文件，尝试过：" + candidates
+                + "；当前工作目录：" + Path.of("").toAbsolutePath());
     }
 }

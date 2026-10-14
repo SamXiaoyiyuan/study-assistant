@@ -73,10 +73,12 @@ public final class StartupCheck {
     /**
      * {@link #inspect(Path)} 的<b>可注入</b>形式：「该目录可写否」由一个函数决定。
      *
-     * <p>抽成这个方法是为了让<b>「不可写 → 只给中性提示、不阻断」这条失败分支真的能被测到</b>
+     * <p>抽成这个方法是为了让<b>「不可写 → 只给中性提示、不阻断」这条失败分支在测试里稳定承重</b>
      * （minor 清算批 Minor-1，同 {@code ThemeManager.verify(Function)} 的既定手法）：
-     * 旧测试拿 {@code C:\\Windows\\…} 当不可写点，在本机被 {@code assumeFalse} 永久跳过，
-     * 变异把判据改成 {@code if (false)} 仍然全绿。现在测试直接注入「不可写」，这条分支恒定承重。</p>
+     * 旧写法拿 {@code C:\Windows\…} 当不可写点，而该目录的可写性<b>取决于机器</b>——
+     * 提权机器上该目录可写，{@code assumeFalse(isWritable)} 触发、用例被跳过；非提权机器上不可写，
+     * 假设不触发、用例照跑。于是同一份代码的覆盖<b>随环境漂移</b>：这台机器守得住，换一台就静默不跑。
+     * 现在测试直接注入「不可写」，这条分支与环境无关、恒定承重。</p>
      *
      * @param studyDir     学习目录（可以还不存在）
      * @param writableProbe 「这个目录可写吗」的判定；生产路径是 {@link #isWritable(Path)}
