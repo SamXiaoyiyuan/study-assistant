@@ -393,22 +393,32 @@
     -fx-border-color: transparent -fx-c-border-subtle transparent transparent;
     -fx-border-width: 0 1 0 0;
     -fx-padding: 0.80em;         /* = -fx-sp-3 */
+    -fx-pref-width: 13.5em;      /* 指南 §3.3 的侧栏宽（≈202 逻辑像素）；用 em 以便随字号档位缩放 */
 }
 .nav-item {
     -fx-background-color: transparent;
     -fx-background-radius: 6;    /* = -fx-r-control */
     -fx-padding: 0.53em 0.80em;  /* = -fx-sp-2 / -fx-sp-3 */
+    -fx-min-height: 2.4em;       /* ≈36 逻辑像素：侧栏项高度与 .text-field 同档 */
     -fx-text-fill: -fx-c-text-secondary;
-    -fx-font-size: 0.93em;
+    -fx-font-size: 0.93em;       /* = -fx-fs-small */
+    -fx-alignment: center-left;
 }
 .nav-item:hover {
     -fx-background-color: -fx-c-surface-hover;
 }
-.nav-item.active {
+/* 当前页：唯一一条高亮规则。类名与 AppShell.showPage 里写的逐字一致（测试按名字钉住） */
+.nav-item-active {
     -fx-background-color: -fx-c-accent-soft;
     -fx-text-fill: -fx-c-accent;
     -fx-border-color: -fx-c-accent;
     -fx-border-width: 0 0 0 2;
+}
+
+/* ---------- 内容区 ---------- */
+.content {
+    -fx-background-color: -fx-c-bg;
+    -fx-padding: 1.60em;         /* = -fx-sp-5：页面内容与窗口边缘的呼吸区 */
 }
 
 /* ---------- 页头 / 状态条 ---------- */

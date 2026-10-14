@@ -369,6 +369,10 @@ class ColorAuditTest {
                 "0.7em",                    // .scroll-bar 的 pref-width / pref-height
                 "2.9em", "2.4em", "6em",    // .button / .text-field / .text-area 的 min-height
                 "46em",                     // .reading 的 max-width（指南 §3.2 的可读行宽）
+                // Task 2（应用外壳）：侧栏宽与侧栏项高度。指南 §3.3 给了 13.5em 的侧栏宽，
+                // 但它没有 -fx-* 令牌（不是色/间距/圆角族的一员），所以逐个写死在这里。
+                "13.5em",                   // .nav 的 pref-width（指南 §3.3 布局骨架）
+                "2.4em",                    // .nav-item 的 min-height（与 .text-field 同档）
                 "1", "2", "-2"));           // 描边宽度与焦点 insets（guides §2.3）
 
         List<String> checked = new ArrayList<>();
