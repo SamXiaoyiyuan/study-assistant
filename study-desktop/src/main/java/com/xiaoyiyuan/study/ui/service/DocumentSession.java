@@ -152,8 +152,11 @@ public final class DocumentSession {
         boolean changedOnDisk = store.changedExternally();
         if (changedOnDisk) {
             if (policy == ExternalChangePolicy.RELOAD) {
-                // 「重新载入」不写盘：只把磁盘那一份接受为新基线，编辑由调用方自行丢弃
-                store.reload();
+                // 「重新载入」不写盘：重新读盘，把磁盘那一份接受为新基线——
+                // 存储层（基线哈希）与会话（originalText）必须同时对齐，否则 originalText() 还停在
+                // 「打开时那份」，RELOAD 的语义（接受磁盘为新基线）就是一句空话。
+                // 内存里的编辑不动：外部策略文档钉死「只重新读盘，编辑由调用方按返回结果自行丢弃」。
+                originalText = store.read();
                 return SaveResult.BLOCKED_EXTERNAL_CHANGE;
             }
             if (policy != ExternalChangePolicy.FORCE_OVERWRITE) {

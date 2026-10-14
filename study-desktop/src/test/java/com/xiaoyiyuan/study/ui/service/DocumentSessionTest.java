@@ -12,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -141,6 +142,40 @@ class DocumentSessionTest {
         assertEquals(1, backupNames(f).size(), "覆盖式写入必须把对方那份先备份下来（备份数 +1）");
     }
 
+    /**
+     * 语义边界：{@link ExternalChangePolicy#FORCE_OVERWRITE} + <b>界面内容与基线相同</b> + 有外部改动。
+     *
+     * <p>此时 {@code currentText.equals(originalText)} 成立，但磁盘已被人改过。当前实现走的是
+     * 「备份 + 覆盖」——把磁盘那份换成我们认可的那份，并留下对方那份的可回滚快照。
+     *
+     * <p><b>为什么这是对的</b>（不是缺陷）：这一格的冲突与「用户有没有在界面里编辑过」无关，
+     * 而是「磁盘那份已经不是你打开时的那份」。用户在这里显式选了「覆盖」，意图指向的是磁盘上的
+     * 内容——把它换成我认可的版本——而不是「我到底改没改过」。若这里改走 {@code UNCHANGED}
+     * （什么都不做、什么都不提示），等于把别人写进去的内容<b>静默留在磁盘上</b>，同时不给用户任何
+     * 反馈：那正是本任务（「外部改动绝不静默」）要杜绝的东西。而「备份 + 覆盖」至少把对方那份先存下来，
+     * 用户随时能拿回去。与任务书第 1 条（外部改动必须先让用户表态）一致：表态过了就照办。
+     */
+    @Test
+    void forceOverwrite_withContentEqualToBaseline_stillBacksUp_andOverwritesExternalChange()
+            throws IOException {
+        Path f = plan();
+        Files.writeString(f, "初始\n", StandardCharsets.UTF_8);
+
+        DocumentSession s = DocumentSession.open(f, rotation());
+        // 刻意不 update：currentText == originalText == "初始\n"
+        Files.writeString(f, "外部那份\n", StandardCharsets.UTF_8);
+
+        assertEquals(SaveResult.SAVED, s.save(ExternalChangePolicy.FORCE_OVERWRITE),
+                "有外部改动 + 用户确认覆盖 → 必须真的写下去（不能退化成 UNCHANGED）");
+        assertEquals("初始\n", Files.readString(f, StandardCharsets.UTF_8),
+                "覆盖写下去的必须是我们认可的那份内容");
+        List<String> backups = backupNames(f);
+        assertEquals(1, backups.size(), "覆盖式写入必须把对方那份先备份下来（备份数 +1）");
+        assertEquals("外部那份\n",
+                Files.readString(dir.resolve(".backup").resolve(backups.get(0)), StandardCharsets.UTF_8),
+                "备份下来的必须是外部改动后的那份（用户能拿回去的退路）");
+    }
+
     @Test
     void reload_discardsMemoryEditAndRebaselines() throws IOException {
         Path f = plan();
@@ -155,6 +190,36 @@ class DocumentSessionTest {
         assertEquals(SaveResult.UNCHANGED, s.save(ExternalChangePolicy.ASK_USER),
                 "重新载入后基线已对齐，再保存就是「什么都没改」");
         assertEquals("外部那份\n", Files.readString(f, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * {@link ExternalChangePolicy#RELOAD} <b>不是写路径</b>：它只把磁盘那一份接受为新基线，
+     * 一个字节都不许写，也不许产生备份。
+     *
+     * <p>这一条与 {@link #reload_discardsMemoryEditAndRebaselines} 的区别：那条走的是用户直接调
+     * {@code reload()}；这条走的是「带着未保存的编辑去 {@code save(RELOAD)}」——最容易和
+     * {@code FORCE_OVERWRITE} 混起来的那条边界。RELOAD 的语义是「我认输，磁盘那份才算数」，
+     * 所以这次调用必须一个字节都不写（内存里那份编辑由调用方按返回结果自行丢弃，见
+     * {@link ExternalChangePolicy#RELOAD}），而新基线必须变成磁盘那份。
+     */
+    @Test
+    void save_RELOAD_acceptsDiskAsNewBaseline_andWritesNotEvenAByte() throws IOException {
+        Path f = plan();
+        Files.writeString(f, "初始\n", StandardCharsets.UTF_8);
+
+        DocumentSession s = DocumentSession.open(f, rotation());
+        s.update("我的编辑\n");                                    // 内存里有未保存的编辑
+        byte[] external = "外部那份\n".getBytes(StandardCharsets.UTF_8);
+        Files.write(f, external);                                 // 外部把磁盘改掉
+
+        assertEquals(SaveResult.BLOCKED_EXTERNAL_CHANGE, s.save(ExternalChangePolicy.RELOAD),
+                "RELOAD 不写盘：它只能返回「被拦下」");
+        assertArrayEquals(external, Files.readAllBytes(f),
+                "磁盘必须逐字等于外部那一份——RELOAD 一个字节都不许写");
+        assertEquals(0, backupNames(f).size(),
+                "RELOAD 连备份都不该产生（备份是「即将覆盖」的前奏，而这里什么都不覆盖）");
+        assertEquals("外部那份\n", s.originalText(),
+                "RELOAD 的语义是「接受磁盘那一份为新基线」：originalText() 必须变成外部那份");
     }
 
     @Test
@@ -325,40 +390,58 @@ class DocumentSessionTest {
     // ================================================================================
 
     /**
-     * {@code ui.view} 与 {@code ui.control} 下的类，<b>类列表显式写死</b>。
+     * 被守卫的两个包（内部名形式的包目录）。
      *
-     * <p>写死的理由与 Task 1 那条占位断言同源：空列表会让下面的循环形同虚设，
-     * 所以列表非空本身也要被断言。
+     * <p><b>刻意不写死类名</b>：Task 4–10 每个页面都会往这两个包里加类，写死的清单必定漏掉新类
+     * ——那时守卫会「看起来还绿着」，实际罩不住任何新代码。改成「按包目录发现」后，只要类落在
+     * {@code ui/view} / {@code ui/control} 下，就自动被扫到，无需每次加类都回来改清单。
      */
-    private static final List<String> VIEW_AND_CONTROL_CLASSES = List.of(
-            "com.xiaoyiyuan.study.ui.view.Page",
-            "com.xiaoyiyuan.study.ui.view.PlaceholderPage",
-            "com.xiaoyiyuan.study.ui.view.StartupNoticeBar",
-            "com.xiaoyiyuan.study.ui.control.StatusModel");
+    private static final List<String> GUARDED_PACKAGES = List.of(
+            "com/xiaoyiyuan/study/ui/view",
+            "com/xiaoyiyuan/study/ui/control");
 
-    /** 界面视图层禁止引用的文件 API 的<b>内部名</b>（与 class 常量池里的写法一致）。 */
+    /** 界面视图/控制层禁止引用的文件 API 的<b>内部名</b>（与 class 常量池里的写法一致）。 */
     private static final List<String> FORBIDDEN_INTERNAL_NAMES = List.of(
             "java/nio/file/Files",
             "com/xiaoyiyuan/study/storage/TextFileCodec",
             "com/xiaoyiyuan/study/storage/FileStore");
 
     @Test
-    void uiViewLayer_hasNoDirectFileWriteApi() throws IOException {
-        assertFalse(VIEW_AND_CONTROL_CLASSES.isEmpty(),
-                "类列表不能为空——空列表会让下面的循环形同虚设（Task 1 那条占位断言的同类错误）");
-
+    void uiViewLayer_hasNoDirectFileWriteApi() throws Exception {
         List<String> offenders = new ArrayList<>();
-        for (String className : VIEW_AND_CONTROL_CLASSES) {
-            byte[] bytes = classBytes(className);
-            assertTrue(bytes.length > 0, "读不到 " + className + " 的字节码");
-            for (String needle : FORBIDDEN_INTERNAL_NAMES) {
-                if (referencesConstant(bytes, needle)) {
-                    offenders.add(className + " 引用 " + needle);
+        int scanned = 0;
+        for (String pkg : GUARDED_PACKAGES) {
+            Path compiledDir = compiledPackageDir(pkg);
+            List<String> classFiles = classFilesIn(compiledDir);
+
+            // 反空转 A：目录里确实有类。目录路径写错 / 什么都没编译进来时，扫描会形同虚设。
+            assertFalse(classFiles.isEmpty(),
+                    pkg + " 的编译产物目录里一个 .class 都没有——扫描会形同虚设：" + compiledDir);
+
+            // 反空转 B：编译出来的顶层类数 == 源码 .java 数。
+            // 「某个类没被编译进来」（顶层类少一个）或「源码目录写错」（找不到 / 数目对不上）都会红，
+            // 而不是静默 0 命中。只数顶层类：一个 .java 可以产出多个 .class（内部类 / 匿名类
+            // Foo$1.class），把它们也算进来会让这条证据在合法代码上误红；但它们仍逐个参与常量池扫描。
+            int topLevel = (int) classFiles.stream().filter(n -> !n.contains("$")).count();
+            int sourceFiles = sourceJavaCount(pkg);
+            assertEquals(sourceFiles, topLevel,
+                    pkg + " 的编译产物顶层类数必须等于源码 .java 数"
+                            + "（少了 = 有类没被编译进来；目录对不上 = 源码目录写错）。classFiles=" + classFiles);
+
+            for (String classFile : classFiles) {
+                scanned++;
+                byte[] bytes = Files.readAllBytes(compiledDir.resolve(classFile));
+                assertTrue(bytes.length > 0, "读不到 " + pkg + "/" + classFile + " 的字节码");
+                for (String needle : FORBIDDEN_INTERNAL_NAMES) {
+                    if (referencesConstant(bytes, needle)) {
+                        offenders.add(pkg + "/" + classFile + " 引用 " + needle);
+                    }
                 }
             }
         }
+        assertTrue(scanned > 0, "至少要扫到一个类，否则这条守卫是空转的");
         assertEquals(List.of(), offenders,
-                "ui.view / ui.control 里禁止引用 Files / TextFileCodec / FileStore：唯一入口是 ui/service："
+                "ui/view 与 ui/control 里禁止引用 Files / TextFileCodec / FileStore：唯一入口是 ui/service："
                         + offenders);
 
         // 正向自证：扫描器必须在一个【确实引用 FileStore】的类上命中。
@@ -369,6 +452,35 @@ class DocumentSessionTest {
         assertFalse(referencesConstant(classBytes("com.xiaoyiyuan.study.ui.control.StatusModel"),
                         "com/xiaoyiyuan/study/storage/FileStore"),
                 "负向对照：StatusModel 不该引用 FileStore");
+    }
+
+    /** 编译产物里某个包目录的位置。走 classpath 解析（{@code getResource}），与工作目录无关。 */
+    private static Path compiledPackageDir(String pkg) throws Exception {
+        URL url = DocumentSessionTest.class.getResource("/" + pkg);
+        assertNotNull(url, "类路径里找不到包目录 /" + pkg);
+        assertEquals("file", url.getProtocol(),
+                "包目录必须落在文件系统上（测试不打包成 jar），实际协议 " + url.getProtocol() + "：" + url);
+        return Path.of(url.toURI());
+    }
+
+    /** 某个包目录下的全部 {@code .class} 文件名（含内部类；按名排序，便于失败时阅读）。 */
+    private static List<String> classFilesIn(Path compiledDir) throws IOException {
+        try (Stream<Path> entries = Files.list(compiledDir)) {
+            return entries.map(p -> p.getFileName().toString())
+                    .filter(name -> name.endsWith(".class"))
+                    .sorted()
+                    .toList();
+        }
+    }
+
+    /** 对应源码目录下的 {@code .java} 文件数（相对模块根定位，与 {@code ShellTest.uiSources} 同一约定）。 */
+    private static int sourceJavaCount(String pkg) throws IOException {
+        Path sourceDir = Path.of("src", "main", "java", pkg);
+        assertTrue(Files.isDirectory(sourceDir),
+                "找不到源码目录 " + sourceDir.toAbsolutePath() + "（路径写错？）");
+        try (Stream<Path> entries = Files.list(sourceDir)) {
+            return (int) entries.filter(p -> p.getFileName().toString().endsWith(".java")).count();
+        }
     }
 
     /** 类路径上的 {@code .class} 字节（不依赖工作目录，走 classpath 资源）。 */
