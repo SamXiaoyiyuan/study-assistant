@@ -3,12 +3,12 @@
    规则：
      - 只用 -fx-c-* / CHART_COLOR_* 查找色与 -fx-* 非颜色令牌；**不含任何字面色值**
      - 不含任何 px：尺寸一律 em 或裸倍率（本机 200% 缩放，写死 px 必然破版）
-     - **长度类属性一律写字面值**（`-fx-padding` / `-fx-*-radius` / `-fx-min-height` …）：
-       JavaFX 25 的长度转换器要 `javafx.css.Size`，而 tokens-*.css 里那些自定义长度令牌
-       （间距族 / 圆角族）在运行时被解析成 `Double` → 抛 `ClassCastException` 并**静默忽略整条声明**
-       （`CssParser` 只报语法错）。修复前 31 处声明（内边距 11 / 圆角 19 / 最小高度 1）全部失效，
-       全站 padding 与圆角实际为 0。字面值必须与令牌逐字一致：两条长度护栏（在色值审计测试类里）
-       焊住这一点——一条禁止长度属性引用查找值，一条把字面值与令牌逐值对齐。
+     - **长度类属性一律写字面值**：理由分两类（minor 清算批 MEDIUM-1 更正）。① `-fx-padding` /
+       `-fx-*-radius` / `-fx-*-insets` / `-fx-border-width`：查找值被 JavaFX 25 拒收——转换器要
+       `javafx.css.Size`，而自定义长度令牌在运行时是 `Double` → 抛 `ClassCastException` 并**静默忽略
+       整条声明**（`CssParser` 只报语法错）；修复前这类声明共 31 处（内边距 10 / 圆角 21）全部失效。
+       ② `-fx-spacing` / `-fx-min|max|pref-width|height`：查找值**合法且生效**（转换器收 `Number`），
+       写成字面值只是**统一约定**（与 em 缩放一致、便于审计），并非会失效；字面值与令牌逐字一致。
      - 必须最后加载（guides §2.2）：tokens-*.css → app.css，否则组件样式被基线覆盖
      - 不用 ProgressBar 表达计划完成度（隐含「落后」语义，见 guides §4.2）
      - 状态永远「文字 + 形状 + 中性色」三重编码，绝不只靠颜色

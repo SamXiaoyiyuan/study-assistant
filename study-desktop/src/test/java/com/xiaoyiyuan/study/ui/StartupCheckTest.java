@@ -129,26 +129,41 @@ class StartupCheckTest {
     }
 
     /**
-     * 指向一个不存在、且最近的已存在祖先不可写的路径：报成 notice，不抛异常。
+     * 指向一个<b>可控的</b>不可写点：注入「不可写」判定（minor 清算批 Minor-1）。
+     *
+     * <p>旧用例拿 {@code C:\Windows\…} 当不可写点，在本机被 {@code assumeFalse} 永久跳过，
+     * 变异证明这半没被守住（task-2-review.md 的 M4b：把判据改成 {@code if (false)} 仍然全绿）。
+     * 现在判定由测试注入，这条分支恒定承重、也不再依赖任何本机权限。</p>
      *
      * <p>注意「目录还没建」本身<b>不算</b>不可写——那是全新安装的常态（见
-     * {@link #notYetExistingDirUnderWritableAncestor_isWritable}）。本用例用的祖先
-     * （{@code C:\Windows}）即使对管理员也是拒绝写入的。</p>
+     * {@link #notYetExistingDirUnderWritableAncestor_isWritable}）。</p>
      */
     @Test
-    void unwritableDir_isReportedAsNotice_notException() {
-        Path unwritable = Path.of("C:\\Windows\\xiaoyiyuan-study-probe-not-writable");
+    void unwritableDir_isReportedAsNotice_notException(@TempDir Path studyDir) throws IOException {
+        Files.writeString(AppPaths.legacyFile(studyDir), "# 旧档案\n", StandardCharsets.UTF_8);
+        List<Path> probed = new ArrayList<>();
 
-        // 先确认这条路径真的不可写；不可用（例如换到 Linux）就跳过，而不是让测试变成机器相关的抽奖
-        org.junit.jupiter.api.Assumptions.assumeFalse(StartupCheck.isWritable(unwritable),
-                "这台机器上 " + unwritable + " 意外地可写，本用例不适用");
+        StartupCheck.Result result = StartupCheck.inspect(studyDir, dir -> {
+            probed.add(dir);
+            return false; // 注入：这个目录不可写
+        });
 
-        StartupCheck.Result result = StartupCheck.inspect(unwritable);
-
+        assertEquals(List.of(studyDir), probed, "可写判定必须作用在传入的 studyDir 上，而不是别的路径");
         assertFalse(result.ready(), "目录不可写时 ready=false");
         assertEquals(List.of(StartupCheck.NOTICE_NOT_WRITABLE), result.notices(),
-                "不可写时要恰好一条中性提示：" + StartupCheck.NOTICE_NOT_WRITABLE);
-        assertEquals(unwritable, result.studyDir(), "studyDir 原样回传（界面要显示它自己）");
+                "不可写时要恰好一条中性提示（不可写优先于「有旧档案」那支，不得报迁移）："
+                        + StartupCheck.NOTICE_NOT_WRITABLE + "，实际 " + result.notices());
+        assertEquals(studyDir, result.studyDir(), "studyDir 原样回传（界面要显示它自己）");
+    }
+
+    /** 注入「可写」时走正常分支：不得因为注入了判定就改变其它分支的行为（Minor-1 的对照组）。 */
+    @Test
+    void writableProbeSaysTrue_fallsThroughToTheNoPlanBranch(@TempDir Path studyDir) {
+        StartupCheck.Result result = StartupCheck.inspect(studyDir, dir -> true);
+
+        assertFalse(result.ready(), "可写但没有计划文件 → 仍不 ready（这是首启常态）");
+        assertEquals(List.of(StartupCheck.NOTICE_NO_PLAN), result.notices(),
+                "判定为可写时走正常分支（无计划文件 → NO_PLAN），不得出现 NOT_WRITABLE，实际 " + result.notices());
     }
 
     @Test
@@ -196,7 +211,7 @@ class StartupCheckTest {
         Files.delete(AppPaths.planFile(studyDir));
         Files.createDirectory(AppPaths.planFile(studyDir));
         cases.add(StartupCheck.inspect(studyDir).notices());
-        cases.add(StartupCheck.inspect(Path.of("C:\\Windows\\xiaoyiyuan-study-probe-not-writable")).notices());
+        cases.add(StartupCheck.inspect(studyDir, dir -> false).notices());
 
         int checked = 0;
         for (List<String> notices : cases) {
@@ -253,5 +268,42 @@ class StartupCheckTest {
 
         Files.writeString(AppPaths.planFile(studyDir), "# 计划\n", StandardCharsets.UTF_8);
         assertFalse(StartupCheck.shouldOfferMigration(studyDir), "两份都在时不提供迁移");
+    }
+
+    /**
+     * Minor-3（2026-10-14 minor 清算批）：{@code ready} 与 {@code notices().isEmpty()} 必须等价。
+     *
+     * <p>{@code Result.ready()} 在生产代码里目前零调用方（{@code AppShell} 用
+     * {@code notices().isEmpty()} 决定要不要显示提示条），评审把它点名成「护栏承重、但字段本身
+     * 是死数据」。本批选择<b>补这条显式断言</b>而不是改 {@code AppShell}：在 {@code inspect} 的
+     * 每条出口上，「{@code ready=false}」与「至少一条提示」本就同进同退；让 {@code AppShell}
+     * 改读 {@code ready} 只会把这层等价从一个字段挪到另一个字段，行为上无法被任何测试区分，
+     * 反而在等价被破坏时会静默丢掉提示。把不变式钉在这里，等价一旦被破坏（例如某支返回
+     * {@code ready=true} 却带提示）立刻红。</p>
+     */
+    @Test
+    void ready_and_noticesAreEmpty_areEquivalent_onEveryOutcome(@TempDir Path studyDir) throws IOException {
+        List<StartupCheck.Result> outcomes = new ArrayList<>();
+        outcomes.add(StartupCheck.inspect(studyDir));                                  // 两份都没有
+        Files.writeString(AppPaths.legacyFile(studyDir), "# 旧档案\n", StandardCharsets.UTF_8);
+        outcomes.add(StartupCheck.inspect(studyDir));                                  // 只有旧档案
+        Files.writeString(AppPaths.planFile(studyDir), "# 计划\n", StandardCharsets.UTF_8);
+        outcomes.add(StartupCheck.inspect(studyDir));                                  // 两份都在（正常）
+        Files.delete(AppPaths.planFile(studyDir));
+        Files.createDirectory(AppPaths.planFile(studyDir));
+        outcomes.add(StartupCheck.inspect(studyDir));                                  // 计划位置是目录（读不动）
+        outcomes.add(StartupCheck.inspect(studyDir, dir -> false));                    // 不可写
+        outcomes.add(StartupCheck.inspect(studyDir.resolve("更深一层"), dir -> false)); // 还不存在 + 不可写
+
+        assertEquals(6, outcomes.size(), "必须覆盖 inspect 的全部出口");
+        for (StartupCheck.Result r : outcomes) {
+            assertEquals(r.notices().isEmpty(), r.ready(),
+                    "ready 必须与 notices().isEmpty() 等价：ready=" + r.ready() + " notices=" + r.notices());
+        }
+        // 两种取值都必须出现过，否则这条等价是空转
+        assertTrue(outcomes.stream().anyMatch(StartupCheck.Result::ready),
+                "至少要有一条 ready=true 的出口");
+        assertTrue(outcomes.stream().anyMatch(r -> !r.ready()),
+                "至少要有一条 ready=false 的出口");
     }
 }

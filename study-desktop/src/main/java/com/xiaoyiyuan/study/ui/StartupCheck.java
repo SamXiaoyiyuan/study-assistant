@@ -67,12 +67,29 @@ public final class StartupCheck {
      * @param studyDir 学习目录（可以还不存在）
      */
     public static Result inspect(Path studyDir) {
+        return inspect(studyDir, StartupCheck::isWritable);
+    }
+
+    /**
+     * {@link #inspect(Path)} 的<b>可注入</b>形式：「该目录可写否」由一个函数决定。
+     *
+     * <p>抽成这个方法是为了让<b>「不可写 → 只给中性提示、不阻断」这条失败分支真的能被测到</b>
+     * （minor 清算批 Minor-1，同 {@code ThemeManager.verify(Function)} 的既定手法）：
+     * 旧测试拿 {@code C:\\Windows\\…} 当不可写点，在本机被 {@code assumeFalse} 永久跳过，
+     * 变异把判据改成 {@code if (false)} 仍然全绿。现在测试直接注入「不可写」，这条分支恒定承重。</p>
+     *
+     * @param studyDir     学习目录（可以还不存在）
+     * @param writableProbe 「这个目录可写吗」的判定；生产路径是 {@link #isWritable(Path)}
+     */
+    static Result inspect(Path studyDir, java.util.function.Predicate<Path> writableProbe) {
         Path dir = Objects.requireNonNull(studyDir, "studyDir");
+        java.util.function.Predicate<Path> probe =
+                Objects.requireNonNull(writableProbe, "writableProbe");
         Path plan = AppPaths.planFile(dir);
         Path legacy = AppPaths.legacyFile(dir);
         List<String> notices = new ArrayList<>();
 
-        if (!isWritable(dir)) {
+        if (!probe.test(dir)) {
             // 最要紧的一条：写不进去。其余提示此时都无关紧要（计划文件就算在也存不了）。
             notices.add(NOTICE_NOT_WRITABLE);
             return new Result(false, notices, plan, legacy, dir);

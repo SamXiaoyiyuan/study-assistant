@@ -312,24 +312,34 @@ class ColorAuditTest {
      * 于是每渲染一次就抛
      * {@code ClassCastException: class java.lang.Double cannot be cast to class javafx.css.Size}
      * 并<b>静默忽略该声明</b>。{@code CssParser.errorsProperty()} 只报语法错，这条完全看不见——
-     * 修复前 31 处声明全被忽略，全站 padding 与圆角实际为 0。
+     * 修复前 31 处声明全被忽略，全站 padding 与圆角实际为 0。</p>
      *
      * <p>本机实测（2026-10-14，探针在 {@code %TEMP%\p3t1fix2\}）：
      * 修复前 {@code .card} 的 {@code getPadding()} = {@code top=0 right=0 bottom=0 left=0}、
      * {@code getBackground().getRadii()} = {@code tl=0 tr=0 br=0 bl=0}；修复后分别是
-     * {@code 16.05} 四边与 {@code 10} 四角。
+     * {@code 16.05} 四边与 {@code 10} 四角。</p>
+     *
+     * <p><b>名单其实有两类（minor 清算批 MEDIUM-1 更正）</b>：上面那段 {@code ClassCastException}
+     * 的因果只对 {@code -fx-padding} / {@code -fx-*-radius} / {@code -fx-*-insets} /
+     * {@code -fx-border-width} 成立；{@code -fx-spacing} / {@code -fx-min|max|pref-width|height}
+     * 的查找值<b>合法且生效</b>（Region 的转换器接受 {@code Number}），把它们也纳入这份名单是
+     * <b>统一约定</b>（与 em 缩放一致、便于审计），不是因为它们会失效。两类分界见
+     * {@link CssTokens#CCE_IGNORED_LENGTH_PROPERTIES} / {@link CssTokens#CONVENTION_LENGTH_PROPERTIES}；
+     * 拆分只改理由与分类，判定集合与结论不变。</p>
      *
      * <p>合法取值只有两种：字面数值（可带 {@code em} / {@code px}）。{@code px} 仍只允许
      * {@code .root} 的 {@code -fx-font-size} 那一处（由 {@link #allOtherLengths_useEmOnly} 守着），
-     * 所以这条断言只可能被判红的写法就是查找值本身。
+     * 所以这条断言只可能被判红的写法就是查找值本身。</p>
      */
     @Test
     void appCss_lengthProperties_neverReferenceLookupValues() {
         List<String> offenders = CssTokens.lengthClassDeclarationsWithLookupValue("/css/app.css");
         assertEquals(List.of(), offenders,
-                "app.css 里长度类属性（" + CssTokens.LENGTH_CLASS_PROPERTIES + "）不得引用 -fx-* 查找值："
-                        + "JavaFX 25 会抛 ClassCastException 并静默忽略整条声明（N1：修复前 31 处，"
-                        + "全站 padding/圆角实际为 0）。必须写成字面数值（em / 裸数值）或改到 Java 侧设定。"
+                "app.css 里长度类属性不得引用 -fx-* 查找值（判定集合 = " + CssTokens.LENGTH_CLASS_PROPERTIES + "）。"
+                        + "其中 " + CssTokens.CCE_IGNORED_LENGTH_PROPERTIES + " 的查找值会被 JavaFX 25 抛 "
+                        + "ClassCastException 并静默忽略整条声明（N1：修复前 31 处，全站 padding/圆角实际为 0）；"
+                        + "而 " + CssTokens.CONVENTION_LENGTH_PROPERTIES + " 的查找值本身合法生效，"
+                        + "纳入本护栏只是统一约定。两类都必须写成字面数值（em / 裸数值）或改到 Java 侧设定。"
                         + "违规声明：" + offenders);
         // 反向证据：护栏必须真的扫到了那些属性，否则「0 违规」可能只是「0 命中」
         long scanned = CssTokens.parse("/css/app.css").stream()
@@ -339,6 +349,88 @@ class ColorAuditTest {
                 "app.css 里被扫描的长度类声明太少（" + scanned + "），护栏形同虚设");
         System.out.println("[evidence] app.css 长度类声明共 " + scanned
                 + " 条，其中引用查找值的 0 条（N1 修复前是 31 条）");
+    }
+
+    /**
+     * MEDIUM-1（2026-10-14 minor 清算批）：{@link CssTokens#LENGTH_CLASS_PROPERTIES} 的两类拆分
+     * 必须<b>互斥、完备，且分界线钉死</b>。
+     *
+     * <p>拆分的全部意义就在这条分界线上：{@code -fx-min-height} / {@code -fx-spacing} 的查找值
+     * <b>是合法生效的</b>（旧 javadoc 说它们「同样被忽略」，已被实测证伪），因此它们属于「统一约定」
+     * 那一类，不属于 N1 的因果。这条断言把分界线写死，防止后人把理由再搅在一起、或把某条属性
+     * 悄悄挪到错的类里。</p>
+     */
+    @Test
+    void lengthClassProperties_areSplitByTheirRealReason_disjointAndComplete() {
+        Set<String> cce = new LinkedHashSet<>(CssTokens.CCE_IGNORED_LENGTH_PROPERTIES);
+        Set<String> convention = new LinkedHashSet<>(CssTokens.CONVENTION_LENGTH_PROPERTIES);
+
+        assertEquals(new LinkedHashSet<>(List.of("-fx-padding", "-fx-background-radius", "-fx-border-radius",
+                        "-fx-background-insets", "-fx-border-insets", "-fx-border-width")), cce,
+                "① 会被 ClassCastException 静默忽略的长度类属性（N1 本身）恰是这 6 条：" + cce);
+        assertEquals(new LinkedHashSet<>(List.of("-fx-spacing", "-fx-min-width", "-fx-max-width", "-fx-pref-width",
+                        "-fx-min-height", "-fx-max-height", "-fx-pref-height")), convention,
+                "② 查找值合法生效、只因统一约定写字面值的长度类属性恰是这 7 条：" + convention);
+
+        Set<String> overlap = new LinkedHashSet<>(cce);
+        overlap.retainAll(convention);
+        assertEquals(Set.of(), overlap, "两类必须互斥（同一属性不可能既被忽略又合法生效）：" + overlap);
+
+        Set<String> union = new LinkedHashSet<>(cce);
+        union.addAll(convention);
+        assertEquals(new LinkedHashSet<>(CssTokens.LENGTH_CLASS_PROPERTIES), union,
+                "两类的并集必须逐元素等于护栏的判定集合 LENGTH_CLASS_PROPERTIES（拆分不改判据）");
+
+        // 分界线本身：这两条是旧 javadoc 说错的地方
+        assertFalse(cce.contains("-fx-min-height"),
+                "-fx-min-height 的查找值合法生效（实测 minHeight=32.0、CCE=0），不得归入「被 CCE 忽略」那类");
+        assertTrue(convention.contains("-fx-min-height"),
+                "-fx-min-height 属于「统一约定」那类");
+        assertFalse(cce.contains("-fx-spacing"), "-fx-spacing 的查找值合法生效（实测 spacing=16.1、CCE=0）");
+        assertFalse(convention.contains("-fx-padding"), "-fx-padding 的查找值会被 CCE 忽略，属于第 ① 类");
+    }
+
+    /**
+     * LOW-1（2026-10-14 minor 清算批）：{@link CssTokens#parse} 报出的行号必须指向真实声明行。
+     *
+     * <p>修复前 {@code parse} 用一个非贪婪的多行块注释正则整体替换成单个空格（{@code (?s)} + 块注释），
+     * 把多行注释<b>塌成一个空格</b>
+     * （吃掉其中的换行），于是在塌缩后的文本上数出来的行号对「位于多行注释之后的声明」全部偏小。
+     * {@code app.css} 头部注释 15 行 → 偏移 <b>−14</b>：{@code .card} 的 {@code -fx-padding}
+     * 会被报成 {@code line 29}（M01 的红消息就是它），真实行号是 <b>43</b>。</p>
+     *
+     * <p>行号是护栏唯一的定位手段（任务书：断言要能定位到具体行号），所以这条断言逐条把解析出的
+     * 每个 {@link CssTokens.Decl} 对回源文件的那一行——那一行必须真的写着这个属性名。</p>
+     */
+    @Test
+    void appCss_parsedLineNumbers_pointAtTheRealDeclarationLines() throws IOException {
+        List<String> sourceLines = Files.readAllLines(
+                Path.of("src", "main", "resources", "css", "app.css"), StandardCharsets.UTF_8);
+        List<CssTokens.Decl> decls = CssTokens.parse("/css/app.css");
+        assertTrue(decls.size() >= 50,
+                "app.css 解析出的声明太少（" + decls.size() + "），这条行号护栏形同虚设");
+
+        List<String> mismatched = new ArrayList<>();
+        for (CssTokens.Decl d : decls) {
+            assertTrue(d.line() >= 1 && d.line() <= sourceLines.size(),
+                    "报出的行号越界：" + d.selector() + " { " + d.property() + " } (line " + d.line() + ")");
+            String realLine = sourceLines.get(d.line() - 1);
+            if (!realLine.contains(d.property())) {
+                mismatched.add(d.property() + "@" + d.selector() + " 报 line " + d.line()
+                        + "，但该行是「" + realLine.trim() + "」");
+            }
+        }
+        assertEquals(List.of(), mismatched,
+                "parse 报出的行号必须指向真实的声明行（剥注释时必须保留换行）：" + mismatched);
+
+        // 钉住一条已知偏移量（头部 15 行注释之后的第一个 .card 声明）：修复前报 29，真实是 43 → 偏移 −14
+        CssTokens.Decl cardPadding = decls.stream()
+                .filter(d -> ".card".equals(d.selector()) && "-fx-padding".equals(d.property()))
+                .findFirst().orElseThrow(() -> new AssertionError("app.css 里找不到 .card 的 -fx-padding"));
+        assertEquals(43, cardPadding.line(),
+                "app.css 的 .card { -fx-padding } 真实行号必须是 43（修复前报 29，偏移 −14）");
+        System.out.println("[evidence] app.css 行号回对源文件：" + decls.size()
+                + " 条声明逐条命中真实行；.card {-fx-padding} 报 line " + cardPadding.line() + "（真实 43）");
     }
 
     @Test

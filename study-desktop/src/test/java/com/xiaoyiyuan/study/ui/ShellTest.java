@@ -31,7 +31,6 @@ import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -333,15 +332,22 @@ class ShellTest {
         });
     }
 
+    /**
+     * 学习目录不可写时，外壳照常起来、只多一条中性提示（minor 清算批 Minor-1）。
+     *
+     * <p>旧用例拿 {@code C:\Windows\…} 当不可写点，在本机被 {@code assumeFalse} 永久跳过
+     * （task-2-review.md 的 M4b 证明这半没被守住）。现在「可写判定」由测试注入，
+     * 恒定承重、也不依赖本机权限。</p>
+     */
     @Test
-    void unreadableStudyDir_shellStillComesUp_withANeutralNotice(@TempDir Path tempDir) {
-        Path notWritable = Path.of("C:\\Windows\\xiaoyiyuan-study-probe-not-writable");
-        Assumptions.assumeFalse(StartupCheck.isWritable(notWritable),
-                "这台机器上 " + notWritable + " 意外地可写，本用例不适用");
-
+    void unwritableStudyDir_shellStillComesUp_withANeutralNotice(@TempDir Path studyDir) {
         FxToolkitTest.onFx(() -> {
-            Shell shell = shell(notWritable);
+            Shell shell = shell(studyDir, dir -> false);
+
             assertNotNull(shell.root(), "学习目录不可写时外壳照样要建出来（不阻断、不报警）");
+            assertEquals(Page.OVERVIEW, shell.navigation().current(), "不可写也照常起来并进入总览");
+            assertEquals(1, withStyleClass(shell.root(), "notice").size(), "恰好一条中性提示条，实际 "
+                    + textsOf(shell.root()));
             assertTrue(textsOf(shell.root()).contains(StartupCheck.NOTICE_NOT_WRITABLE),
                     "要给一条中性提示：" + StartupCheck.NOTICE_NOT_WRITABLE + "，实际 " + textsOf(shell.root()));
             return null;
@@ -490,11 +496,16 @@ class ShellTest {
     }
 
     static Shell shell(Path studyDir) {
+        return shell(studyDir, StartupCheck::isWritable);
+    }
+
+    /** 「学习目录可写否」可注入（Minor-1）：让「不可写 → 提示条」这条分支可控地承重。 */
+    static Shell shell(Path studyDir, java.util.function.Predicate<Path> writableProbe) {
         Stage stage = new Stage();
         AppConfig config = config(studyDir);
         Navigation navigation = new Navigation(Page.OVERVIEW);
         StatusModel status = new StatusModel(studyDir, false);
-        AppShell appShell = new AppShell(stage, config, navigation, status);
+        AppShell appShell = new AppShell(stage, config, navigation, status, writableProbe);
         Parent root = appShell.build();
         // build() 在「Stage 还没有 Scene」时会自己建一个（1100×720）——生产路径与这里完全一致。
         Scene scene = stage.getScene();

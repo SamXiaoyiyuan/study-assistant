@@ -301,9 +301,11 @@ class CrisisPanelRenderTest {
      * 第二条真渲染证据：{@code .button} 的 {@code -fx-padding: -fx-sp-3 -fx-sp-5}
      * 与 {@code -fx-min-height: 2.9em}。
      *
-     * <p>后者尤其重要：它是 31 处里唯一不在 padding/radius 名单中的长度声明，
-     * 也是「按同一规则处理所有长度类属性」这条要求的落点——修复前按钮高度是
-     * 「内容 + 0 内边距」，修复后必须是「内容 + 上下内边距」，且不低于 2.9em。
+     * <p>后者是「统一约定」那一类的落点（minor 清算批 MEDIUM-1）：{@code -fx-min-height}
+     * <b>本身接受查找值</b>（Region 的转换器收 {@code Number}，实测 {@code -fx-min-height: -fx-sp-6}
+     * → {@code minHeight=32.0}、CCE=0），它写字面 {@code 2.9em} 不是因为它会失效，而是与全站
+     * 「长度类属性一律写字面值」的约定一致。修复前按钮高度是「内容 + 0 内边距」（padding 那半才是
+     * 真被 CCE 忽略的），修复后必须是「内容 + 上下内边距」，且不低于 2.9em。
      */
     @Test
     void button_paddingAndMinHeightAreActuallyApplied_notZero() {
@@ -325,7 +327,8 @@ class CrisisPanelRenderTest {
                             + "修复后必须至少容纳上下各 " + sp3 + "px");
             assertTrue(s.layoutHeight() >= minHeight - 0.5,
                     "2.9em 的 -fx-min-height 必须生效：实测 " + s.layoutHeight()
-                            + "px，期望 ≥ " + minHeight + "px（-fx-min-height 的查找值此前同样被忽略）");
+                            + "px，期望 ≥ " + minHeight + "px（按统一约定写字面值；"
+                            + "注意 -fx-min-height 的查找值本身是合法生效的，这里不是「因为它会失效」）");
         }
     }
 
