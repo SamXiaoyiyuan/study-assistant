@@ -372,8 +372,18 @@ class ShellTest {
 
     @Test
     void uiViewLayer_hasNoDirectFileWriteApi() throws IOException {
-        List<Path> sources = uiSources("main");
-        assertTrue(sources.size() >= 8, "至少应扫到 8 个 ui 源文件，实际 " + sources.size());
+        // Task 3 收窄：ui/service 是**唯一**被允许用 FileStore / TextFileCodec / Files 的层
+        // （界面侧数据访问层就是它的职责），所以本护栏只守其余五处——
+        // ui、ui/view、ui/control、ui/text、ui/theme。少了这个排除，Task 3 一落地本护栏必红。
+        Path servicePackage = Path.of("ui", "service");
+        List<Path> sources = new ArrayList<>();
+        for (Path file : uiSources("main")) {
+            if (!file.toString().contains(servicePackage.toString())) {
+                sources.add(file);
+            }
+        }
+        assertTrue(sources.size() >= 15,
+                "至少应扫到 15 个非 service 的 ui 源文件，实际 " + sources.size() + "：" + sources);
 
         List<String> offenders = new ArrayList<>();
         for (Path file : sources) {
